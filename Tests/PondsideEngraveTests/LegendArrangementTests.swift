@@ -99,6 +99,28 @@ final class LegendArrangementTests: XCTestCase {
         XCTAssertEqual(out.moves.count, 1)
     }
 
+    /// The frames and handles travel with what a drag moves, and an
+    /// example's frame shrinks to what its crop keeps.
+    func testTheOverlayFollowsTheDrag() {
+        let (legend, sheet) = sheet()
+        let still = LegendArrangement.overlay(of: sheet, outcome: nil)
+        XCTAssertEqual(still.examples[0], sheet.rows[0].example)
+        let move = legend.drag(.table, on: sheet, from: Point(40, 40), to: Point(45, 43), layout: .init(), examples: [],
+                               snap: false, threshold: 1)
+        let moved = LegendArrangement.overlay(of: sheet, outcome: move)
+        XCTAssertEqual(moved.table.x, sheet.table.x + 5, accuracy: 0.01)
+        XCTAssertEqual(moved.examples[1]?.y ?? 0, (sheet.rows[1].example?.y ?? 0) + 3, accuracy: 0.01)
+        let crop = legend.drag(.cropRight(0), on: sheet, from: Point(30, 34), to: Point(28, 34), layout: .init(),
+                               examples: [.init(), .init()], snap: false, threshold: 1)
+        let cropped = LegendArrangement.overlay(of: sheet, outcome: crop)
+        let e = sheet.rows[0].example!
+        XCTAssertLessThan(cropped.examples[0]!.x + cropped.examples[0]!.width, e.x + e.width - 0.5, "\(crop.hidden) \(crop.moves)")
+        let gap = legend.drag(.rowGap(0), on: sheet, from: Point(50, 40), to: Point(50, 42), layout: .init(), examples: [], threshold: 1)
+        let spaced = LegendArrangement.overlay(of: sheet, outcome: gap)
+        XCTAssertGreaterThan(spaced.examples[1]!.y, sheet.rows[1].example!.y)
+        XCTAssertEqual(spaced.examples[0], sheet.rows[0].example, "the row above stays")
+    }
+
     /// The real definitions engrave: markers on the canvas, the example cropped.
     func testEngravedLegendCarriesMarkers() async throws {
         let installs = await ToolchainDetector().detectLilyPond()

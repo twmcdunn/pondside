@@ -799,12 +799,14 @@ private final class PageView: NSView {
             ctx.setFillColor(Theme.paper.withAlphaComponent(0.82).cgColor)
             ctx.fill(viewRect(for: r))
         }
+        // The frames and handles travel with what is being dragged.
+        let overlay = LegendArrangement.overlay(of: sheet, outcome: outcome)
         ctx.setLineWidth(1)
         ctx.setStrokeColor(accent.withAlphaComponent(0.55).cgColor)
         ctx.setLineDash(phase: 0, lengths: [4, 3])
-        ctx.stroke(viewRect(for: sheet.table).insetBy(dx: -3, dy: -3))
-        if let w = sheet.rows.compactMap(\.words).first {
-            let t = viewRect(for: sheet.table)
+        ctx.stroke(viewRect(for: overlay.table).insetBy(dx: -3, dy: -3))
+        if let w = overlay.words {
+            let t = viewRect(for: overlay.table)
             let x = viewRect(for: w).minX
             ctx.move(to: CGPoint(x: x - 1, y: t.minY - 3))
             ctx.addLine(to: CGPoint(x: x - 1, y: t.maxY + 3))
@@ -812,7 +814,7 @@ private final class PageView: NSView {
         }
         ctx.setLineDash(phase: 0, lengths: [])
         for row in sheet.rows {
-            guard let e = row.example else { continue }
+            guard let e = overlay.examples[row.index] else { continue }
             let r = viewRect(for: e)
             ctx.setStrokeColor(accent.withAlphaComponent(0.35).cgColor)
             ctx.stroke(r.insetBy(dx: -1, dy: -1))

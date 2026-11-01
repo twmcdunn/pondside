@@ -149,6 +149,50 @@ public struct LegendArrangement: Sendable {
         public var summary: String = ""
     }
 
+    /// Where the arrange overlay's frames go while a drag is previewed: the
+    /// same moves as the music they frame (so a frame travels with its
+    /// example, the table's with the table), and an example's frame shrunk
+    /// to what its crop keeps.
+    public struct Overlay: Sendable, Equatable {
+        public var table: Rect
+        /// The meaning column's left edge, as a rect (its x).
+        public var words: Rect?
+        /// By row index.
+        public var examples: [Int: Rect]
+    }
+
+    public static func overlay(of sheet: Sheet, outcome: Outcome?) -> Overlay {
+        let moves = outcome?.moves ?? [], hidden = outcome?.hidden ?? []
+        func moved(_ r: Rect) -> Rect {
+            let c = Point(r.midX, r.midY)
+            guard let t = moves.first(where: { $0.region.contains(c) })?.transform else { return r }
+            let xs = [r.x, r.x + r.width], ys = [r.y, r.y + r.height]
+            let pts = xs.flatMap { x in ys.map { y in (t.a * x + t.c * y + t.e, t.b * x + t.d * y + t.f) } }
+            let minX = pts.map(\.0).min()!, maxX = pts.map(\.0).max()!, minY = pts.map(\.1).min()!, maxY = pts.map(\.1).max()!
+            return Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+        func cropped(_ e: Rect) -> Rect {
+            var lo = e.x, hi = e.x + e.width
+            for h in hidden where h.y < e.y + e.height && h.y + h.height > e.y {
+                if h.x <= lo + 0.01, h.x + h.width > lo { lo = min(hi, h.x + h.width) }
+                if h.x + h.width >= hi - 0.01, h.x < hi { hi = max(lo, h.x) }
+            }
+            return Rect(x: lo, y: e.y, width: hi - lo, height: e.height)
+        }
+        var examples: [Int: Rect] = [:]
+        for row in sheet.rows { if let e = row.example { examples[row.index] = moved(cropped(e)) } }
+        let words = sheet.rows.compactMap(\.words).first.map(moved)
+        var table = moved(sheet.table)
+        // Rows that moved inside a table that didn't (a row gap, a column):
+        // the frame grows to keep them in it.
+        for e in examples.values {
+            let minX = min(table.x, e.x), minY = min(table.y, e.y)
+            let maxX = max(table.x + table.width, e.x + e.width), maxY = max(table.y + table.height, e.y + e.height)
+            table = Rect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+        return Overlay(table: table, words: words, examples: examples)
+    }
+
     /// What dragging `handle` from `start` to `to` makes of `layout` and the
     /// rows' `examples` (by row index). `snap` off when ⌘ is held; `all`
     /// (⌥) makes a scale drag the table's.
