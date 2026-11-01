@@ -1,0 +1,9 @@
+#!/bin/sh
+# Removes LilyPond versions an earlier Pondside installer put here; the
+# Toolchain folder holds only what the installer manages.
+. "$(dirname "$0")/versions.env"
+toolchain="/Library/Application Support/Pondside/Toolchain"
+for dir in "$toolchain"/lilypond-*; do
+  [ -d "$dir" ] && [ "$dir" != "$toolchain/lilypond-$LILYPOND_VERSION" ] && rm -rf "$dir"
+done
+exit 0

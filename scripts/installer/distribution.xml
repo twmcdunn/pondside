@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Template: make-installer.sh replaces the @NAME@ placeholders. -->
+<installer-gui-script minSpecVersion="2">
+    <title>Pondside</title>
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <license file="license.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+    <options customize="always" require-scripts="false" rootVolumeOnly="true" hostArchitectures="@HOST_ARCHS@"/>
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+    <volume-check>
+        <allowed-os-versions><os-version min="14.0"/></allowed-os-versions>
+    </volume-check>
+    <script><![CDATA[
+function has(path) { return system.files.fileExistsAtPath(path); }
+]]></script>
+
+    <choices-outline>
+        <line choice="pondside"/>
+        <line choice="lilypond"/>
+        <line choice="cli"/>
+        <line choice="fluidsynth"/>
+        <line choice="supercollider"/>
+        <line choice="musescore"/>
+        <line choice="claude"/>
+        <line choice="opencode"/>
+    </choices-outline>
+
+    <choice id="pondside" title="Pondside @PONDSIDE_VERSION@" enabled="false" selected="true"
+            description="The Pondside app, installed in Applications.">
+        <pkg-ref id="app.pondside.app"/>
+    </choice>
+    <choice id="lilypond" title="LilyPond @LILYPOND_VERSION@" enabled="false" selected="true"
+            description="The engraver Pondside runs on every edit. Required. This is the version Pondside is tested with; a LilyPond you already have is still used for scores that declare its version.">
+        <pkg-ref id="app.pondside.lilypond">lilypond.pkg</pkg-ref>
+    </choice>
+    <choice id="cli" title="Command-line tool" start_selected="true"
+            description="Links the pondside command (CLI and MCP server for agents) into /usr/local/bin.">
+        <pkg-ref id="app.pondside.cli"/>
+    </choice>
+    <choice id="fluidsynth" title="FluidSynth @FLUIDSYNTH_VERSION@ and a General MIDI SoundFont" start_selected="true"
+            description="Renders an audio mockup of the score when MuseScore is not installed. About 35 MB.">
+        <pkg-ref id="app.pondside.fluidsynth"/>
+    </choice>
+    <choice id="supercollider" title="SuperCollider @SUPERCOLLIDER_VERSION@" start_selected="!has('/Applications/@SUPERCOLLIDER_APP@')"
+            description="For live-electronics scores: Pondside writes cue times and pitch collections for SuperCollider patches. Downloaded from the SuperCollider project during installation (about 240 MB). Unticked if SuperCollider is already in Applications.">
+        <pkg-ref id="app.pondside.supercollider"/>
+    </choice>
+    <choice id="musescore" title="MuseScore Studio @MUSESCORE_VERSION@" start_selected="false"
+            description="Optional, higher-quality audio mockups. Downloaded from MuseScore during installation (about 200 MB). Muse Sounds instruments are installed separately through Muse Hub.">
+        <pkg-ref id="app.pondside.musescore"/>
+    </choice>
+
+    <choice id="claude" title="Claude Code @CLAUDE_VERSION@ (agent)" start_selected="false"
+            description="A coding agent for Pondside's agent features: describe a change to a graphic (⌘L), and finish SuperCollider patch migrations unattended. Installed into your home folder by Anthropic's own install script; needs an Anthropic account or API key (run claude once to sign in). Pick it in Pondside ▸ Settings.">
+        <pkg-ref id="app.pondside.claude"/>
+    </choice>
+    <choice id="opencode" title="opencode @OPENCODE_VERSION@ (agent)" start_selected="false"
+            description="An open-source coding agent, as an alternative to Claude Code, for the same features. Installed into your home folder by opencode's own install script; needs a model provider (run opencode once to set one up).">
+        <pkg-ref id="app.pondside.opencode"/>
+    </choice>
+
+    <pkg-ref id="app.pondside.app">pondside.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.cli">cli.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.fluidsynth">fluidsynth.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.supercollider">supercollider.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.musescore">musescore.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.claude">claude.pkg</pkg-ref>
+    <pkg-ref id="app.pondside.opencode">opencode.pkg</pkg-ref>
+</installer-gui-script>

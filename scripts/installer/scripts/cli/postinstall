@@ -1,0 +1,6 @@
+#!/bin/sh
+# Links the pondside CLI (and `pondside mcp`) onto the default PATH.
+mkdir -p /usr/local/bin
+ln -sf "$2/Pondside.app/Contents/Resources/pondside" /usr/local/bin/pondside 2>/dev/null \
+  || ln -sf /Applications/Pondside.app/Contents/Resources/pondside /usr/local/bin/pondside
+exit 0

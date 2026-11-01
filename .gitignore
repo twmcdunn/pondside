@@ -3,5 +3,9 @@
 *.xcodeproj/
 xcuserdata/
 DerivedData/
-Package.resolved
 .DS_Store
+*.wav
+.mcp.json
+research_notes/*
+reports/*
+opencode.json
