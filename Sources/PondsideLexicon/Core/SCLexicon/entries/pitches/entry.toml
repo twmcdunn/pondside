@@ -1,0 +1,22 @@
+schema = 1
+id     = "pitches"
+kind   = "pattern"
+gloss  = "The MIDI notes of a pitch-class set in a range (a score's collection as notes)"
+tags   = ["pitch", "collection", "harmony", "chord", "scale", "notes"]
+
+[sc]
+name     = "pitches"
+usage    = """
+\\midinote, Pxrand(~lx[\\pitches].([0, 2, 7], 55, 79), inf)"""
+
+[params.pcs]
+default = "[0, 4, 7]"
+doc     = "Pitch classes, C = 0 (a collection's pitch_classes in patch_context)"
+
+[params.lo]
+default = 48
+doc     = "Lowest MIDI note"
+
+[params.hi]
+default = 84
+doc     = "Highest MIDI note"

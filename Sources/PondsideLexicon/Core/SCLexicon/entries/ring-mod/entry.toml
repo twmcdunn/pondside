@@ -1,0 +1,22 @@
+schema = 1
+id     = "ring-mod"
+kind   = "effect"
+gloss  = "Ring modulation by a sine"
+tags   = ["ring", "metallic", "bell", "inharmonic", "modulation"]
+
+[sc]
+name     = "ringMod"
+usage    = """
+// at a cue: the performer through it
+~ringMod = Synth(\\lx_ringMod_mono, [\\in, ~live, \\mix, 1], addAction: \\addToTail);
+~ringMod.set(\\mix, 0.5);   // later
+// on a pattern
+~lx[\\withFx].(~pat, [[\\ringMod, (mix: 0.4)]]).play;"""
+
+[params.mix]
+default = 1
+doc     = "0 dry .. 1 wet"
+
+[params.freq]
+default = 300
+doc     = "Modulator frequency, Hz: low trembles, high turns metallic"

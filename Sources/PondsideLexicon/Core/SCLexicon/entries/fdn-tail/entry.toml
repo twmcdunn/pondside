@@ -1,0 +1,26 @@
+schema = 1
+id     = "fdn-tail"
+kind   = "effect"
+gloss  = "Long smooth reverb tail (4-line feedback delay network)"
+tags   = ["reverb", "tail", "wash", "ambient", "decay", "space"]
+
+[sc]
+name     = "tail"
+usage    = """
+// at a cue: the performer through it
+~tail = Synth(\\lx_tail_mono, [\\in, ~live, \\mix, 1], addAction: \\addToTail);
+~tail.set(\\mix, 0.5);   // later
+// on a pattern
+~lx[\\withFx].(~pat, [[\\tail, (mix: 0.4)]]).play;"""
+
+[params.mix]
+default = 0.5
+doc     = "0 dry .. 1 wet"
+
+[params.rt60]
+default = 3
+doc     = "Seconds for the tail to fall 60 dB"
+
+[params.damp]
+default = 8000
+doc     = "Low-pass in the loop, Hz"

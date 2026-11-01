@@ -1,0 +1,22 @@
+schema = 1
+id     = "with-fx"
+kind   = "pattern"
+gloss  = "Put a chain of effects on a pattern, on its own bus, with tails that ring after it stops"
+tags   = ["effects", "chain", "insert", "pfx", "pfxb", "tail", "pattern"]
+
+[sc]
+name     = "withFx"
+usage    = """
+~p = ~lx[\\withFx].(~lx[\\cloud].([0, 7]), [[\\fbDelay, (time: 0.25)], [\\reverb, (mix: 0.5)]], 6).play;"""
+
+[params.pattern]
+default = ""
+doc     = "The pattern"
+
+[params.effects]
+default = "[[\\reverb, (mix: 0.3)]]"
+doc     = "[[name, (param: value, ...)], ...], first nearest the notes"
+
+[params.tail]
+default = 2
+doc     = "Seconds the effects keep ringing after the pattern stops"

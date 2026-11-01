@@ -1,0 +1,26 @@
+schema = 1
+id     = "lpf"
+kind   = "effect"
+gloss  = "Resonant low-pass filter"
+tags   = ["filter", "darker", "muffle", "low-pass", "resonance"]
+
+[sc]
+name     = "lpf"
+usage    = """
+// at a cue: the performer through it
+~lpf = Synth(\\lx_lpf_mono, [\\in, ~live, \\mix, 1], addAction: \\addToTail);
+~lpf.set(\\mix, 0.5);   // later
+// on a pattern
+~lx[\\withFx].(~pat, [[\\lpf, (mix: 0.4)]]).play;"""
+
+[params.mix]
+default = 1
+doc     = "0 dry .. 1 wet"
+
+[params.freq]
+default = 2000
+doc     = "Cutoff, Hz (20..20000)"
+
+[params.rq]
+default = 0.7
+doc     = "Reciprocal of Q: low is resonant (0.05..2)"

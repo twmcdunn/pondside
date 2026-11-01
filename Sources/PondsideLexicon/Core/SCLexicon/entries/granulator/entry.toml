@@ -1,0 +1,42 @@
+schema = 1
+id     = "granulator"
+kind   = "effect"
+gloss  = "Granulates its input live: a cloud of short grains from the last moments"
+tags   = ["granular", "grains", "cloud", "texture", "scatter", "freeze"]
+
+[sc]
+name     = "granulator"
+usage    = """
+// at a cue: the performer through it
+~granulator = Synth(\\lx_granulator_mono, [\\in, ~live, \\mix, 1], addAction: \\addToTail);
+~granulator.set(\\mix, 0.5);   // later
+// on a pattern
+~lx[\\withFx].(~pat, [[\\granulator, (mix: 0.4)]]).play;"""
+
+[params.mix]
+default = 1
+doc     = "0 dry .. 1 wet"
+
+[params.density]
+default = 20
+doc     = "Grains per second"
+
+[params.grainDur]
+default = 0.08
+doc     = "Grain length, s"
+
+[params.delay]
+default = 0.3
+doc     = "How far back grains read, s (0..1.5)"
+
+[params.scatter]
+default = 0.2
+doc     = "Random extra delay per grain, s"
+
+[params.pitchJitter]
+default = 0
+doc     = "Random transposition per grain, ± semitones"
+
+[params.spread]
+default = 0.8
+doc     = "Stereo spread 0..1"

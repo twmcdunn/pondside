@@ -1,0 +1,39 @@
+schema = 1
+id     = "cloud"
+kind   = "pattern"
+gloss  = "A cloud of grains on a pitch collection: a ready Pbind (density, register and amp may be patterns)"
+tags   = ["cloud", "grains", "texture", "swarm", "granular", "pbind", "collection"]
+
+[sc]
+name     = "cloud"
+requires = ["grain", "pitches", "glide"]
+usage    = """
+~cloud = ~lx[\\cloud].([0, 3, 7, 10], ~lx[\\glide].(2, 40, 30)).play;"""
+
+[params.pcs]
+default = "[0, 4, 7]"
+doc     = "Pitch classes"
+
+[params.density]
+default = 10
+doc     = "Grains per second (a number or a pattern, e.g. ~lx[\\glide].(2, 30, 20))"
+
+[params.amp]
+default = 0.05
+doc     = "Amplitude (number or pattern)"
+
+[params.lo]
+default = 60
+doc     = "Lowest MIDI note"
+
+[params.hi]
+default = 96
+doc     = "Highest MIDI note"
+
+[params.length]
+default = 0.05
+doc     = "Grain length, s"
+
+[params.instrument]
+default = "\\lx_grain"
+doc     = "Any SynthDef with freq, amp, sustain, pan"

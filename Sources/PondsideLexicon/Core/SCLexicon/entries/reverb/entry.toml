@@ -1,0 +1,26 @@
+schema = 1
+id     = "reverb"
+kind   = "effect"
+gloss  = "Room reverb (FreeVerb)"
+tags   = ["reverb", "room", "space", "hall", "wet"]
+
+[sc]
+name     = "reverb"
+usage    = """
+// at a cue: the performer through it
+~reverb = Synth(\\lx_reverb_mono, [\\in, ~live, \\mix, 1], addAction: \\addToTail);
+~reverb.set(\\mix, 0.5);   // later
+// on a pattern
+~lx[\\withFx].(~pat, [[\\reverb, (mix: 0.4)]]).play;"""
+
+[params.mix]
+default = 0.3
+doc     = "0 dry .. 1 wet"
+
+[params.room]
+default = 0.8
+doc     = "Room size 0..1"
+
+[params.damp]
+default = 0.5
+doc     = "High damping 0..1"

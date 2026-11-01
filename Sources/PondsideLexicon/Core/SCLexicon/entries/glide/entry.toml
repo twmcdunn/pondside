@@ -1,0 +1,26 @@
+schema = 1
+id     = "glide"
+kind   = "pattern"
+gloss  = "A value that glides from one level to another over seconds, then holds (for any Pbind key)"
+tags   = ["glide", "ramp", "envelope", "crescendo", "fade", "sweep", "gradual"]
+
+[sc]
+name     = "glide"
+usage    = """
+\\amp, ~lx[\\glide].(0.01, 0.2, 20, \\exp)"""
+
+[params.from]
+default = 0
+doc     = "Start value"
+
+[params.to]
+default = 1
+doc     = "End value"
+
+[params.secs]
+default = 10
+doc     = "Seconds (score seconds: the engine's clock)"
+
+[params.curve]
+default = 0
+doc     = "Env curve: 0 linear, \\exp, or a number"

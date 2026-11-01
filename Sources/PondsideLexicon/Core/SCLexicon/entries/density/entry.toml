@@ -1,0 +1,27 @@
+schema = 1
+id     = "density"
+kind   = "pattern"
+gloss  = "Event durations for a density that changes from one rate to another over seconds (sparser to denser)"
+tags   = ["density", "rate", "accelerando", "sparser", "denser", "dur", "rhythm"]
+
+[sc]
+name     = "density"
+requires = ["glide"]
+usage    = """
+\\dur, ~lx[\\density].(2, 30, 15)"""
+
+[params.from]
+default = 2
+doc     = "Events per second at the start"
+
+[params.to]
+default = 20
+doc     = "Events per second at the end"
+
+[params.secs]
+default = 10
+doc     = "Seconds"
+
+[params.jitter]
+default = 0.3
+doc     = "Random ± fraction of each duration (0 = regular)"

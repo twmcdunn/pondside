@@ -1,0 +1,30 @@
+schema = 1
+id     = "grain"
+kind   = "synth"
+gloss  = "A short enveloped sine grain (the instrument for clouds)"
+tags   = ["grain", "sine", "blip", "instrument", "synthdef"]
+
+[sc]
+name     = "grain"
+usage    = """
+Pbind(\\instrument, \\lx_grain, \\midinote, 72, \\dur, 0.1, \\sustain, 0.04).play;"""
+
+[params.freq]
+default = 440
+doc     = "Hz"
+
+[params.amp]
+default = 0.1
+doc     = "Amplitude"
+
+[params.sustain]
+default = 0.05
+doc     = "Length, s (a Pbind's \\sustain)"
+
+[params.pan]
+default = 0
+doc     = "-1..1"
+
+[params.attack]
+default = 0.3
+doc     = "Fraction of the length spent rising"
