@@ -19,6 +19,7 @@ function has(path) { return system.files.fileExistsAtPath(path); }
         <line choice="lilypond"/>
         <line choice="cli"/>
         <line choice="fluidsynth"/>
+        <line choice="sclang"/>
         <line choice="supercollider"/>
         <line choice="musescore"/>
         <line choice="claude"/>
@@ -41,7 +42,11 @@ function has(path) { return system.files.fileExistsAtPath(path); }
             description="Renders an audio mockup of the score when MuseScore is not installed. About 35 MB.">
         <pkg-ref id="app.pondside.fluidsynth"/>
     </choice>
-    <choice id="supercollider" title="SuperCollider @SUPERCOLLIDER_VERSION@" start_selected="!has('/Applications/@SUPERCOLLIDER_APP@')"
+    <choice id="sclang" title="SuperCollider engine @SUPERCOLLIDER_VERSION@ (headless)" enabled="false" selected="true"
+            description="The SuperCollider language and audio server without its IDE, for live electronics, patches and the mix. About 16 MB.">
+        <pkg-ref id="app.pondside.sclang">sclang.pkg</pkg-ref>
+    </choice>
+    <choice id="supercollider" title="SuperCollider @SUPERCOLLIDER_VERSION@ (with its IDE)" start_selected="!has('/Applications/@SUPERCOLLIDER_APP@')"
             description="For live-electronics scores: Pondside writes cue times and pitch collections for SuperCollider patches. Downloaded from the SuperCollider project during installation (about 240 MB). Unticked if SuperCollider is already in Applications.">
         <pkg-ref id="app.pondside.supercollider"/>
     </choice>

@@ -305,7 +305,9 @@ public enum PatchRender {
         try FileManager.default.createDirectory(at: classes, withIntermediateDirectories: true)
         try Data(clockClass.utf8).write(to: classes.appendingPathComponent("PondsideRenderClock.sc"))
         let config = dir.appendingPathComponent("sclang_conf.yaml")
-        try Data(renderConfig(classes: classes).utf8).write(to: config)
+        // A headless sclang leaves the user's extensions out (they may need Qt).
+        try Data((SuperColliderToolchain.isHeadless(sclang) ? SuperColliderToolchain.headlessConfig(sclang, extra: [classes.path])
+                  : renderConfig(classes: classes)).utf8).write(to: config)
         let script = dir.appendingPathComponent("render.scd")
         let partial = dir.appendingPathComponent("mix.wav")
         let blockDir = dir.appendingPathComponent("blocks")

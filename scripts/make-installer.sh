@@ -85,6 +85,16 @@ cp "$cache/GeneralUser-GS-LICENSE.txt" "$stage/fluidsynth/soundfonts/LICENSE-Gen
 pkgbuild --root "$stage/fluidsynth" --install-location "$toolchain" \
   --identifier app.pondside.fluidsynth --version "$FLUIDSYNTH_VERSION" --quiet "$pkgs/fluidsynth.pkg"
 
+# --- Headless SuperCollider: sclang and scsynth without Qt (about 16 MB),
+# so live electronics work without installing SuperCollider.app.
+sc_dir="$work/supercollider-$SUPERCOLLIDER_VERSION"
+[ -x "$sc_dir/SuperCollider.app/Contents/MacOS/sclang" ] \
+  || "$here/build-supercollider.sh" "$work/supercollider-work" "$sc_dir" >/dev/null
+mkdir -p "$stage/sclang"
+ditto "$sc_dir" "$stage/sclang/supercollider"
+pkgbuild --root "$stage/sclang" --install-location "$toolchain" \
+  --identifier app.pondside.sclang --version "$SUPERCOLLIDER_VERSION" --quiet "$pkgs/sclang.pkg"
+
 # --- Payload-free components
 pkgbuild --nopayload --install-location /Applications --scripts "$(scripts_for cli)" \
   --identifier app.pondside.cli --version "$version" --quiet "$pkgs/cli.pkg"
@@ -128,10 +138,13 @@ Source: <code>https://lilypond.org/download.html</code> (tag v$LILYPOND_VERSION)
 <li><b>FluidSynth $FLUIDSYNTH_VERSION</b> and <b>libsndfile</b> — GNU LGPL v2.1 or later,
 statically linked into <code>fluidsynth</code>; texts in <code>$toolchain/fluidsynth</code>.
 Source: <code>$FLUIDSYNTH_URL</code> and <code>$LIBSNDFILE_URL</code>.</li>
+<li><b>SuperCollider $SUPERCOLLIDER_VERSION</b> (sclang and scsynth, headless) — GNU GPL v3 or
+later, with <b>libsndfile</b> (GNU LGPL v2.1 or later) linked statically; texts in
+<code>$toolchain/supercollider</code>. Source: <code>$SUPERCOLLIDER_SOURCE_URL</code>.</li>
 <li><b>GeneralUser GS</b> SoundFont by S. Christian Collins — licence below.</li>
 </ul>
 <h2>Downloaded if chosen</h2>
-<p>SuperCollider and MuseScore Studio are downloaded from their projects and
+<p>The SuperCollider app (with its IDE) and MuseScore Studio are downloaded from their projects and
 are distributed under the GNU GPL v3 by their authors.</p>
 <p>Claude Code (Anthropic) and opencode are installed by their vendors' own
 install scripts into your home folder, under their own terms; Claude Code

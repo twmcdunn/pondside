@@ -22,7 +22,31 @@ public enum SuperColliderToolchain {
             out.append("\(dir)/sclang")
         }
         out += ["/opt/homebrew/bin/sclang", "/usr/local/bin/sclang", "/usr/bin/sclang"]
+        // Last: the headless SuperCollider the installer bundles (no IDE, no GUI
+        // classes). A full SuperCollider.app, with the user's extensions, wins.
+        out.append(bundled)
         return out
+    }
+
+    /// The installer's headless sclang (scripts/installer/build-supercollider.sh).
+    public static let bundled = "/Library/Application Support/Pondside/Toolchain/supercollider/SuperCollider.app/Contents/MacOS/sclang"
+
+    /// Whether `sclang` is a headless build: it must run with
+    /// `headlessConfig`, since the user's Extensions may need Qt.
+    public static func isHeadless(_ sclang: String) -> Bool {
+        FileManager.default.fileExists(atPath: resources(of: sclang).appendingPathComponent("pondside-headless").path)
+    }
+
+    static func resources(of sclang: String) -> URL {
+        URL(fileURLWithPath: sclang).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
+    }
+
+    /// sclang_conf.yaml for a headless sclang: its own class library and
+    /// `extra` paths, and none of the user's (`excludeDefaultPaths`).
+    public static func headlessConfig(_ sclang: String, extra: [String] = []) -> String {
+        let paths = [resources(of: sclang).appendingPathComponent("SCClassLibrary").path] + extra
+        return "includePaths:\n" + paths.map { "    - \($0)\n" }.joined()
+            + "excludePaths:\n    []\nexcludeDefaultPaths: true\npostInlineWarnings: false\n"
     }
 
     /// The SuperCollider IDE beside `sclang` (`SuperCollider.app/Contents/MacOS/SuperCollider`).
@@ -242,6 +266,13 @@ public final class SCLangSession: @unchecked Sendable {
         p.executableURL = URL(fileURLWithPath: executable)
         // `-i` names an IDE: sclang then reads plain stdin, without readline.
         p.arguments = ["-i", "pondside"]
+        // A headless sclang (the installer's): its own class library only.
+        if SuperColliderToolchain.isHeadless(executable) {
+            let conf = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-sclang-headless.yaml")
+            if (try? Data(SuperColliderToolchain.headlessConfig(executable).utf8).write(to: conf, options: .atomic)) != nil {
+                p.arguments = ["-l", conf.path] + p.arguments!
+            }
+        }
         p.currentDirectoryURL = workingDirectory
         let stdin = Pipe(), stdout = Pipe()
         p.standardInput = stdin
