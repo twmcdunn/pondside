@@ -19,6 +19,11 @@ protocol NotationLensSession: AnyObject {
     var isOpen: Bool { get }
     var onClose: (() -> Void)? { get set }
     var onFailure: ((String) -> Void)? { get set }
+    /// The mode bar was clicked: open that lens instead.
+    var onSwitch: ((LensMode) -> Void)? { get set }
+    /// The other lenses the bar offers, and why the rest aren't.
+    var available: Set<LensMode> { get set }
+    var unavailable: [LensMode: String] { get set }
 
     /// Shows `lens` pointing at `anchor`, or updates the lens already
     /// showing. An open lens stays put; it moves only when `anchor` is on

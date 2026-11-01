@@ -360,6 +360,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             lens = session
         }
         guard let lens else { return }
+        let modes = lensModes
+        lens.available = modes.available
+        lens.unavailable = modes.unavailable
+        lens.onSwitch = { [weak self] m in self?.openLens(m) }
         let wasExplicit = lensWasExplicit && !lensClosesOnRender
         let explicit = navigating ? wasExplicit : (!closesOnRender || wasExplicit)
         let shown = lens.present(lens: content, fileLabel: activeFile.displayName, anchor: lensAnchor(), explicit: explicit)
@@ -1267,7 +1271,7 @@ extension DocumentWindowController: CommandResponder {
         // ⇥ in the lens: the request line for this passage.
         if event.keyCode == 48, lens?.isOpen == true, flags.subtracting([.numericPad, .function]).isEmpty {
             closeLens()
-            showRequest(fromLens: true)
+            openLens(LensMode.notation.next(among: lensModes.available) ?? .graphics)
             return true
         }
         // Plain ←→ step through the lens's voice; with modifiers they keep
@@ -1943,14 +1947,12 @@ extension DocumentWindowController: CommandResponder {
             ? String(decoding: Array(text.utf8)[sel.lowerBound..<min(sel.upperBound, sel.lowerBound + 40)], as: UTF8.self) : ""
         let title = word.hasPrefix("\\") ? word : "the selection"
         let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
-        // ⇥ goes on to the patch agent when the score has a patch, then back to the lens.
-        let hasPatch = score.patchURL != nil
-        requestPopover.tabLabel = hasPatch ? "patch" : "lens"
-        requestPopover.onTab = hasPatch ? { [weak self] in self?.showPatchRequest(fromLens: fromLens) }
-            : fromLens ? { [weak self] in self?.showLens(closesOnRender: false) } : nil
         requestPopover.placeholder = nil
         requestPopover.mode = .graphics
-        requestPopover.onSwitch = hasPatch ? { [weak self] _ in self?.showPatchRequest(fromLens: fromLens) } : nil
+        configureLensModes(requestPopover)
+        let part = canvas.graphicPartSelection.map { _ in " Only the highlighted part changes." } ?? ""
+        requestPopover.detail = "The score's agent changes the music and graphics here." + part
+            + "\nTry: taller · denser till 7 · thin out the bottom · a grainy swell over these bars"
         requestPopover.onSubmit = { [weak self] request in
             guard let self else { return }
             guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
@@ -1976,10 +1978,12 @@ extension DocumentWindowController: CommandResponder {
         let context = rpcPatchContext(cue: nil)
         let cue = context["cue"]?["name"]?.string
         let title = cue.map { "cue \($0) in \(patch.lastPathComponent)" } ?? patch.lastPathComponent
-        requestPopover.tabLabel = "lens"
-        requestPopover.onTab = { [weak self] in self?.showLens(closesOnRender: false) }
         requestPopover.mode = .patch
-        requestPopover.onSwitch = { [weak self] _ in self?.showRequest(fromLens: fromLens) }
+        configureLensModes(requestPopover)
+        let at = context["point"]?["seconds"]?.number.map { String(format: " at %.2f s", $0) } ?? ""
+        let after = context["cue"]?["point_after_cue"]?.number.map { $0 > PatchContext.waitThreshold ? String(format: ", %.2f s after it", $0) : "" } ?? ""
+        requestPopover.detail = "The patch agent changes \(patch.lastPathComponent)" + (cue.map { " in cue \($0)'s handler" } ?? "")
+            + at + after + ".\nTry: more reverb here · a grain cloud on this chord, denser over 20 s · fade the delay out by cue 14"
         requestPopover.placeholder = "Describe the electronics here… e.g. more reverb, a grain cloud on this chord"
         requestPopover.onSubmit = { [weak self] request in
             guard let self else { return }
@@ -1992,6 +1996,34 @@ extension DocumentWindowController: CommandResponder {
         let turns = patchSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
         let who = agent.map { "patch agent (\($0.harness.title)" + (turns > 0 ? ", continuing, ␣ e N new" : "") + ")" } ?? "the patch agent"
         requestPopover.present(title: title, agent: who, anchor: anchor.rect, in: anchor.view)
+    }
+
+    /// The lenses the selection offers: the Notation Lens when it is in
+    /// notes, the patch agent when there is a patch, the score's agent always.
+    private var lensModes: (available: Set<LensMode>, unavailable: [LensMode: String]) {
+        var available: Set<LensMode> = [.graphics]
+        var unavailable: [LensMode: String] = [:]
+        if LensScoreBuilder.build(tree: tree, selection: selectionUTF8()) != nil { available.insert(.notation) }
+        else { unavailable[.notation] = "No notes here to show (a graphic, or a part the lens can't draw)" }
+        if score.patchURL != nil { available.insert(.patch) }
+        else { unavailable[.patch] = "This score has no Pondside patch yet: File › Make Patch Pondside-Ready… (␣ f m)" }
+        return (available, unavailable)
+    }
+
+    private func configureLensModes(_ popover: AgentRequestPopover) {
+        let modes = lensModes
+        popover.available = modes.available
+        popover.unavailable = modes.unavailable
+        popover.onSwitch = { [weak self] m in self?.openLens(m) }
+    }
+
+    /// Opens the lens for `mode` at the selection (the bar, ⇥).
+    private func openLens(_ mode: LensMode) {
+        switch mode {
+        case .notation: showLens(closesOnRender: false)
+        case .graphics: showRequest(fromLens: true)
+        case .patch: showPatchRequest(fromLens: true)
+        }
     }
 
     /// `patch_context` at the selection (DESIGN.md §8): the cue there, its
@@ -2172,7 +2204,10 @@ extension DocumentWindowController: CommandResponder {
         let graphic = context["graphic"]
         log.log("context", graphic == nil ? "No graphic at the selection: the agent gets the event and staff only"
                     : "Selection: \(graphic?["command"]?.string ?? graphic?["entry"]?.string ?? "a graphic")"
-                      + (graphic?["drawing"] == nil ? "" : " with its drawing code"),
+                      + (graphic?["drawing"] == nil ? "" : " with its drawing code")
+                      + (context["selection"]?["x"]?.array.map { x in
+                          " · highlighted part x " + x.compactMap(\.number).map { String(format: "%.2f", $0) }.joined(separator: "–") }
+                         ?? " · the whole graphic (no part highlighted)"),
                 level: graphic == nil ? .warning : .info, detail: contextText)
         log.log("prompt", "\(session.turns > 0 ? "Follow-up" : "First") request, \(prompt.count) characters"
                     + (session.turns > 0 ? " (turn \(session.turns + 1))" : ""), detail: prompt, limit: AgentLog.promptLimit)

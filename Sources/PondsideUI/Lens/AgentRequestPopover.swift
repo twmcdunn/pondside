@@ -14,39 +14,37 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
 
     /// Called with the request when ↩ is pressed.
     var onSubmit: ((String) -> Void)?
-    /// ⇥: back to the notation lens (nil for a graphic, which has none).
-    var onTab: (() -> Void)?
-    /// Where ⇥ goes, for the caption: "lens", "patch".
-    var tabLabel = "lens"
     /// The field's prompt; nil for the score's.
     var placeholder: String?
+    /// What it shows below the field: the selection, and a few examples.
+    var detail = ""
 
-    /// Which agent the line talks to, shown as an icon switch at its top so
-    /// it is clear whether a request is about the graphics or the patch.
-    enum Mode { case graphics, patch }
-    var mode: Mode = .graphics
-    /// Clicking the other side of the switch (nil: the score has no patch,
-    /// and the patch side says so).
-    var onSwitch: ((Mode) -> Void)?
-    private let modes = NSSegmentedControl()
-
-    static func icon(_ mode: Mode) -> NSImage? {
-        NSImage(systemSymbolName: mode == .graphics ? "scribble.variable" : "waveform",
-                accessibilityDescription: mode == .graphics ? "Graphics" : "SuperCollider patch")
-    }
+    /// Which agent the line talks to (graphics or patch), and which other
+    /// lenses ⇥ and the bar can switch to.
+    var mode: LensMode = .graphics
+    var available: Set<LensMode> = []
+    var unavailable: [LensMode: String] = [:]
+    /// The bar was clicked, or ⇥ pressed: open that lens instead.
+    var onSwitch: ((LensMode) -> Void)?
+    private let modes = LensModeBar()
+    private let detailLabel = NSTextField(wrappingLabelWithString: "")
 
     var isOpen: Bool { popover?.isShown == true }
 
     /// `title`: what is selected ("\startGrains · bar 4"); `agent`: who
     /// will do it, or nil when no agent is set up (the field is disabled
-    /// and the caption says where to choose one).
+    /// and the caption says where to choose one). The same size as the
+    /// Notation Lens, so ⇥ between them doesn't resize anything.
     func present(title: String, agent: String?, anchor: NSRect, in view: NSView) {
         popover?.close()
+        let size = LensMode.size(for: LensAnchor(rect: anchor, view: view))
         let card = NSView()
         card.translatesAutoresizingMaskIntoConstraints = false
         card.setAccessibilityElement(true)
         card.setAccessibilityRole(.group)
         card.setAccessibilityLabel("Describe a change to \(title)")
+        card.wantsLayer = true
+        card.layer?.backgroundColor = Theme.chrome.withAlphaComponent(0.72).cgColor
 
         field.placeholderString = placeholder ?? "Describe what you want… e.g. grainy swell till m. 3"
         field.font = Theme.bodyFont
@@ -58,46 +56,44 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
         caption.font = Theme.secondaryFont
         caption.textColor = Theme.glassSecondaryText
         caption.lineBreakMode = .byTruncatingMiddle
-        let tab = onTab == nil ? "" : "  ⇥ \(tabLabel)"
+        let tab = mode.next(among: available).map { "  ⇥ \($0.title.lowercased())" } ?? ""
         caption.stringValue = agent.map { "\(title)    \($0) · ↩ go\(tab)  ⎋ close" }
             ?? "\(title)    No agent is set up: choose one in Settings (⌘,)"
         caption.translatesAutoresizingMaskIntoConstraints = false
-        modes.segmentCount = 2
-        modes.segmentStyle = .rounded
-        modes.trackingMode = .selectOne
-        for (i, m) in [Mode.graphics, .patch].enumerated() {
-            modes.setImage(Self.icon(m), forSegment: i)
-            modes.setLabel(m == .graphics ? "Graphics" : "SuperCollider", forSegment: i)
-            modes.setImageScaling(.scaleProportionallyDown, forSegment: i)
+        detailLabel.font = Theme.secondaryFont
+        detailLabel.textColor = Theme.glassSecondaryText
+        detailLabel.stringValue = detail
+        detailLabel.maximumNumberOfLines = 5
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        modes.configure(current: mode, available: available, unavailable: unavailable)
+        modes.onSelect = { [weak self] m in
+            guard let self, m != self.mode else { return }
+            self.close()
+            self.onSwitch?(m)
         }
-        modes.setToolTip("Ask the score's agent about the graphics and notation", forSegment: 0)
-        modes.setToolTip(onSwitch == nil && mode == .graphics ? "This score has no Pondside patch yet (File › Make Patch Pondside-Ready…)"
-                            : "Ask the patch agent to change the SuperCollider patch at this point", forSegment: 1)
-        modes.setEnabled(mode == .patch || onSwitch != nil, forSegment: 1)
-        modes.setEnabled(mode == .graphics || onSwitch != nil, forSegment: 0)
-        modes.selectedSegment = mode == .graphics ? 0 : 1
-        modes.target = self
-        modes.action = #selector(switchMode(_:))
         modes.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(modes)
-        card.addSubview(field)
-        card.addSubview(caption)
+        for v in [modes, field, caption, detailLabel] as [NSView] { card.addSubview(v) }
         NSLayoutConstraint.activate([
-            card.widthAnchor.constraint(equalToConstant: 420),
-            modes.topAnchor.constraint(equalTo: card.topAnchor, constant: 10),
-            modes.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
-            field.topAnchor.constraint(equalTo: modes.bottomAnchor, constant: 8),
+            card.widthAnchor.constraint(equalToConstant: size.width),
+            card.heightAnchor.constraint(equalToConstant: size.height),
+            modes.topAnchor.constraint(equalTo: card.topAnchor, constant: 6),
+            modes.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 8),
+            field.topAnchor.constraint(equalTo: card.topAnchor, constant: LensMode.barHeight + 8),
             field.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 10),
             field.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -10),
-            caption.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
+            detailLabel.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 10),
+            detailLabel.leadingAnchor.constraint(equalTo: field.leadingAnchor, constant: 2),
+            detailLabel.trailingAnchor.constraint(equalTo: field.trailingAnchor),
             caption.leadingAnchor.constraint(equalTo: field.leadingAnchor, constant: 2),
             caption.trailingAnchor.constraint(equalTo: field.trailingAnchor),
             caption.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -8),
         ])
         let controller = NSViewController()
         controller.view = card
+        controller.preferredContentSize = size
         let p = NSPopover()
         p.contentViewController = controller
+        p.contentSize = size
         p.behavior = .transient
         p.animates = false
         p.appearance = view.window?.appearance
@@ -112,12 +108,6 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
         popover?.close()
     }
 
-    @objc private func switchMode(_ sender: NSSegmentedControl) {
-        let picked: Mode = sender.selectedSegment == 0 ? .graphics : .patch
-        guard picked != mode, let onSwitch else { return }
-        close()
-        onSwitch(picked)
-    }
 
     func popoverDidClose(_ notification: Notification) {
         popover = nil
@@ -136,9 +126,9 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
             close()
             return true
         case #selector(NSResponder.insertTab(_:)):
-            guard let onTab else { return true }
+            guard let next = mode.next(among: available) else { return true }
             close()
-            onTab()
+            onSwitch?(next)
             return true
         default:
             return false

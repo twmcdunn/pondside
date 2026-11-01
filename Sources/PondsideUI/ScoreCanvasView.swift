@@ -330,18 +330,16 @@ final class ScoreCanvasView: NSView {
     /// (above it), never on it.
     private var workBadge: NSView?
 
-    /// Marks the current selection as the agent's work in progress: its
-    /// outline pulses until `endWork`, and a capsule above it says who is
-    /// working. HIG Progress indicators: indeterminate, on the content it
-    /// describes; the music stays fully readable (no blur, no dimming).
+    /// Marks the current selection as the agent's work in progress until
+    /// `endWork`: its outline pulses, and the music inside it fades between
+    /// blurred and sharp, so the region reads as "being redrawn" while
+    /// staying readable every cycle. No spinner: the status bar says in
+    /// words what the agent is doing.
     func beginWork(label: String) {
         for v in pageViews { v.working = v.highlights }
         guard pageViews.contains(where: { !$0.working.isEmpty }) else { return }
         workBadge?.removeFromSuperview()
-        let badge = WorkBadge(label: label)
-        addSubview(badge)
-        workBadge = badge
-        placeWorkBadge()
+        workBadge = nil
         NSAccessibility.post(element: NSApp.mainWindow as Any, notification: .announcementRequested,
                              userInfo: [.announcement: "\(label) on the selection", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
     }
@@ -558,6 +556,8 @@ private final class PageView: NSView {
     /// layer of its own, so the pulse never redraws the music.
     var working: [Rect] = [] { didSet { if working != oldValue { updateWork() } } }
     private let workLayer = CAShapeLayer()
+    /// A blurred copy of the music in the work region, faded in and out.
+    private let blurLayer = CALayer()
     private var displayOptionsObserver: NSObjectProtocol?
 
     /// The work region in view coordinates, padded like the outline.
@@ -585,6 +585,11 @@ private final class PageView: NSView {
         workLayer.isHidden = true
         workLayer.zPosition = 1
         layer?.addSublayer(workLayer)
+        layerUsesCoreImageFilters = true
+        blurLayer.isHidden = true
+        blurLayer.zPosition = 0.5
+        blurLayer.masksToBounds = true
+        layer?.addSublayer(blurLayer)
         displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateWork() }
@@ -621,6 +626,9 @@ private final class PageView: NSView {
         guard !working.isEmpty else {
             workLayer.removeAllAnimations()
             workLayer.isHidden = true
+            blurLayer.removeAllAnimations()
+            blurLayer.isHidden = true
+            blurLayer.contents = nil
             return
         }
         let path = CGMutablePath()
@@ -632,9 +640,10 @@ private final class PageView: NSView {
         let still = ws.accessibilityDisplayShouldReduceMotion
         workLayer.frame = bounds
         workLayer.path = path
-        workLayer.fillColor = Theme.accent.withAlphaComponent(contrast ? 0.22 : 0.12).cgColor
+        workLayer.fillColor = Theme.accent.withAlphaComponent(contrast ? 0.26 : 0.18).cgColor
         workLayer.strokeColor = Theme.accent.cgColor
-        workLayer.lineWidth = contrast ? 2.5 : 1.75
+        workLayer.lineWidth = contrast ? 3 : 2.25
+        updateBlur(still: still)
         workLayer.lineDashPattern = still ? [5, 3] : nil
         workLayer.isHidden = false
         if still {
@@ -643,12 +652,42 @@ private final class PageView: NSView {
         } else if workLayer.animation(forKey: "pondside.working") == nil {
             let pulse = CABasicAnimation(keyPath: "opacity")
             pulse.fromValue = 1.0
-            pulse.toValue = contrast ? 0.55 : 0.3
+            pulse.toValue = contrast ? 0.35 : 0.08
             pulse.duration = 1.1
             pulse.autoreverses = true
             pulse.repeatCount = .infinity
             pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
             workLayer.add(pulse, forKey: "pondside.working")
+        }
+    }
+
+    /// The blurred copy of the work region: the page's own drawing of it,
+    /// through a Gaussian blur, its opacity breathing in step with the
+    /// outline (blurred as the outline fades, sharp as it returns).
+    private func updateBlur(still: Bool) {
+        guard !still, let first = working.first else {
+            blurLayer.removeAllAnimations()
+            blurLayer.isHidden = true
+            return
+        }
+        let region = working.dropFirst().reduce(viewRect(for: first)) { $0.union(viewRect(for: $1)) }
+            .insetBy(dx: -6, dy: -6).intersection(bounds)
+        guard region.width > 1, region.height > 1, let rep = bitmapImageRepForCachingDisplay(in: region) else { return }
+        cacheDisplay(in: region, to: rep)
+        blurLayer.frame = region
+        blurLayer.contents = rep.cgImage
+        blurLayer.contentsScale = window?.backingScaleFactor ?? 2
+        blurLayer.filters = [CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 3.5])].compactMap { $0 }
+        blurLayer.isHidden = false
+        if blurLayer.animation(forKey: "pondside.blur") == nil {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.0
+            fade.toValue = 1.0
+            fade.duration = 1.1
+            fade.autoreverses = true
+            fade.repeatCount = .infinity
+            fade.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            blurLayer.add(fade, forKey: "pondside.blur")
         }
     }
 

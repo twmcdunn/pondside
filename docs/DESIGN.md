@@ -858,6 +858,16 @@ feedback delay, FDN tail, reverb, a buffer-free granulator) and pattern
 parts (pitches from a collection, glide, density, cloud, effects on a
 pattern). `SCLexiconTests` compiles them all in sclang.
 
+**One lens, three views (2026-11-01).** The Notation Lens and the two
+request lines share a mode bar (Notation · Graphics · SuperCollider, each
+with its icon) and one size, so ⇥ (in that order, skipping what the
+selection doesn't offer) and the bar change only what is below the bar. A
+mode that isn't available is greyed, with a tooltip saying why. While an
+agent works the highlighted region pulses and fades between blurred and
+sharp; there is no spinner. The highlighted part of a large drawing is
+always the one the agent's `selection` describes, however the highlight
+was made (a click, the keyboard, a re-highlight after an engraving).
+
 ## 9. What remains
 
 Built in this pass (2026-10-28) and no longer listed: the graphics kit and

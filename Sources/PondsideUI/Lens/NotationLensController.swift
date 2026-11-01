@@ -16,6 +16,19 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
 
     var onClose: (() -> Void)?
     var onFailure: ((String) -> Void)?
+    var onSwitch: ((LensMode) -> Void)?
+    var available: Set<LensMode> = []
+    var unavailable: [LensMode: String] = [:]
+
+    private func configure(_ card: NotationLensOverlayView) {
+        card.tabTarget = LensMode.notation.next(among: available)?.title.lowercased()
+        card.modes.configure(current: .notation, available: available, unavailable: unavailable)
+        card.modes.onSelect = { [weak self] m in
+            guard let self, m != .notation else { return }
+            self.dismiss(animated: false)
+            self.onSwitch?(m)
+        }
+    }
 
     var isOpen: Bool { popover?.isShown == true }
 
@@ -31,6 +44,7 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
                 onFailure?("Notation Lens could not display this passage")
                 return false
             }
+            configure(card)
             card.update(lens: lens, fileLabel: fileLabel, explicit: explicit)
             popover.animates = false
             // Following the cursor note by note is too much motion: the
@@ -55,10 +69,11 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
             return false
         }
         let card = NotationLensOverlayView(host: host)
+        configure(card)
         card.update(lens: lens, fileLabel: fileLabel, explicit: explicit)
         // Auto Layout sizes a popover to its content's fitting size, and the
         // strip has no intrinsic width: pin the card, or it collapses.
-        let size = NSSize(width: Self.width(for: anchor), height: NotationLensOverlayView.musicHeight + 42)
+        let size = LensMode.size(for: anchor)
         card.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             card.widthAnchor.constraint(equalToConstant: size.width),
@@ -91,12 +106,6 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
 
     private static func sameLine(_ a: NSRect, _ b: NSRect) -> Bool {
         a.minY < b.maxY && b.minY < a.maxY
-    }
-
-    /// Wide enough for a few bars, never wider than the score pane allows.
-    private static func width(for anchor: LensAnchor) -> CGFloat {
-        let room = anchor.view.enclosingScrollView?.contentView.bounds.width ?? anchor.view.bounds.width
-        return min(640, max(380, room - 48))
     }
 
     func dismiss(animated: Bool) {

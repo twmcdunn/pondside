@@ -11,6 +11,11 @@ final class NotationLensOverlayView: NSView {
     private let host: LensScoreHostView
     private let footer = NSTextField(labelWithString: "")
     private let badge = NSTextField(labelWithString: "")
+    /// The same switch as the request lines', so ⇥ between them only
+    /// changes what is below it.
+    let modes = LensModeBar()
+    /// Where ⇥ goes, for the footer ("graphics"); nil when nowhere.
+    var tabTarget: String?
 
     static let musicHeight: CGFloat = 136
 
@@ -45,11 +50,15 @@ final class NotationLensOverlayView: NSView {
         badge.translatesAutoresizingMaskIntoConstraints = false
         addSubview(footer)
         addSubview(badge)
+        modes.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(modes)
 
         NSLayoutConstraint.activate([
             paper.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             paper.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            paper.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            modes.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            modes.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            paper.topAnchor.constraint(equalTo: topAnchor, constant: LensMode.barHeight + 8),
             paper.heightAnchor.constraint(equalToConstant: Self.musicHeight),
             host.leadingAnchor.constraint(equalTo: paper.leadingAnchor, constant: 10),
             host.trailingAnchor.constraint(equalTo: paper.trailingAnchor, constant: -10),
@@ -71,7 +80,8 @@ final class NotationLensOverlayView: NSView {
         let staff = lens.label.map { " · \($0)" } ?? ""
         let bars = lens.bars.count == 1 ? "bar \(lens.bars.lowerBound)" : "bars \(lens.bars.lowerBound)–\(lens.bars.upperBound)"
         // An edit's lens closes on the next render; say how to keep it.
-        let keys = explicit ? "←→ step  ⎋ close" : "⌘L keep open  ←→ step  ⎋ close"
+        let tab = tabTarget.map { "  ⇥ \($0)" } ?? ""
+        let keys = (explicit ? "←→ step" : "⌘L keep open  ←→ step") + tab + "  ⎋ close"
         footer.stringValue = "\(fileLabel)\(staff) · \(bars)    \(keys)"
         let unsupported = lens.unsupported
         badge.stringValue = unsupported.isEmpty ? "" : unsupported.joined(separator: " · ")
