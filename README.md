@@ -159,3 +159,12 @@ Everything the CLI and MCP server offer is documented in [docs/API.md](docs/API.
 
 CI builds and tests the portable modules on Linux and everything on macOS.
 `scripts/check-seam.sh` rejects Apple-only imports below the seam.
+
+## Licence
+
+Pondside is free software under the [Apache License 2.0](LICENSE): use,
+change and redistribute it however you like, commercially or not. Keep the
+[NOTICE](NOTICE) with any copy or derived work, and please acknowledge the
+project ("Made with Pondside"); [CITATION.cff](CITATION.cff) has a citation.
+GNU LilyPond, SuperCollider and the other programs Pondside runs or bundles
+keep their own licences: see [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md).

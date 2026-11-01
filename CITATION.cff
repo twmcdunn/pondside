@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use Pondside, please cite it as below."
+title: "Pondside"
+abstract: "A macOS LilyPond notation app with a portable core, CLI and MCP server, graphic notation and SuperCollider live electronics."
+authors:
+  - family-names: McDunn
+    given-names: Tim
+repository-code: "https://github.com/twmcdunn/pondside"
+license: Apache-2.0
+type: software

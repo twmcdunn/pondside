@@ -1,0 +1,17 @@
+Pondside
+Copyright 2026 Tim McDunn
+
+This product includes software developed as part of the Pondside project
+(https://github.com/twmcdunn/pondside).
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). Under its
+section 4(d), redistributions of Pondside or of works derived from it must
+carry this NOTICE file (or its attribution notices) with them.
+
+If you use Pondside, or code from it, in your own software, scores,
+research or performances, please acknowledge the project, for example:
+"Made with Pondside (https://github.com/twmcdunn/pondside)". CITATION.cff
+gives a citation for academic work.
+
+Pondside runs, and its installer bundles, programs that have their own
+licences (GNU LilyPond, SuperCollider and others): see ACKNOWLEDGEMENTS.md.
