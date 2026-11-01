@@ -4,12 +4,12 @@
 #(define pondside-lexicon-cues (make-hash-table))
 #(define (pondside-lexicon-register! id proc) (hash-set! pondside-lexicon-impls id proc))
 \include "/Users/maestro/Documents/Coding/pondside/.build/Pondside.app/Contents/Resources/Pondside_PondsideLexicon.bundle/Contents/Resources/Core/Lexicon/kit/pondside-graphics.ily"
-#(hash-set! pondside-lexicon-defaults "aleatoric-box" '((label . "") (top . 3.5) (bottom . -3.5) (thickness . 0.16) (padding . 0.6)))
-#(hash-set! pondside-graphics-defaults "aleatoric-box" '((label . "") (top . 3.5) (bottom . -3.5) (thickness . 0.16) (padding . 0.6)))
-\include "/Users/maestro/Documents/Coding/pondside/.build/Pondside.app/Contents/Resources/Pondside_PondsideLexicon.bundle/Contents/Resources/Core/Lexicon/entries/aleatoric-box/impl.ily"
 #(hash-set! pondside-lexicon-defaults "scribble" '((density . 0.5) (height . ("constant" 1.5)) (centre . 0) (length . 0.6) (spread . 60) (thickness . 0.08) (seed . 0)))
 #(hash-set! pondside-graphics-defaults "scribble" '((density . 0.5) (height . ("constant" 1.5)) (centre . 0) (length . 0.6) (spread . 60) (thickness . 0.08) (seed . 0)))
 \include "/Users/maestro/Documents/Coding/pondside/.build/Pondside.app/Contents/Resources/Pondside_PondsideLexicon.bundle/Contents/Resources/Core/Lexicon/entries/scribble/impl.ily"
+#(hash-set! pondside-lexicon-defaults "staff-ripple" '((amplitude . ("swell" 1 0 0.5)) (curl . 0.8) (wavelength . 1.2) (lines . 5) (thickness . 0.1) (seed . 0)))
+#(hash-set! pondside-graphics-defaults "staff-ripple" '((amplitude . ("swell" 1 0 0.5)) (curl . 0.8) (wavelength . 1.2) (lines . 5) (thickness . 0.1) (seed . 0)))
+\include "/Users/maestro/Documents/Coding/pondside/.build/Pondside.app/Contents/Resources/Pondside_PondsideLexicon.bundle/Contents/Resources/Core/Lexicon/entries/staff-ripple/impl.ily"
 
 lexicon =
 #(define-music-function (id params music) (string? list? ly:music?)

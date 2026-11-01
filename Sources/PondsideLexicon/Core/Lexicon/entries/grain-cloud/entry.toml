@@ -1,6 +1,6 @@
 schema   = 1
 id       = "grain-cloud"
-version  = "1.0.0"
+version  = "1.1.0"
 gloss    = "Grainy texture: seeded dots in a band whose height and centre follow envelopes"
 tags     = ["graphic", "texture", "grains", "electronics", "aleatoric"]
 kind     = "graphic"
@@ -13,11 +13,11 @@ attaches  = "span"
 music-arg = false
 
 [params.density]
-type    = "float"
+type    = "envelope"
 default = 0.6
 min     = 0.0
 max     = 4.0
-doc     = "Dots per square staff space, divided by four: 1 is dense, 0.2 sparse"
+doc     = "Dots per square staff space, divided by four, over the span: 1 is dense, 0.2 sparse; (linear 0.1 1.5) grows denser"
 
 [params.height]
 type    = "envelope"

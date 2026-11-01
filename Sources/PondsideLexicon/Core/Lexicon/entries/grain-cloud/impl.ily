@@ -1,15 +1,15 @@
-% grain-cloud: seeded dots in a band; height and centre are envelopes over the span.
+% grain-cloud: seeded dots in a band; density, height and centre are envelopes over the span.
 #(define-graphic! "grain-cloud"
   (lambda (g p)
     (let* ((rs (g-random g))
            (step 0.25)
-           (density (assq-ref p 'density))
            (avoid (g-clear-of g (map (lambda (s) (if (string? s) (string->symbol s) s)) (or (assq-ref p 'avoid) '())))))
       (append-map
        (lambda (k)
          (let* ((u (* k step)) (q (g-q g u))
                 (h (max 0 (env-at (assq-ref p 'height) q)))
                 (c (env-at (assq-ref p 'centre) q))
+                (density (max 0 (env-at (assq-ref p 'density) q)))
                 ; expected dots in this slice, made whole with a random rounding
                 (expected (* 4 density step 2 h))
                 (n (inexact->exact (floor (+ expected (random 1.0 rs))))))

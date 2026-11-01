@@ -1,6 +1,6 @@
 schema   = 1
 id       = "scribble"
-version  = "1.0.0"
+version  = "1.1.0"
 gloss    = "Short random strokes in a band: a rough, scratchy texture"
 tags     = ["graphic", "texture", "strokes", "noise"]
 kind     = "graphic"
@@ -13,11 +13,11 @@ attaches  = "span"
 music-arg = false
 
 [params.density]
-type    = "float"
+type    = "envelope"
 default = 0.5
 min     = 0.0
 max     = 3.0
-doc     = "Strokes per square staff space"
+doc     = "Strokes per square staff space, over the span: (linear 0.1 2) grows denser"
 
 [params.height]
 type    = "envelope"

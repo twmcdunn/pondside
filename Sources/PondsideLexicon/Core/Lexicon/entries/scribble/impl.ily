@@ -8,7 +8,7 @@
          (let* ((u (* k step)) (q (g-q g u))
                 (h (max 0 (env-at (assq-ref p 'height) q)))
                 (c (env-at (assq-ref p 'centre) q))
-                (n (inexact->exact (floor (+ (* (assq-ref p 'density) step 2 h) (random 1.0 rs))))))
+                (n (inexact->exact (floor (+ (* (max 0 (env-at (assq-ref p 'density) q)) step 2 h) (random 1.0 rs))))))
            (map (lambda (i)
                   (let* ((x (+ u (g-rand rs 0 step))) (y (+ c (g-rand rs (- h) h)))
                          (a (g-rand rs (- spread) spread))

@@ -32,7 +32,7 @@ lower = \relative c {
   d4 r r16 a' b cis  d e f d |
   e,8 cis' d,4 r16 d e f g e f d |
   c!4 bes8 a d bes a4 |
-  bes8( a--( g f  e4->) |
+  bes8( a--( g f  e4->)
  a,8 d e\startGraphic "scribble" #'() d bes cis  d2\stopGraphic |
   a1~ |
   a2 d, \bar "|."
@@ -44,7 +44,16 @@ lower = \relative c {
 \score {
   \new PianoStaff <<
     \new Staff = "up" \upper
-    \new Staff = "down" \lower
+    \new Staff = "down" <<
+      \lower
+      \new Voice {
+        s1*4
+        \stopStaff \override Staff.StaffSymbol.transparent = ##t \startStaff
+        s1\startGraphic "staff-ripple" #'((amplitude . (swell 1 0 0.5)) (curl . 0) (wavelength . 2) (seed . 1))
+        \stopStaff \revert Staff.StaffSymbol.transparent \startStaff
+        s1\stopGraphic
+      }
+    >>
   >>
   \layout {
     \context {
