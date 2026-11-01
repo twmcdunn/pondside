@@ -15,7 +15,8 @@ CLI, MCP and file formats are in docs/API.md.
 
 ```
 score.ly, *.ily             the score (the project's root)
-renders/score.wav           the mockup: `pondside mockup`, after every good engraving (⌘⇧P plays it)
+renders/score.wav           the mockup: `pondside mockup`, after every good engraving that can change the sound (⌘⇧P plays it)
+renders/score.mockup-key    what the mockup was made from (MIDI, cues, parts, settings): an unchanged key leaves the WAV and the mix alone
 renders/score.cues          its cue times: seconds<TAB>bar<TAB>cue N
 renders/score.mix.wav       the patch rendered against the mockup: `pondside mix`, after each mockup (⌘⌥P)
 patch/score.scd             the patch: the composer's
@@ -80,6 +81,30 @@ composer has already written that cue's handler outside the markers. It
 also updates each header line, and comments out (`//~ `) the handlers whose
 cue has left the score; if the cue comes back, the handler is restored
 exactly. Pondside never changes code between the markers.
+
+## Which SuperCollider runs
+
+Pondside uses SuperCollider.app when it is installed (with the user's
+Extensions and quarks), else the headless SuperCollider the installer
+bundles in `/Library/Application Support/Pondside/Toolchain/supercollider`:
+sclang and scsynth built without Qt (`scripts/installer/build-supercollider.sh`),
+about 15 MB, linking only system libraries. It has no IDE and no GUI
+classes (`Window`, sliders), which belong in `// @pondside live` blocks
+anyway, and it runs with a config that leaves out the user's Extensions,
+since those may need Qt. `PONDSIDE_SCLANG` or `pondside.toml`'s
+`[supercollider] path` chooses another.
+
+## What renders when
+
+After a good engraving the app runs `pondside mockup`, then `pondside mix`,
+but only as far as the sound can have changed:
+- an edit only to `front-matter.ily` (the legend, the cover) runs neither;
+- `pondside mockup` keeps a key of the MIDI, the cue times, the parts and
+  its settings, and when it matches leaves `score.wav` (and `score.cues`)
+  untouched: a graphic, a comment or a layout change costs one playback
+  compile and nothing more (`--force` renders anyway);
+- the mix renders only when the mockup, the cue times, the patch or a file
+  it loads changed since the last mix (a failed mix tries again).
 
 ## The engine (`patch/dependencies/pondside.scd`)
 

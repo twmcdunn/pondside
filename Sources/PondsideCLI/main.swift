@@ -566,13 +566,35 @@ func mockup(_ args: Arguments) async throws -> Int32 {
     let sheet = CueSheet(log: playback.timing, score: source.lastPathComponent, sampleRate: rate)
     if !sheet.cues.isEmpty {
         let cues = out.deletingPathExtension().appendingPathExtension("cues")
-        try Data(sheet.cuesText.utf8).write(to: cues, options: .atomic)
+        // Rewritten only when the times change: the app re-renders the mix when it does.
+        if (try? String(contentsOf: cues, encoding: .utf8)) != sheet.cuesText {
+            try Data(sheet.cuesText.utf8).write(to: cues, options: .atomic)
+        }
         print("\(cues.path): \(sheet.cues.count) cues")
     }
-    let (used, info) = try await renderer.render(midi: midi, to: out, only: only)
-    finish(out, used, info)
     // Passages the MIDI can't play (improvisations), at their marks.
     let partsDirs = MockupParts.folders(score: source, configured: config.parts)
+    // Nothing audible changed (a graphic, the legend, a comment): the same
+    // MIDI, cues, parts and settings as the last render leave its WAV as it
+    // is, so the app sees no new mockup and doesn't render the mix again.
+    func stamp(_ u: URL) -> String {
+        let a = try? FileManager.default.attributesOfItem(atPath: u.path)
+        return "\(u.path):\((a?[.size] as? Int) ?? 0):\(((a?[.modificationDate] as? Date)?.timeIntervalSince1970) ?? 0)"
+    }
+    let parts = config.hook == nil ? MockupParts.find(marks: sheet.marks, folders: partsDirs) : []
+    let soundKey = ContentHash(bytes: (try? Data(contentsOf: midi)) ?? Data()).description + "|" + ContentHash(sheet.cuesText).description
+        + "|\(rate)|\(only?.rawValue ?? "auto")|\(renderer.soundFont?.path ?? "")|\(end.map { String($0) } ?? "")|"
+        + (config.hook.map(stamp) ?? "") + "|" + parts.map { stamp($0.file) + "@\($0.start)" }.joined(separator: ",")
+        + (args.flags.contains("stems") ? "|stems" : "")
+    let keyFile = out.deletingPathExtension().appendingPathExtension("mockup-key")
+    if FileManager.default.fileExists(atPath: out.path), (try? String(contentsOf: keyFile, encoding: .utf8)) == soundKey,
+       !args.flags.contains("force") {
+        print("\(out.path): unchanged (same MIDI, cues and parts; --force renders anyway)")
+        return 0
+    }
+    try? FileManager.default.removeItem(at: keyFile)
+    let (used, info) = try await renderer.render(midi: midi, to: out, only: only)
+    finish(out, used, info)
     if let hook = config.hook {
         guard let sclang = SuperColliderToolchain.findSclang(configured: config.sclang?.path) else {
             throw CLIError("[audio] hook needs SuperCollider (not found)")
@@ -581,7 +603,6 @@ func mockup(_ args: Arguments) async throws -> Int32 {
                                       partsDir: partsDirs[0])
         print("\(out.lastPathComponent): \(hook.lastPathComponent) rendered the \(config.hookMarks) parts into it")
     } else {
-        let parts = MockupParts.find(marks: sheet.marks, folders: partsDirs)
         if !parts.isEmpty {
             try MockupParts.mix(parts, into: out)
             print("\(out.lastPathComponent): mixed in " + parts.map { "\($0.file.lastPathComponent) at \(String(format: "%.1f", $0.start)) s" }.joined(separator: ", "))
@@ -607,6 +628,8 @@ func mockup(_ args: Arguments) async throws -> Int32 {
             }
         }
     }
+    // Written last: a render that failed part-way renders again next time.
+    try? Data(soundKey.utf8).write(to: keyFile, options: .atomic)
     return 0
 }
 

@@ -434,6 +434,14 @@ final class ScoreDocument {
     /// cue times, so they match the audio (repeats played out, \articulate).
     /// A render is never killed (MuseScore would be orphaned): engravings
     /// during one queue a single re-render of the newest text.
+    /// The score's files as the last mockup started from: an edit that
+    /// touched only the front matter (the legend, the cover) can't change the
+    /// sound, so it renders nothing.
+    private var mockupTexts: [URL: String]?
+    /// What the last mix was rendered from (the mockup, its cues, the patch
+    /// and what it loads): the mix renders only when one of them changed.
+    private var mixInputs: String?
+
     private func renderMockup() {
         guard let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
               FileManager.default.isExecutableFile(atPath: tool.path) else { return }
@@ -441,6 +449,15 @@ final class ScoreDocument {
             mockupPending = true
             return
         }
+        let texts = Dictionary(files.map { ($0.url.standardizedFileURL, $0.text) }, uniquingKeysWith: { a, _ in a })
+        if let last = mockupTexts {
+            let changed = Set(texts.keys).union(last.keys).filter { texts[$0] != last[$0] }
+            if changed.isEmpty || changed.allSatisfy({ $0.lastPathComponent == FrontMatter.fileName }) {
+                mockupTexts = texts
+                return
+            }
+        }
+        mockupTexts = texts
         let process = Process()
         process.executableURL = tool
         let timing = workDirectory.appendingPathComponent("playback-\(UUID().uuidString).timing")
@@ -508,12 +525,22 @@ final class ScoreDocument {
     /// The score with its electronics (`pondside mix`: the patch rendered
     /// offline in mockup mode) into `<name>.mix.wav`, after each mockup.
     func renderMix() {
-        guard patchURL != nil, let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
+        guard let patch = patchURL, let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
               FileManager.default.isExecutableFile(atPath: tool.path) else { return }
         if mixRunning {
             mixPending = true
             return
         }
+        // Nothing the mix hears changed (the mockup wasn't rewritten, the
+        // patch is as it was): keep the last mix.
+        func stamp(_ u: URL) -> String {
+            let a = try? FileManager.default.attributesOfItem(atPath: u.path)
+            return "\((a?[.size] as? Int) ?? -1):\(((a?[.modificationDate] as? Date)?.timeIntervalSince1970) ?? 0)"
+        }
+        let inputs = ([HandlerSync.Layout.mockup(score: url), HandlerSync.Layout.cues(score: url), patch] + PatchMigration.dependencies(of: patch))
+            .map(stamp).joined(separator: "|")
+        if inputs == mixInputs, FileManager.default.fileExists(atPath: HandlerSync.Layout.mix(score: url).path) { return }
+        mixInputs = inputs
         let process = Process()
         process.executableURL = tool
         process.arguments = ["mix", url.path]
@@ -530,6 +557,7 @@ final class ScoreDocument {
                 guard let doc = ref.value else { return }
                 doc.mixRunning = false
                 doc.mixProblem = ok ? nil : message.split(separator: "\n").last.map(String.init) ?? "the patch didn't render"
+                if !ok { doc.mixInputs = nil }   // try again next time
                 if doc.mixPending {
                     doc.mixPending = false
                     doc.renderMix()

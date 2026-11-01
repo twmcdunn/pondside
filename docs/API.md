@@ -23,7 +23,7 @@ pondside patch   score.ly [--scd f] [--from f] [--fix [--agent auto|claude|openc
 pondside lexicon list | search <words> | show <id> | impl <id>
 pondside lexicon check score.ly | include score.ly | lock score.ly
 pondside lexicon drafts | promote <id> [--to user] | discard <id>   agent drafts: only people promote them
-pondside mockup  score.ly [--out file.wav] [--stems] [--timing f]   the playback (below) as audio, padded to the
+pondside mockup  score.ly [--out file.wav] [--stems] [--timing f] [--force]   the playback (below) as audio, padded to the
                                                       end mark (renders/score.wav), its cue times beside it (renders/score.cues); --stems:
                                                       one file per staff (the app runs it after each good engraving)
 pondside history score.ly [--show <rev> [--file f]] [--restore <rev>]   checkpoints, kept outside your repo
