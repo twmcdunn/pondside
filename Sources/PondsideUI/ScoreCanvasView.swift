@@ -277,32 +277,33 @@ final class ScoreCanvasView: NSView {
                 guard group.count > 8 else { rects += group.map(\.bounds); continue }
                 guard !shownLarge.contains(link) else { continue }
                 let shapes = EngravedPage.clusters(of: group, gap: EngravedPage.clusterGap * space)
+                // The shape on screen: the one clicked, else the first. Whichever
+                // it is, the agent's context describes exactly it.
+                let shown: Rect?
                 if let focus = clickFocus, focus.link == link {
                     guard focus.view === v else { continue }
-                    let near = shapes.min { $0.distance(to: focus.point) < $1.distance(to: focus.point) }
-                    if let near {
-                        rects.append(near)
-                        shownLarge.insert(link)
-                        if graphicPartSelection == nil,
-                           let staff = page.staff(at: Point(near.midX, near.midY), among: v.staves) {
-                            let band = EngravedPage.systems(of: v.staves)
-                                .first { ($0.lowerBound - 6)...($0.upperBound + 6) ~= near.midY }
-                            let pieceParts = band.map { b in group.filter { b.contains($0.bounds.midY) } } ?? group
-                            if let piece = EngravedPage.bounds(of: pieceParts) {
-                                let middle = staff.lineYs.count > 2 ? staff.lineYs[staff.lineYs.count / 2] : staff.top
-                                let anchors = page.graphics.compactMap { g -> LinkAnchor? in
-                                    guard let gl = g.link, gl != link, band.map({ $0.contains(g.bounds.midY) }) ?? true else { return nil }
-                                    return LinkAnchor(x: g.bounds.midX, link: gl)
-                                }.sorted { abs($0.x - near.midX) < abs($1.x - near.midX) }.prefix(16)
-                                graphicPartSelection = GraphicPartSelection(page: index + 1, part: near, piece: piece,
-                                                                            staffMiddle: middle, space: staff.space,
-                                                                            anchors: Array(anchors))
-                            }
-                        }
+                    shown = shapes.min { $0.distance(to: focus.point) < $1.distance(to: focus.point) }
+                } else {
+                    shown = shapes.first
+                }
+                guard let near = shown else { continue }
+                rects.append(near)
+                shownLarge.insert(link)
+                if graphicPartSelection == nil,
+                   let staff = page.staff(at: Point(near.midX, near.midY), among: v.staves) {
+                    let band = EngravedPage.systems(of: v.staves)
+                        .first { ($0.lowerBound - 6)...($0.upperBound + 6) ~= near.midY }
+                    let pieceParts = band.map { b in group.filter { b.contains($0.bounds.midY) } } ?? group
+                    if let piece = EngravedPage.bounds(of: pieceParts) {
+                        let middle = staff.lineYs.count > 2 ? staff.lineYs[staff.lineYs.count / 2] : staff.top
+                        let anchors = page.graphics.compactMap { g -> LinkAnchor? in
+                            guard let gl = g.link, gl != link, band.map({ $0.contains(g.bounds.midY) }) ?? true else { return nil }
+                            return LinkAnchor(x: g.bounds.midX, link: gl)
+                        }.sorted { abs($0.x - near.midX) < abs($1.x - near.midX) }.prefix(16)
+                        graphicPartSelection = GraphicPartSelection(page: index + 1, part: near, piece: piece,
+                                                                    staffMiddle: middle, space: staff.space,
+                                                                    anchors: Array(anchors))
                     }
-                } else if let first = shapes.first {
-                    rects.append(first)
-                    shownLarge.insert(link)
                 }
             }
             v.highlights = rects
