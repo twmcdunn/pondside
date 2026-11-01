@@ -134,6 +134,12 @@ data out, and add a case to the kit's test score.
 
 ## Checks before offering it
 
+**Drafting from a terse request** ("birds here till 7"): one draft, then
+`lexicon_propose` → `graphic_insert` → `check`. `check` is the compile test
+(the app's warm engraving); skip `graphic_preview`, extremes and the version
+matrix. Run the full list below when the user wants to keep the entry (before
+`pondside lexicon promote`).
+
 1. `pondside lexicon check` on the score: no problems.
 2. `graphic_preview` with default params and with extremes of each param.
 3. Two compiles produce identical SVG (determinism).

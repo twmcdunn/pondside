@@ -56,11 +56,27 @@ public struct Graphic: Hashable, Sendable {
     public var bounds: Rect
     /// Source location, when the grob was compiled with point-and-click.
     public var link: PointAndClickLocation?
+    /// Only this part of it shows (a cropped legend example); `bounds` is
+    /// already within it.
+    public var clip: Rect?
 
-    public init(content: Content, bounds: Rect, link: PointAndClickLocation? = nil) {
+    public init(content: Content, bounds: Rect, link: PointAndClickLocation? = nil, clip: Rect? = nil) {
         self.content = content
         self.bounds = bounds
         self.link = link
+        self.clip = clip
+    }
+}
+
+/// An invisible named rectangle a front-matter markup leaves in the SVG
+/// (`pondside-legend:<name>` links): where a part of the legend is, so the
+/// canvas can arrange it. In document order.
+public struct PageMarker: Hashable, Sendable {
+    public var name: String
+    public var rect: Rect
+    public init(name: String, rect: Rect) {
+        self.name = name
+        self.rect = rect
     }
 }
 
@@ -78,6 +94,8 @@ public struct EngravedPage: Sendable {
     public var graphics: [Graphic]
     /// Elements the parser recognised but cannot draw yet (e.g. `<image>`).
     public var unsupportedElements: [String]
+    /// The legend's parts, when this is a legend page.
+    public var markers: [PageMarker] = []
 
     /// Every linked graphic, keyed by source line, sorted by character.
     private var linkIndex: [Int: [(character: Int, graphic: Int)]] = [:]
@@ -135,6 +153,96 @@ public struct EngravedPage: Sendable {
         for g in graphics.dropFirst() { r = r.union(g.bounds) }
         return r
     }
+
+    /// Where a drawing made of many small parts (a grain cloud, a
+    /// hand-drawn texture) lies: the parts' bounds merged wherever they are
+    /// less than `gap` apart vertically, so a spanner broken across systems
+    /// gives one region per system rather than one box over the music
+    /// between.
+    /// How far apart (in staff spaces) parts of one drawing may be and
+    /// still read as one shape.
+    public static let clusterGap = 3.0
+
+    public static func regions(of graphics: [Graphic], gap: Double = 2.5) -> [Rect] {
+        var out: [Rect] = []
+        for r in graphics.map(\.bounds).sorted(by: { $0.y < $1.y }) {
+            if let last = out.last, r.minY <= last.maxY + gap {
+                out[out.count - 1] = last.union(r)
+            } else {
+                out.append(r)
+            }
+        }
+        return out
+    }
+
+    /// The parts of one drawing grouped into what reads as one shape:
+    /// parts closer than `gap` in both directions join (a grain cloud's
+    /// dots), so the separate bursts of one spanner, or its pieces on
+    /// different systems, are separate rectangles.
+    public static func clusters(of graphics: [Graphic], gap: Double) -> [Rect] {
+        let rects = graphics.map(\.bounds)
+        guard rects.count > 1, gap > 0 else { return rects }
+        // A grid of half-gap cells: parts in one cell join, and occupied
+        // neighbouring cells join, so parts about a gap apart or closer are
+        // one shape. Linear in the parts, which matters for a texture of
+        // ten thousand dots.
+        let cell = gap / 2
+        var parent: [Int] = []
+        func find(_ i: Int) -> Int {
+            var i = i
+            while parent[i] != i { parent[i] = parent[parent[i]]; i = parent[i] }
+            return i
+        }
+        func join(_ a: Int, _ b: Int) { let ra = find(a), rb = find(b); if ra != rb { parent[ra] = rb } }
+        struct Cell: Hashable { var x: Int, y: Int }
+        var owner: [Cell: Int] = [:]   // a cell's set (an index into parent)
+        var partSet: [Int] = []
+        for r in rects {
+            let x0 = Int((r.minX / cell).rounded(.down)), x1 = Int((r.maxX / cell).rounded(.down))
+            let y0 = Int((r.minY / cell).rounded(.down)), y1 = Int((r.maxY / cell).rounded(.down))
+            var mine: Int?
+            // A long part (a line) covers many cells; cap the walk, its ends join.
+            let xs = x1 - x0 > 64 ? [x0, x1] : Array(x0...x1), ys = y1 - y0 > 64 ? [y0, y1] : Array(y0...y1)
+            for x in xs { for y in ys {
+                let c = Cell(x: x, y: y)
+                if let o = owner[c] {
+                    if let m = mine { join(m, o) } else { mine = o }
+                } else {
+                    if mine == nil { mine = parent.count; parent.append(parent.count) }
+                    owner[c] = mine
+                }
+            } }
+            partSet.append(mine!)
+        }
+        for (c, o) in owner {
+            for dx in -1...1 { for dy in -1...1 where dx != 0 || dy != 0 {
+                if let n = owner[Cell(x: c.x + dx, y: c.y + dy)] { join(o, n) }
+            } }
+        }
+        var out: [Int: Rect] = [:]
+        for (i, r) in rects.enumerated() { let root = find(partSet[i]); out[root] = out[root].map { $0.union(r) } ?? r }
+        return out.values.sorted { ($0.minY, $0.minX) < ($1.minY, $1.minX) }
+    }
+
+    /// The linked drawing whose region holds `point`, for a click that
+    /// landed between its parts (the gaps in a texture); the smallest
+    /// region wins, so a drawing inside another is still reachable.
+    public func regionHit(_ point: Point, excluding removed: Set<Graphic> = []) -> Graphic? {
+        var groups: [PointAndClickLocation: [Graphic]] = [:]
+        for g in graphics where g.link != nil && !removed.contains(g) {
+            groups[g.link!, default: []].append(g)
+        }
+        let gap = Self.clusterGap * (staves.first?.space ?? 1)
+        var best: (graphic: Graphic, area: Double)?
+        for parts in groups.values where parts.count > 1 {
+            // Only drawings that reach the click are worth grouping.
+            guard let whole = Self.bounds(of: parts), whole.insetBy(-gap).contains(point) else { continue }
+            for r in Self.clusters(of: parts, gap: gap) where r.contains(point) {
+                if best == nil || r.area < best!.area { best = (parts[0], r.area) }
+            }
+        }
+        return best?.graphic
+    }
 }
 
 // MARK: - SVG parsing
@@ -154,6 +262,7 @@ extension EngravedPage {
         while let token = tokenizer.next() { builder.consume(token) }
         self.init(widthMM: builder.widthMM, heightMM: builder.heightMM, viewBox: builder.viewBox,
                   graphics: builder.graphics, unsupportedElements: builder.unsupported)
+        markers = builder.markers
     }
 }
 
@@ -168,6 +277,8 @@ private struct SVGState {
     var join = StrokeStyle.Join.miter
     var dash: [Double] = []
     var link: PointAndClickLocation?
+    /// Inside `<a xlink:href="pondside-…">`: its rect is a marker, not ink.
+    var marker: String?
     var fontFamily = "serif"
     var fontSize = 16.0
     var bold = false
@@ -195,6 +306,10 @@ private struct SVGSceneBuilder {
     var viewBox = Rect(x: 0, y: 0, width: 210, height: 297)
     var graphics: [Graphic] = []
     var unsupported: [String] = []
+    var markers: [PageMarker] = []
+    /// Open `data-pondside-clip` groups: the element depth and the rect its
+    /// first `pondside-clip:` link names.
+    private var clips: [(depth: Int, rect: Rect?)] = []
 
     private var stack: [(name: String, state: SVGState)] = []
     private var state = SVGState()
@@ -231,8 +346,24 @@ private struct SVGSceneBuilder {
         case "style":
             styleDepth += 1
         case "a":
-            if let href = attrs["xlink:href"] ?? attrs["href"], let link = PointAndClickLocation(uri: href) {
-                state.link = link
+            if let href = attrs["xlink:href"] ?? attrs["href"] {
+                if href.hasPrefix("pondside-") {
+                    state.marker = href
+                } else if let link = PointAndClickLocation(uri: href) {
+                    state.link = link
+                }
+            }
+        case "g":
+            if attrs["data-pondside-clip"] != nil { clips.append((stack.count, nil)) }
+        case "rect" where state.marker != nil:
+            // LilyPond's url-link writes the y-up interval as is: flip it.
+            let x = num(attrs["x"]), y = num(attrs["y"]), w = num(attrs["width"]), h = num(attrs["height"])
+            let corners = [Point(x, -(y + h)), Point(x + w, -y)].map { state.transform.apply($0) }
+            guard let r = Rect(enclosing: corners), let name = state.marker else { break }
+            if name == "pondside-clip:" {
+                if let last = clips.indices.last, clips[last].rect == nil { clips[last].rect = r }
+            } else if name.hasPrefix("pondside-legend:") {
+                markers.append(PageMarker(name: String(name.dropFirst("pondside-legend:".count)), rect: r))
             }
         case "path":
             if let d = attrs["d"] { emit(VectorPath(svgPathData: d)) }
@@ -277,6 +408,17 @@ private struct SVGSceneBuilder {
             state = top.state
             if top.name == name { break }
         }
+        while let last = clips.last, last.depth > stack.count { clips.removeLast() }
+    }
+
+    /// The clip in force, and the graphic's bounds within it; nil when the
+    /// graphic is entirely clipped away.
+    private func clipped(_ bounds: Rect) -> (bounds: Rect, clip: Rect?)? {
+        var clip: Rect?
+        for c in clips { if let r = c.rect { clip = clip.map { $0.intersection(r) ?? Rect(x: r.x, y: r.y, width: 0, height: 0) } ?? r } }
+        guard let clip else { return (bounds, nil) }
+        guard let inside = bounds.intersection(clip) else { return nil }
+        return (inside, clip)
     }
 
     private mutating func readDocument(_ attrs: [String: String]) {
@@ -319,7 +461,8 @@ private struct SVGSceneBuilder {
                                 dash: state.dash.map { $0 * state.transform.scaleFactor })
         guard var bounds = path.controlBounds else { return }
         if stroke != nil { bounds = bounds.insetBy(-style.width / 2) }
-        graphics.append(Graphic(content: .path(path, fill: fill, stroke: stroke, style: style), bounds: bounds, link: state.link))
+        guard let (shown, clip) = clipped(bounds) else { return }
+        graphics.append(Graphic(content: .path(path, fill: fill, stroke: stroke, style: style), bounds: shown, link: state.link, clip: clip))
     }
 
     private mutating func flushText() {
@@ -341,7 +484,8 @@ private struct SVGSceneBuilder {
         let corners = [Point(x0, -ts.fontSize * 0.8), Point(x0 + width, -ts.fontSize * 0.8),
                        Point(x0, ts.fontSize * 0.25), Point(x0 + width, ts.fontSize * 0.25)]
         let bounds = Rect(enclosing: corners.map { ts.transform.apply($0) })!
-        graphics.append(Graphic(content: .text(run), bounds: bounds, link: ts.link))
+        guard let (shown, clip) = clipped(bounds) else { return }
+        graphics.append(Graphic(content: .text(run), bounds: shown, link: ts.link, clip: clip))
     }
 
     private func num(_ s: String?) -> Double {

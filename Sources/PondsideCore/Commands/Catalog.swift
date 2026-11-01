@@ -4,23 +4,32 @@
 public enum CommandCatalog {
     /// Names shown in the hint bar after the leader and a group key.
     public static let groups: [Character: String] = [
-        "f": "file", "g": "go", "a": "add", "e": "edit", "v": "view", "p": "pane", "w": "workspace", "h": "help",
+        "f": "file", "g": "go", "a": "add", "e": "edit", "v": "view", "p": "pane", "w": "workspace", "s": "supercollider", "h": "help",
     ]
 
-    public static let standard: [CommandSpec] = file + go + add + edit + view + pane + help
+    public static let standard: [CommandSpec] = file + go + add + edit + view + pane + supercollider + help
 
     static let file: [CommandSpec] = [
-        CommandSpec("file.new", "New Score…", "Create a LilyPond file from a template and open it", category: "File",
+        CommandSpec("file.new", "New Project…", "Create a project root: a folder with a score from a template, patch/ and renders/", category: "File",
                     chords: ["fn"], shortcut: KeyStroke("n", .command)),
-        CommandSpec("file.open", "Open…", "Open a .ly or .ily file", category: "File",
+        CommandSpec("file.open", "Open Project Root…", "Open the folder that holds a score", category: "File",
                     chords: ["fo"], shortcut: KeyStroke("o", .command)),
         CommandSpec("file.exportPDF", "Export PDF…", "Engrave a PDF for performers, without local file paths", category: "File",
                     chords: ["fe"], shortcut: KeyStroke("e", .command)),
         CommandSpec("file.engravingSettings", "Engraving Settings…",
                     "Score-wide settings: page, staves, beaming, accidentals, bar lines, tuplets", category: "File",
                     chords: ["fs"], shortcut: KeyStroke("e", [.command, .shift])),
+        CommandSpec("file.scoreSetup", "Score Setup…",
+                    "Staves and instruments, cover page, notes and legend", category: "File",
+                    chords: ["fu"], shortcut: KeyStroke("u", [.command, .shift])),
+        CommandSpec("file.arrangeLegend", "Arrange Legend",
+                    "Drag the legend's table, columns and row spacing on the page; crop and scale its examples",
+                    category: "File", chords: ["fa"]),
         CommandSpec("file.lilypond", "LilyPond Version…", "Choose which installed LilyPond engraves this score (saved in pondside.toml)",
                     category: "File", chords: ["fl"]),
+        CommandSpec("file.migratePatch", "Make Patch Pondside-Ready…",
+                    "Check the score's SuperCollider patch against Pondside's layout and refactor it", category: "File",
+                    chords: ["fm"]),
         CommandSpec("file.reveal", "Reveal in Finder", "Show the score's file in the Finder", category: "File",
                     chords: ["fr"], shortcut: KeyStroke("r", [.command, .option])),
         CommandSpec("file.close", "Close", "Close this window; your work is already saved", category: "File",
@@ -106,6 +115,16 @@ public enum CommandCatalog {
         CommandSpec("edit.duration", "Set Duration", "1 2 4 8 16 32: change the selection, or arm the next note",
                     category: "Edit", keys: ["1", "2", "4", "8", "16"]),
         CommandSpec("edit.dot", "Toggle Dot", "Add or remove a duration dot", category: "Edit", keys: ["."]),
+        CommandSpec("edit.undoAgent", "Undo Agent Change", "Put back the files the agent's last request changed", category: "Edit",
+                    chords: ["ez"]),
+        CommandSpec("edit.newAgentConversation", "New Agent Conversation", "The next request from the lens starts a new conversation with the agent",
+                    category: "Edit", chords: ["en"]),
+        CommandSpec("edit.patchRequest", "Ask the Patch Agent…", "Describe a change to the SuperCollider patch at the selection's cue; the patch agent makes it (⇥ from the lens's request line)",
+                    category: "Edit", chords: ["ep"]),
+        CommandSpec("edit.newPatchConversation", "New Patch Agent Conversation", "The patch agent's next request starts a new conversation; what it knows is in the patch doc",
+                    category: "Edit", chords: ["eN"]),
+        CommandSpec("edit.stopAgent", "Stop Agent", "Cancel the agent's work in the background: a request from the lens, or a patch migration",
+                    category: "Edit", requires: .agentWorking, chords: ["ek"], shortcut: KeyStroke(".", [.command, .option])),
         CommandSpec("edit.disarm", "Disarm Duration", "Stop arming durations; ⎋ also deselects", category: "Edit", keys: ["⎋"]),
     ]
 
@@ -122,10 +141,14 @@ public enum CommandCatalog {
                     category: "View", chords: ["vy"], shortcut: KeyStroke("l", .command)),
         CommandSpec("view.play", "Play from Here", "Play the mockup (pondside mockup) from the selection's bar; again to stop",
                     category: "View", chords: ["vp"], shortcut: KeyStroke("p", [.command, .shift])),
+        CommandSpec("view.playMix", "Play with Electronics", "Play the score with its patch's electronics (pondside mix) from the selection's bar; again to stop",
+                    category: "View", chords: ["ve"], shortcut: KeyStroke("p", [.command, .option])),
         CommandSpec("view.lightsOut", "Lights Out", "Dim the paper for night work (display only, never exported)",
                     category: "View", chords: ["vl"], shortcut: KeyStroke("l", [.command, .shift])),
         CommandSpec("view.fullScreen", "Full Screen", "Use the whole display", category: "View",
                     chords: ["vf"], shortcut: KeyStroke("f", [.command, .control])),
+        CommandSpec("view.agentLog", "Show/Hide Agent Log", "Open or close a pane of everything the agents did: requests, refactors, tool calls, errors",
+                    category: "View", chords: ["va"], shortcut: KeyStroke("a", [.command, .option])),
     ]
 
     static let pane: [CommandSpec] = {
@@ -155,12 +178,39 @@ public enum CommandCatalog {
         return specs
     }()
 
+    static let supercollider: [CommandSpec] = [
+        CommandSpec("sc.evaluate", "Evaluate", "Run the selection, or the ( … ) block around the caret, in SuperCollider",
+                    category: "SuperCollider", requires: .supercollider, chords: ["se"], keys: ["⌘↩"]),
+        CommandSpec("sc.evaluateLine", "Evaluate Line", "Run the caret's line in SuperCollider", category: "SuperCollider",
+                    requires: .supercollider, chords: ["sl"], keys: ["⇧↩"]),
+        CommandSpec("sc.stop", "Stop Sound", "Stop every sound, routine and clock (CmdPeriod), from any pane",
+                    category: "SuperCollider", chords: ["s."], shortcut: KeyStroke(".", .command)),
+        CommandSpec("sc.boot", "Boot Server", "Boot the SuperCollider server, or quit it if it is running",
+                    category: "SuperCollider", chords: ["sb"], shortcut: KeyStroke("b", .command)),
+        CommandSpec("sc.help", "Look Up in Help", "SuperCollider help for the class or method at the caret",
+                    category: "SuperCollider", requires: .supercollider, chords: ["sd"], keys: ["⌘D"]),
+        CommandSpec("sc.complete", "Complete", "Suggest classes, methods and variables at the caret",
+                    category: "SuperCollider", requires: .supercollider, chords: ["sc"], keys: ["⎋"]),
+        CommandSpec("sc.openFile", "Open SuperCollider File…", "Pick a .scd file beside the score to edit",
+                    category: "SuperCollider", chords: ["so"]),
+        CommandSpec("sc.openInIDE", "Open in SuperCollider IDE", "Open the SuperCollider file (else the patch) in SuperCollider's own IDE",
+                    category: "SuperCollider", chords: ["sv"]),
+        CommandSpec("sc.clearPost", "Clear Post Window", "Empty the interpreter's output", category: "SuperCollider",
+                    chords: ["sx"]),
+        CommandSpec("sc.recompile", "Recompile Class Library", "Recompile after changing .sc class files",
+                    category: "SuperCollider", chords: ["sr"]),
+        CommandSpec("sc.restart", "Restart Interpreter", "Quit sclang and start it again", category: "SuperCollider",
+                    chords: ["si"]),
+    ]
+
     static let help: [CommandSpec] = [
         CommandSpec("help.palette", "Command Palette", "Find any command by typing a few letters", category: "Help",
                     chords: [" "], shortcut: KeyStroke("k", .command)),
         CommandSpec("help.context", "What Can I Do Here?", "Every action for the current selection, with its keys",
                     category: "Help", chords: ["?"], shortcut: KeyStroke("/", .command)),
         CommandSpec("help.keys", "All Keys", "Every command and its chord", category: "Help", chords: ["hk"]),
+        CommandSpec("help.settings", "Settings…", "Pondside's own settings: the agent, appearance, the command-line tool",
+                    category: "Help", chords: ["hs"], shortcut: KeyStroke(",", .command)),
         CommandSpec("help.about", "About Pondside", "Version, and why you can leave any time", category: "Help",
                     chords: ["ha"]),
     ]

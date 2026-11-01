@@ -9,11 +9,7 @@ final class TerminalPane: NSView, LocalProcessTerminalViewDelegate {
     private let directory: URL
     private var startedAt = Date()
 
-    /// `command`: run first (the Agent pane's agent); the shell follows it.
-    private var command: String?
-
-    init(directory: URL, command: String? = nil) {
-        self.command = command
+    init(directory: URL) {
         self.directory = directory
         super.init(frame: .zero)
         wantsLayer = true
@@ -46,8 +42,13 @@ final class TerminalPane: NSView, LocalProcessTerminalViewDelegate {
         var env = ProcessInfo.processInfo.environment
         env["TERM"] = "xterm-256color"
         env["PONDSIDE_SCORE_DIR"] = directory.path
-        let first = command.map { "\($0); " } ?? ""
-        terminal.startProcess(executable: shell, args: ["-l", "-c", "cd \(quoted) && \(first)exec \(shell) -l"],
+        // The bundled CLI first, so the folder's agent configs can launch
+        // `pondside mcp`. Login shells' path_helper keeps the entry.
+        if let resources = Bundle.main.resourceURL,
+           FileManager.default.isExecutableFile(atPath: resources.appendingPathComponent("pondside").path) {
+            env["PATH"] = resources.path + ":" + (env["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin")
+        }
+        terminal.startProcess(executable: shell, args: ["-l", "-c", "cd \(quoted) && exec \(shell) -l"],
                               environment: env.map { "\($0.key)=\($0.value)" })
     }
 

@@ -16,7 +16,9 @@ final class AppRPC {
 
     func start() {
         let server = RPCSocketServer(path: RPCSocketServer.defaultPath) { method, params in
-            try await MainActor.run { try AppRPC.shared.handle(method, params) }
+            // A question waits for the person's answer.
+            if method == "document.ask" { return try await AppRPC.shared.ask(params) }
+            return try await MainActor.run { try AppRPC.shared.handle(method, params) }
         }
         do {
             try server.start()
@@ -37,7 +39,7 @@ final class AppRPC {
 
     private var controllers: [DocumentWindowController] { app?.documentControllers ?? [] }
 
-    private func controller(_ params: JSONValue) throws -> DocumentWindowController {
+    func controller(_ params: JSONValue) throws -> DocumentWindowController {
         if let path = params["path"]?.string {
             guard let c = controllers.first(where: { $0.score.file(for: path) != nil }) else {
                 throw RPCSocketServer.MethodError("no open score contains \(path)")
@@ -71,6 +73,15 @@ final class AppRPC {
                 }
             }
             return c.rpcContext
+        case "document.patchContext":
+            let c = try controller(params)
+            if let path = params["path"]?.string, let line = params["line"]?.int {
+                guard c.revealSource(path: path, line: line, character: params["character"]?.int ?? 0) else {
+                    throw RPCSocketServer.MethodError("can't find \(path):\(line)")
+                }
+            }
+            guard c.score.patchURL != nil else { throw RPCSocketServer.MethodError("the score has no Pondside patch") }
+            return c.rpcPatchContext(cue: params["cue"]?.string)
         case "document.select":
             let c = try controller(params)
             guard let path = params["path"]?.string, let line = params["line"]?.int else {
@@ -87,6 +98,19 @@ final class AppRPC {
         case "document.cues":
             guard let sheet = try controller(params).score.cueSheet else { return .null }
             return try JSONValue.from(sheet)
+        case "document.warn":
+            // An agent reports a problem: an alert on the score's window, not waited for.
+            let c = try controller(params)
+            guard let message = params["message"]?.string, let window = c.window else {
+                throw RPCSocketServer.MethodError("document.warn needs a message")
+            }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = params["title"]?.string ?? "The agent ran into a problem"
+            alert.informativeText = message
+            alert.addButton(withTitle: "OK")
+            alert.beginSheetModal(for: window)
+            return ["shown": true]
         case "document.open":
             guard let path = params["path"]?.string else { throw RPCSocketServer.MethodError("document.open needs a path") }
             app?.open(URL(fileURLWithPath: path))
@@ -94,6 +118,37 @@ final class AppRPC {
         default:
             throw RPCSocketServer.MethodError(code: -32601, "method not found: \(method)")
         }
+    }
+}
+
+extension AppRPC {
+    /// An agent's clarifying question, as a sheet on the score's window: its
+    /// suggested answers as buttons, and a field for one of the person's own.
+    /// Returns the answer, or `answered: false` if the person skipped it.
+    func ask(_ params: JSONValue) async throws -> JSONValue {
+        let c = try controller(params)
+        guard let question = params["question"]?.string, let window = c.window else {
+            throw RPCSocketServer.MethodError("document.ask needs a question")
+        }
+        let choices = (params["choices"]?.array ?? []).compactMap(\.string).prefix(4)
+        let alert = NSAlert()
+        alert.messageText = "The agent asks"
+        alert.informativeText = question
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = choices.isEmpty ? "Your answer" : "Or your own answer"
+        alert.accessoryView = field
+        for c in choices { alert.addButton(withTitle: c) }
+        alert.addButton(withTitle: "Answer")
+        alert.addButton(withTitle: "Skip")
+        alert.window.initialFirstResponder = field
+        NSApp.requestUserAttention(.informationalRequest)
+        let response = await withCheckedContinuation { (k: CheckedContinuation<NSApplication.ModalResponse, Never>) in
+            alert.beginSheetModal(for: window) { k.resume(returning: $0) }
+        }
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        if index >= 0, index < choices.count { return ["answered": true, "answer": .string(choices[choices.startIndex + index])] }
+        if index == choices.count, !field.stringValue.isEmpty { return ["answered": true, "answer": .string(field.stringValue)] }
+        return ["answered": false]
     }
 }
 
@@ -108,7 +163,18 @@ extension DocumentWindowController {
         case .errors(let n): status = .string("errors:\(n)")
         case .failed(let why): status = .string("failed: \(why)")
         }
+        // What LilyPond reported, for `check` to answer from the app's warm
+        // engraving instead of compiling the score again.
+        let diagnostics: [JSONValue] = score.files.flatMap { f in
+            f.diagnostics.filter { $0.severity != .warning }.prefix(20).map { d -> JSONValue in
+                ["severity": .string(d.severity.rawValue), "file": .string(f.url.path),
+                 "line": d.line.map { .number(Double($0)) } ?? .null,
+                 "column": d.column.map { .number(Double($0)) } ?? .null, "message": .string(d.message)]
+            }
+        }
         return ["root": .string(score.root.url.path), "files": .array(score.files.map { .string($0.url.path) }),
-                "active": .string(activeFile.url.path), "status": status]
+                "active": .string(activeFile.url.path), "status": status,
+                "started": score.compileStarted.map { .number($0.timeIntervalSince1970) } ?? .null,
+                "diagnostics": .array(diagnostics)]
     }
 }

@@ -14,13 +14,18 @@ run on Linux.
 ```
 pondside check   score.ly [--json]                 compile; diagnostics; exit 1 on errors
 pondside render  score.ly [--format pdf|svg|png] [--out dir] [--json]
-pondside cues    score.ly [--format json|cues] [--rate 48000] [--out file]
+pondside cues    score.ly [--format json|cues|marks|ec] [--rate 48000] [--out file]
 pondside timeline score.ly [--json]                tempo steps: moment, seconds, quarters/min
-pondside handlers score.ly --scd cues.scd [--project dir]
+pondside handlers score.ly [--scd f]               the patch (patch/score.scd) and its engine, with a stub per cue
+pondside mix     score.ly [--scd patch.scd] [--out f]   the patch rendered offline in mockup mode (renders/score.mix.wav)
+pondside patch   score.ly [--scd f] [--from f] [--fix [--agent auto|claude|opencode]]   audit a patch; --fix migrates it;
+                                                      --agent then has claude -p / opencode run finish it
 pondside lexicon list | search <words> | show <id> | impl <id>
 pondside lexicon check score.ly | include score.ly | lock score.ly
 pondside lexicon drafts | promote <id> [--to user] | discard <id>   agent drafts: only people promote them
-pondside mockup  score.ly [--out file.wav] [--stems]   padded to the end mark; --stems: one file per staff
+pondside mockup  score.ly [--out file.wav] [--stems] [--timing f]   the playback (below) as audio, padded to the
+                                                      end mark (renders/score.wav), its cue times beside it (renders/score.cues); --stems:
+                                                      one file per staff (the app runs it after each good engraving)
 pondside history score.ly [--show <rev> [--file f]] [--restore <rev>]   checkpoints, kept outside your repo
 pondside links   page.svg [--json]                 point-and-click links with bounds
 pondside doctor  [--json]                          every LilyPond found, version and origin
@@ -37,7 +42,10 @@ pondside completion zsh|bash                       eval "$(pondside completion z
   minute before any `\tempo`, hidden `\playTempo` changes included.
 - `--format cues` writes `seconds<TAB>bar<TAB>cue N` lines, the format
   SuperCollider loaders in the lilypond-supercollider workflow already
-  read.
+  read; `marks` the `\timingMark` lines starting with `--prefix`
+  (default `improv`) in the same shape; `ec` the pitch classes of each
+  `\collection` on `--staff` (default `elecUp`) as `~ec`/`~ecWhere`, as
+  `piece.ec.scd` always held them.
 
 ## Project settings: `pondside.toml`
 
@@ -45,6 +53,9 @@ Put `pondside.toml` at the project root. The CLI and the app read the
 nearest one at or above the score, and command-line options override it.
 
 ```toml
+[project]
+score = "quartet.ly"          # the score the project root opens (set when the folder has several)
+
 [lilypond]
 version = "2.26.0"            # compile with this LilyPond; wins over \version
 
@@ -52,16 +63,38 @@ version = "2.26.0"            # compile with this LilyPond; wins over \version
 sample-rate = 48000           # cue samples and the mockup; the quark checks it
 renderer = "musescore"        # or "fluidsynth"
 soundfont = "sounds/piano.sf2"
+parts = "resources/improv"    # recordings mixed into the mockup at their marks (improv1.wav at "improv 1")
+hook = "improv/render.scd"    # or a script that renders them: sclang hook score.wav marks.txt out.wav parts
+hook-marks = "improv"         # the marks the hook gets (default improv)
 
 [supercollider]
 handlers = "patch/cues.scd"   # the default for `pondside handlers`
 resources = "patch/resources"
-
-[agent]
-command = "claude"            # what the app's Agent pane runs (default "claude")
+path = "/Applications/SuperCollider.app"   # the SuperCollider pane's sclang (or sclang itself); found if omitted
 ```
 
 File › LilyPond Version… in the app writes `[lilypond] version` for you.
+
+### The project root
+
+The app opens a project by its root folder (File › Open Project Root…), and
+File › New Project… creates one. Every project gets the same structure,
+added when missing each time it opens (`ProjectStructure` in
+PondsideBridge); the composer's own files are never touched:
+
+```
+<root>/<name>.ly                        the score: [project] score, else the folder's only .ly,
+                                        else the one nothing \includes (named after the folder, or score.ly)
+<root>/lexicon.ily                      the Lexicon entries the score uses (regenerated)
+<root>/patch/<name>.scd                 the SuperCollider patch (a starter until the composer writes one)
+<root>/patch/dependencies/pondside.scd  its engine (kept current)
+<root>/patch/resources/                 the patch's sounds, empty to start ([supercollider] resources)
+<root>/renders/                         mockup, cue times, mix
+<root>/.mcp.json, opencode.json         `pondside mcp` for agents started here
+```
+
+A folder with no score offers to start `<folder>.ly`; one with several
+asks which and records it as `[project] score`.
 
 ## MCP
 
@@ -77,25 +110,113 @@ Setup:
 | opencode | in `opencode.json`: `"mcp": { "pondside": { "type": "local", "command": ["pondside", "mcp"] } }` |
 | anything else | `{ "command": "pondside", "args": ["mcp"] }` in the client's MCP server list |
 
+Per folder, with no setup: when the app opens a score it writes
+`.mcp.json` (Claude Code) and `opencode.json` (opencode) in the score's
+folder, and `pondside agents [dir]` does the same from the shell. An agent
+started in that folder, such as in the app's terminal pane, starts
+`pondside mcp` itself; Claude Code asks once to approve it. A file that
+already exists only gains a missing `pondside` server: other servers and
+settings stay, an existing `pondside` entry is left as it is, and a file
+that isn't plain JSON (opencode's JSONC comments) is not touched. The
+configs name a bare `pondside`. The terminal pane puts the app's bundled
+CLI first on `PATH`; elsewhere, install it (Pondside ▸ Install Command-Line
+Tool links it into `~/.local/bin`).
+
 Pass `--project <dir>` if the client starts servers somewhere other than
 the score's folder. Relative `file` arguments and the project Lexicon scope
 resolve against it.
+
+`--role graphics` or `--role patch` serves one of the app's two lens
+agents (DESIGN.md §8): each sees only its tools and its own instructions,
+and `edit` changes only its files (`.ly`/`.ily`, or the patch's `.scd`).
+Without a role, as from the terminal or for a migration, every tool is
+offered.
+
+| Role | Tools it doesn't see |
+|---|---|
+| `graphics` | `patch_context`, `patch_doc`, `patch_note`, `patch_check`, `sc_lexicon_*`, `patch_migrate` |
+| `patch` | `check`, `query`, `render`, `lexicon_*`, `graphic_preview`, `graphic_insert`, `patch_migrate` |
 
 ### Tools
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }] }` |
+| `edit` | `file`, `edits: [{ old?, new, from_line?, to_line? }]`, `root?` | applies every edit or none: `old` is exact text, unique in the file (the contexts' `412| ` prefixes are stripped if copied); `from_line`…`to_line` replaces whole lines as the contexts number them, and with `old` too checks they still say it (else says where `old` is now). No reading the file first. For `.ly`/`.ily` it then returns `check`'s result (the app's engraving; `root` for an `.ily` when the app isn't open); for `.scd`, a pointer to `patch_check`. Pondside's own `pondside.scd` and `sc-lexicon.scd` are refused |
+| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }] }`. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
 | `query` | `file`, `from_line?`, `to_line?` | events in order: `{ kind, text, line, character, pitches, duration, explicitDuration }` |
 | `render` | `file`, `format?` (`pdf`·`svg`·`png`), `out?` | `{ files }` |
 | `cues` | `file`, `rate?` | cues.json (below) |
 | `lexicon_check` | `file` | problems with `\lexicon` and `\startGraphic` uses, by line |
-| `score_context` | `file?`, `line?`, `character?` | what "here" means: the event, its staff's `.ly`, its bar, the graphic it is in (entry, params, start, stop); from the running app also `system: { first, last, next }`. Without arguments, the app's selection |
+| `patch_audit` | `file`, `scd?` | what keeps the score's patch (or the folder's likeliest `.scd`) from being a Pondside patch: what `patch_migrate` does, what is left |
+| `mix` | `file` | renders the score's patch offline in mockup mode into `renders/score.mix.wav`: whether it rendered, and the errors its setup or cues printed |
+| `warn_user` | `message`, `title?`, `file?` | an alert on the score's window in the running app: something went wrong that the user must know |
+| `ask_user` | `question`, `choices?` (up to 4), `file?` | a dialog asking the user; waits, and returns the answer (or that they skipped it) |
+| `patch_migrate` | `file`, `scd?`, `from?` | migrates it into `patch/score.scd`, moving what it uses into `patch/` (docs/SUPERCOLLIDER.md), and lists what it did and the lines it marked `// pondside:` |
+| `score_context` | `file?`, `line?`, `character?` | what "here" means: the event, its staff's `.ly`, bar, `moment` (whole notes from the staff's start, for a plain voice), the graphic (below), the clicked part when a large drawing was clicked (`selection`: `x` as a fraction of the broken piece's width, `y` in staff spaces, `spanner_x`, the nearest `at` bar/moment, `scope`: the Scheme test for "inside the highlight", and `music_around` when the music brackets it), every cue as `"7: bar 9 beat 2, moment 221/8, 75.5 s"`; from the running app also `system: { first, last, next }`. Without arguments, the app's selection (a clicked graphic selects its start command) |
 | `lexicon_search` | `query`, `limit?` | tier 0 lines, best first |
 | `lexicon_entry` | `id` | tier 1: params with types, ranges and docs; README |
 | `graphic_preview` | `id`, `params?`, `bars?`, `music?`, `out?` | `{ svg, source, diagnostics }`: the entry engraved on its own staff |
-| `graphic_insert` | `file`, `id`, `params?`, `start_line`, `start_character`, `stop_line`, `stop_character`, `root?` | inserts `\startGraphic`…`\stopGraphic` on those events (one staff), writes `lexicon.ily` and includes it in the root |
+| `graphic_insert` | `file`, `id`, `params?`, `start_line`, `start_character`, then `stop_line` + `stop_character`, or `stop_cue`, or `stop_moment`; `root?` | inserts `\startGraphic`…`\stopGraphic` (one staff); a stop at a cue or moment inside a skip splits it (`s1*a s1*b\stopGraphic`); writes `lexicon.ily` and includes it in the root |
 | `lexicon_propose` | `id`, `entry_toml`, `impl`, `readme` | writes a validated draft to `Lexicon/drafts/entries/<id>`; the user accepts or discards it |
+| `patch_context` | `file?` (the score), `line?`, `character?`, `cue?` | the patch agent's context at a point: the cue at or before it (`name`, `bar`, `beat`, `seconds`, `handler`, `window` until the next cue, `code`: the handler numbered, `touches`: the items it uses with their code when short), `next_cue`, the pitch `collections` around it (`pitch_classes`, `midi`), the patch `doc`, `stale_notes`, every cue, and `sc_lexicon` (one line per entry). No arguments: the app's selection |
+| `patch_doc` | `file` | the patch doc (below), rebuilt from the code; stale notes listed |
+| `patch_note` | `file`, `item`, `note` | writes the note on one item (`cue cue-12`, `synthdef \grain`, `pattern ~cloud`, `overview`), stamped with its code's hash; an empty note removes it |
+| `patch_check` | `file`, `cue?` | renders the mix (as `mix`); errors; for the cue, RMS and peak in its window of the mix and of the electronics alone (mix − mockup), before and after; notes the change made stale |
+| `sc_lexicon_search` | `query`, `limit?` | SuperCollider Lexicon lines, best first |
+| `sc_lexicon_entry` | `id` | an entry in full: how to call it, params, usage, README, code |
+| `sc_lexicon_add` | `file`, `ids` | writes `patch/dependencies/sc-lexicon.scd` with the entries and what they require; the first time, adds its load line after the engine's and says which line moved |
+
+`score_context`'s `graphic` is a Lexicon graphic's `{ entry, params,
+start, stop }`, or, for a graphic drawn by the score's own code (a
+`\startGrains` defined as a text spanner with a custom stencil),
+`{ command, start, stop, definition, drawing, uses, notes }`: the command's
+definition line, the stencil procedure it names (file, lines, and its text
+when under 150 lines), the helpers and constants that procedure uses with
+their definition lines, and the comments in the score's files that
+describe the command. Paths beside the clicked file are relative to it.
+
+For a large drawing, `graphic` describes the whole spanner and `selection`
+describes the shape the user clicked inside it: `{ kind: "graphic-part",
+page, x: [from, to], y: [low, high], spanner_x: [from, to], units, at? }`.
+`x` is a fraction of the broken piece's width (from its left edge, as the
+drawing's `x` runs from `(car (g-span grob))`), `y` is staff spaces above
+the middle line, `spanner_x` is that piece's page x (so the same fraction
+on another system is not changed), `at` is the bar/moment of the nearest
+linked music, `scope` is a ready Scheme condition for a point inside the
+highlight (`(let ((f (/ (- x x0) (- x1 x0)))) (and (>= f 0.412) …))`), and
+`music_around` (when present) is the linked music on either side, wider than
+the highlight. An agent changing a clicked part must change exactly the
+highlight, gated on `scope`, never a wider range such as `music_around` or
+the bar.
+
+Code in `score_context` and `patch_context` (`definition`, `drawing`,
+`uses`, `music`, a cue's `code` and `touches`) is numbered as in its file,
+`412| (define …`, so an agent edits it with `edit` without reading the file.
+A drawing's `uses` are the helpers and constants it calls, in full when
+under 60 lines (400 lines in all), and what those call by their definition
+line.
+
+### The patch doc
+
+`patch/score.patch.md` is the patch agent's memory (docs/SUPERCOLLIDER.md,
+"The patch agent"). Its headings and `file:lines` lines are the outline,
+rebuilt from the code on every read (`PatchOutline`: SynthDefs, patterns,
+`Pdef`/`Ndef`/`Tdef`, buses, buffers, groups, synths, functions, routines
+and other values assigned to `~names`, cue handlers, live-only blocks, and
+the Lexicon entries the patch loads); under each heading is a note, kept:
+
+```markdown
+## pattern ~cloud
+`score.scd:12-15` · ~cloud = Pbind(
+**Stale:** the code changed since this note was written.
+<!-- note e83ca850 -->
+The flute's halo: starts at cue 12.
+```
+
+`<!-- note HASH -->` is the code's hash when the note was written (runs of
+whitespace ignored); the stale line is shown while it differs. A note
+whose item has gone stays at the end, marked *No longer in the patch.*
+Notes written by hand without a hash never go stale.
 
 `query` pitches are absolute Dutch names (`c'` is middle C) in any input
 language, with `\relative` and chord-repeat (`q`) resolved. `character` is
@@ -119,8 +240,19 @@ its implementation only to adapt it.
 
 | URI / prompt | Use |
 |---|---|
-| `lexicon://guide/graphics` · `graphic-notation` | the default for graphic notation: `score_context` → `lexicon_search` → `graphic_preview` → `graphic_insert`; the core graphic entries; envelopes; combining entries |
+| `lexicon://guide/graphics` · `graphic-notation` | the default for graphic notation and for changing a clicked graphic: one `edit` from the numbered context (it returns the engraving); terse words to params ("taller", "till 7"), scaled to be visible at a glance; the core entries; envelopes |
 | `lexicon://guide/entries` · `lexicon-entries` | writing a new entry when no combination satisfies the user: the graphics kit's API, the entry folder, LilyPond and Guile gotchas, checks |
+| `skill://lilypond` · `lilypond` | writing, spacing and debugging LilyPond: project layout, the compile-and-look loop, Scheme and Guile gotchas |
+| `skill://lilypond-contemporary-notation` | aleatoric boxes, links, timed improvisation, air/slap notation (library `contemporary.ily`) |
+| `skill://lilypond-electronics-staff` | an electronics staff: `\ecue`, `\edesc`, `\collection` (library `electronics.ily`) |
+| `skill://lilypond-supercollider` | the score-to-patch workflow: timing, holds, Muse Sounds renders |
+| `skill://sc-patch-migration` | finishing a migrated patch: the lines marked `// pondside:` (Claude Code: `/mcp__pondside__sc-patch-migration`) |
+| `skill://sc-patch-editing` | the patch agent: a request at a point → `edit` the cue's handler → `patch_check` → `patch_note`; where code goes; the SuperCollider Lexicon; terse words to code |
+
+Every folder in `Sources/PondsideLexicon/Core/Skills` is served this way.
+A skill's other files are resources at `skill://<skill>/<path>`, listed at
+the end of its text; agents copy a library into the score's folder before
+including it.
 
 ### Graphic entries
 
@@ -132,9 +264,49 @@ time, through the graphics kit (`pondside-graphics.ily`, included by
 `aleatoric-box`. `envelope` params take a number or `(swell n lo hi)`,
 `(linear a b)`, `(pulse …)`, `(lfo …)`, `(points (q v) …)`, `(sum …)`,
 `(product …)`, `(smooth …)`. Graphics are linked by point-and-click to
-their `\startGraphic`. Drafts in `Lexicon/drafts/` are usable at once and
+their `\startGraphic` (as are a score's own graphic spanners to their start
+command); clicking anywhere in a graphic's area selects it. Drafts in `Lexicon/drafts/` are usable at once and
 listed as drafts; `pondside lexicon lock` records the versions a score uses
 in a comment block, and `check` warns when an entry has changed since.
+
+### Agent log
+
+With `PONDSIDE_AGENT_RUN` (or `PONDSIDE_AGENT_RUN_FILE`) in its environment,
+as when the app starts an agent, `pondside mcp` appends each tool call
+(name, arguments, result, duration) to the agent log,
+`~/Library/Logs/Pondside/agents.jsonl` (`PONDSIDE_LOG_DIR` overrides). One
+JSON object per line: `time`, `run`, `kind` (`graphics`, `refactor`, `mcp`),
+`level`, `event`, `message`, `elapsed`, `detail`.
+
+## Playback
+
+What the mockup plays and what cue times are computed from come from one
+compile of the same music, so they agree. A score with its own `\midi`
+block plays as written. Any other gets a playback score generated at
+compile time (`Sources/PondsideEngrave/Playback/pondside-playback.ily`,
+loaded with `-dinclude-settings`); the `.ly` files are never edited:
+
+- repeats are played out (`\unfoldRepeats`), so a cue inside a repeat fires
+  on each pass, and bars count the music as played, not as printed;
+- tremolos between notes play as alternating notes, `c2:32` as repeated ones;
+- trills play as alternating notes in 32nds, from the written note:
+  `\trill`, `\startTrillSpan … \stopTrillSpan` over several (tied) notes,
+  `\pitchedTrill`, a `trill-upper` sign ("♯" "♭" "♮") and `\shapedTrill`
+  speeds (`trill-shape`: 32nds at 1, eighths at 0); the upper note follows
+  the key signature;
+- `\articulate` (LilyPond's own) shortens staccatos, joins slurs and plays
+  ornaments and "rall."; a voice it fails on plays as written;
+- dynamics are read per staff, so dynamics in a voice of their own reach
+  the notes, over velocities 0.15–1;
+- `midiInstrument` comes from a staff's `instrumentName` when it has none
+  (flute, clarinet, violin, piano …); staves named Electronics or Tape keep
+  their cues but are silent;
+- music tagged `printed` (the lilypond-supercollider convention for an
+  improvisation) is silent but keeps its time.
+
+Holds and timed passages are hidden tempos (`\playTempo`, the
+`timed-fermata` and `senza-misura` entries); `\articulate` leaves fermatas
+alone. Scores inside a `\book` are not covered yet: give them a `\midi`.
 
 ## cues.json
 
@@ -168,22 +340,96 @@ with a `[sound]` binding. Both put a `cue-label` on a hidden text event.
 
 ## SuperCollider
 
-`pondside handlers score.ly --scd cues.scd` writes one handler stub per
-cue. Run it again after editing the score: it adds stubs for new cues,
-updates the comment line above each handler, and comments out handlers
-whose cue has gone (with `//~ `, restored exactly if the cue returns). It
-never changes code inside a handler.
+The whole reference (every block of the patch, the offline render, and
+migrating a patch written elsewhere) is docs/SUPERCOLLIDER.md.
 
-The quark in `sc/Pondside` plays the mockup and fires the handlers:
+**The patch.** `patch/score.scd` (marked `// @pondside patch`) is the
+composer's code with a first block that sets `~mode` (`\mockup` or `\live`)
+and loads the engine, `patch/dependencies/pondside.scd`, which Pondside
+writes and keeps current. Then come a cue block (`~cue[\cue12] = { |cue| … };`
+per cue) and the run lines: `~triggerCue.()` (cue 1 starts the piece, then
+the next cue), `~triggerCue.(12)` (start at or jump to cue 12) and
+`~stop.()`. The SuperCollider pane starts one when the score has none;
+`pondside handlers` does the same. The full reference is
+docs/SUPERCOLLIDER.md.
+
+After each mockup the app adds stubs for new cues to the patch, then runs
+`pondside mix`: the patch's `( … )` blocks run in a generated sclang
+script, in mockup mode, on a clock far faster than real time, with the
+server replaced by a recorder that keeps every message at its score time
+(and answers `/sync`, `/done` and `/b_query` as scsynth would); scsynth then
+renders them in non-real time against the mockup into `score.mix.wav`, the
+score with its electronics. ⌘⌥P (Play with Electronics) plays it from the
+selection's bar, as ⌘⇧P plays the mockup. Cues run as routines on the
+score's clock (`TempoClock.default` while playing), so `wait`, `fork`,
+patterns, `s.sync` and buffer actions render as they sound live. Code timed
+by `SystemClock` or `AppClock` is not, and blocks whose first line is
+`// @pondside live` (windows, MIDI) are skipped.
+
+`pondside patch score.ly` checks a patch, or the folder's likeliest `.scd`,
+against Pondside's layout; `--fix` migrates it (the app offers the same
+when it opens a score).
+
+`pondside handlers score.ly --scd file` keeps any handler file in step.
+Run it again after editing the score: it adds stubs for new cues (in the
+file's style: a patch's `~cue[…]`, else the quark's `p.on(…)`, adding the
+quark's `p = Pondside(…)` line when the file has none), updates the comment
+line above each handler, and comments out handlers whose cue has gone
+(with `//~ `, restored exactly if the cue returns). It never changes code
+inside a handler.
+
+The quark in `sc/Pondside` plays the mockup and fires `p.on` handlers:
 
 ```supercollider
-p = Pondside("~/scores/piece/resources");   // piece.cues + piece.wav
+p = Pondside("~/scores/piece", "score");    // score.cues + score.wav beside score.ly
 p.on(\cue12, { |cue| ~swell.set(\amp, 0.5) });
 p.play(from: "42");                          // bar 42, or seconds
 ```
 
 It refuses to play when the server's sample rate differs from the
 mockup's, and prints the line that fixes it.
+
+## Skills and the files Pondside writes
+
+The skills `pondside mcp` serves describe the files Pondside itself
+produces, so an agent following a skill never builds a second, disagreeing
+copy of them. `SkillConsistencyTests` checks that every file a skill names
+is bundled with it and that the SuperCollider skill describes the real cue
+format.
+
+Names follow the root file: `quartet.ly` gives `quartet.cues`,
+`quartet.wav`, `quartet.scd` and `quartet.mix.wav`.
+
+| What | Written by | Skills that use it |
+|---|---|---|
+| Cue times: `renders/score.cues` (`seconds<TAB>bar<TAB>cue N`) | `pondside mockup`, run by the app after every good engraving; `pondside cues --format cues` | lilypond-supercollider (the quark reads it), lilypond-electronics-staff (`\ecue` → `cue N`) |
+| Mockup: `renders/score.wav` | the same run | lilypond-supercollider |
+| cues.json | `pondside cues`, MCP `cues`, RPC `document.cues` | graphic-notation (via `score_context`'s `cues`) |
+| Collections `~ec`, marks | `pondside cues --format ec` / `marks` | lilypond-supercollider, lilypond-electronics-staff |
+| The patch `patch/score.scd` (`// @pondside patch`), its engine `patch/dependencies/pondside.scd` | the SuperCollider pane when the score has no patch; `pondside handlers`; stubs for new cues and the current engine after each mockup | lilypond-supercollider, sc-patch-migration |
+| The mix `renders/score.mix.wav` | `pondside mix`, run by the app after each mockup | — (⌘⌥P plays it) |
+| `score.before-pondside.scd` | `pondside patch --fix`, `patch_migrate`, the app's refactor dialog | sc-patch-migration |
+| `lexicon.ily` | `graphic_insert`, `pondside lexicon include` | graphic-notation, lexicon-entries |
+| `patch/dependencies/sc-lexicon.scd` (`// @pondside sc-lexicon <ids>`) and its load line after the engine's | `sc_lexicon_add` | sc-patch-editing |
+| The patch doc `patch/score.patch.md` | `patch_doc`, `patch_note`, `patch_context`, `patch_check` | sc-patch-editing |
+| `front-matter.ily`: cover, notes, legend (`%% ---- cover` …, `%% legend: <id>` rows) and its `\include` before the root's first `\score` | the app's Score Setup (`⌘⇧U`) | lilypond, graphic-notation (the legend) |
+| Staff names, `midiInstrument`, `\clef` in a staff's `\with` | Score Setup › Staves | lilypond |
+| `.mcp.json`, `opencode.json` | the app, `pondside agents` | — |
+
+All cue times come from one interpretation of the score: the playback
+compile (`PlaybackScore`) with Pondside's timing listener. The bundled
+libraries only mark things for it: `\ecue` sets `cue-label`,
+`\timingMark`/`\improvisation` set `timing-label`, `\playTempo` is a
+hidden `\tempo`, `\collection` wraps its notes in `\startGroup`/`\stopGroup`.
+A score that still includes the old workflow's `timing.ily` keeps writing
+`score.timing` (into the score's folder, as LilyPond runs there); Pondside
+reads its own rows, and the two agree (`pondside cues --format cues` and
+`lily_timing.py … cues` give identical lines on Tests/Scores/large-graphic).
+The skill tells agents not to set that pipeline up again.
+
+Graphics: the Lexicon kit's `\startGraphic`/`\stopGraphic` and a score's
+own graphic spanners are all text spanners, so one voice holds one graphic
+at a time; the graphic-notation skill says so.
 
 ## The running app: JSON-RPC over a Unix socket
 
@@ -196,10 +442,11 @@ calls a method from the shell.
 | Method | Params | Result |
 |---|---|---|
 | `app.version` | | name, version, socket path |
-| `app.documents` | | each open score: `root`, `files`, `active` file, `status` |
+| `app.documents` | | each open score: `root`, `files`, `active` file, `status`, `started` (when the latest compile began, Unix seconds), `diagnostics` (its errors) |
 | `document.text` | `path?` | `{ path, text }`: the app's current text, including unsaved edits |
 | `document.selection` | `path?` | `{ path, start, end, text, events }`, with positions as `{ line, character }` |
 | `document.context` | `path?`, `line?`, `character?` | the selection's (or that point's) `score_context`, with `system: { first, last, next }` from the engraving |
+| `document.patchContext` | `path?`, `line?`, `character?`, `cue?` | the selection's (or that point's, or that cue's) `patch_context`; an error when the score has no Pondside patch |
 | `document.select` | `path, line, character` | puts the caret there (the score highlights it); returns the selection |
 | `document.engrave` | `path?` | starts a compile; the result arrives as `compile.finished` |
 | `document.cues` | `path?` | the latest cues.json |

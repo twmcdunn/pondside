@@ -142,6 +142,26 @@ final class PaneTests: XCTestCase {
         XCTAssertEqual(l.focused, 0)
     }
 
+    func testToggleAddsAPaneAndGivesItsRoomBack() {
+        var l = PaneLayout(name: "W", contents: [.lilypond, .score], fractions: [0.4, 0.6], focused: 1)
+        l.toggle(.agentLog)
+        XCTAssertEqual(l.contents, [.lilypond, .score, .agentLog])
+        XCTAssertEqual(l.fractions.reduce(0, +), 1, accuracy: 1e-9)
+        XCTAssertEqual(l.fractions[2], 0.3, accuracy: 1e-9)
+        XCTAssertEqual(l.focused, 1, "the keyboard stays where it was")
+        l.toggle(.agentLog)
+        XCTAssertEqual(l.contents, [.lilypond, .score])
+        XCTAssertEqual(l.fractions[0], 0.4, accuracy: 1e-9)
+        XCTAssertEqual(l.fractions[1], 0.6, accuracy: 1e-9)
+        // Closing a pane before the focused one keeps focus on the same content.
+        var m = PaneLayout(name: "M", contents: [.agentLog, .score], focused: 1)
+        m.toggle(.agentLog)
+        XCTAssertEqual(m.contents, [.score])
+        XCTAssertEqual(m.focused, 0)
+        m.toggle(.score)
+        XCTAssertEqual(m.contents, [.score], "the last pane stays")
+    }
+
     func testWorkspacesAndShortcuts() {
         var w = Workspaces()
         w.save(PaneLayout.presets[0], as: "Mine")

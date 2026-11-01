@@ -1,6 +1,9 @@
 import AppKit
 import UniformTypeIdentifiers
 import PondsideCore
+import PondsideBridge
+import PondsideLexicon
+import os
 
 /// Application entry point for the macOS front end.
 @MainActor
@@ -23,10 +26,6 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     private var openedFromLaunch = false
     private let recentMenu = NSMenu(title: "Open Recent")
     private var lightsOut = UserDefaults.standard.bool(forKey: "Pondside.lightsOut")
-
-    static let lilyPondTypes: [UTType] = [
-        UTType(filenameExtension: "ly"), UTType(filenameExtension: "ily"),
-    ].compactMap { $0 }
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMenu()
@@ -55,7 +54,8 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
 
     func applicationWillTerminate(_ notification: Notification) {
         AppRPC.shared.stop()
-        controllers.forEach { $0.score.flushPendingSaves() }
+        controllers.forEach { $0.score.flushPendingSaves(); $0.flushSuperCollider() }
+        SCLangHost.shared.shutdown()
     }
 
     func windowDidClose(_ controller: DocumentWindowController) {
@@ -64,11 +64,23 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
 
     // MARK: Opening
 
+    /// Opens a project: its root folder, or a score in it. Every project
+    /// gets the same structure (ProjectStructure) before its score opens.
     func open(_ url: URL) {
-        let url = url.standardizedFileURL
+        var url = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue {
+            guard let score = rootScore(in: url) else { return }
+            url = score
+        }
         if let existing = controllers.first(where: { $0.score.root.matches(path: url.path) }) {
             existing.showWindow(nil)
             return
+        }
+        for change in ProjectStructure.ensure(score: url) {
+            if let why = change.error {
+                Logger(subsystem: "app.pondside", category: "project").notice("\(change.path, privacy: .public) left alone: \(why, privacy: .public)")
+            }
         }
         do {
             let document = try ScoreDocument(url: url)
@@ -82,36 +94,67 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         }
     }
 
+    /// The score a project root opens. A folder with no score offers to
+    /// start one; one with several asks which, and remembers the answer in
+    /// its pondside.toml (`[project] score`).
+    private func rootScore(in folder: URL) -> URL? {
+        switch ProjectStructure.rootScore(in: folder) {
+        case .score(let score):
+            return score
+        case .none:
+            let alert = NSAlert()
+            alert.messageText = "\(folder.lastPathComponent) has no score"
+            alert.informativeText = "Start one in this project root? Pondside writes \(folder.lastPathComponent).ly "
+                + "and the project's folders (patch/, renders/) beside it."
+            alert.addButton(withTitle: "Create Score")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            do { return try ProjectStructure.create(at: folder) } catch {
+                _ = NSAlert(error: error).runModal()
+                return nil
+            }
+        case .ambiguous(let scores):
+            let alert = NSAlert()
+            alert.messageText = "Which score is \(folder.lastPathComponent)'s root?"
+            alert.informativeText = "Pondside opens it whenever this project root is opened (pondside.toml, [project] score)."
+            let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 260, height: 26), pullsDown: false)
+            popup.addItems(withTitles: scores.map(\.lastPathComponent))
+            alert.accessoryView = popup
+            alert.addButton(withTitle: "Open")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            let score = scores[max(0, popup.indexOfSelectedItem)]
+            let toml = folder.appendingPathComponent(ProjectConfig.fileName)
+            let text = (try? String(contentsOf: toml, encoding: .utf8)) ?? ""
+            try? Data(ProjectStructure.settingScore(score.lastPathComponent, in: text).utf8).write(to: toml, options: .atomic)
+            return score
+        }
+    }
+
     @objc func openDocument(_ sender: Any?) {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = Self.lilyPondTypes
+        panel.title = "Open Project Root"
+        panel.message = "Choose a project root: the folder that holds the score."
+        panel.prompt = "Open"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
         panel.allowsMultipleSelection = true
-        panel.canChooseDirectories = false
         guard panel.runModal() == .OK else { return }
         panel.urls.forEach { self.open($0) }
     }
 
     @objc func newDocument(_ sender: Any?) {
         let panel = NSSavePanel()
-        panel.allowedContentTypes = Self.lilyPondTypes.prefix(1).map { $0 }
-        panel.nameFieldStringValue = "Untitled.ly"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        let template = """
-        \\version "2.26.0"
-
-        \\header {
-          title = "Untitled"
-        }
-
-        \\relative c' {
-          \\time 4/4
-          c4 d e f | g1 \\bar "|."
-        }
-
-        """
+        panel.title = "New Project"
+        panel.message = "Name the project root. Pondside creates this folder with the score, patch/ and renders/ inside."
+        panel.nameFieldLabel = "Project Root:"
+        panel.nameFieldStringValue = "Untitled"
+        panel.prompt = "Create"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
         do {
-            try Data(template.utf8).write(to: url, options: .atomic)
-            self.open(url)
+            self.open(try ProjectStructure.create(at: folder))
         } catch {
             _ = NSAlert(error: error).runModal()
         }
@@ -155,6 +198,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         case "file.open": openDocument(nil)
         case "view.lightsOut": toggleLightsOut(nil)
         case "help.about": showAbout(nil)
+        case "help.settings": SettingsWindowController.shared.show()
         default: NSSound.beep()
         }
     }
@@ -188,7 +232,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         submenu("Pondside", [
             command("help.about"),
             .separator(),
-            item("Install Command-Line Tool…", #selector(installCommandLineTool(_:)), ""),
+            command("help.settings"),
             .separator(),
             item("Hide Pondside", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
@@ -201,6 +245,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             command("file.open"),
             openRecentItem(),
             .separator(),
+            command("file.scoreSetup"),
             command("file.engravingSettings"),
             command("file.lilypond"),
             .separator(),
@@ -223,9 +268,16 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             .separator(),
             command("edit.delete"),
             command("edit.source"),
+            .separator(),
+            command("edit.stopAgent"),
+            command("edit.undoAgent"),
+            command("edit.newAgentConversation"),
+            command("edit.patchRequest"),
+            command("edit.newPatchConversation"),
         ])
         submenu("Go", commands(category: "Go"))
         submenu("Add", commands(category: "Add"))
+        submenu("SuperCollider", commands(category: "SuperCollider"))
         var view = commands(category: "View").filter { $0.commandID != "view.fullScreen" }
         view += [.separator()] + commands(category: "Pane")
         view += [.separator(), center.menuItem("view.fullScreen", action: #selector(NSWindow.toggleFullScreen(_:)))]

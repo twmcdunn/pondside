@@ -39,6 +39,34 @@ final class EngravedPageTests: XCTestCase {
         XCTAssertEqual(page.linkedPositions(onLine: 4), [1, 4, 6, 7, 9, 14, 16, 19, 23, 25, 28, 31])
     }
 
+    /// A texture of dots broken across two systems: a click between its
+    /// dots finds it, a click between the systems doesn't.
+    func testRegionHitFindsTexturesBetweenTheirParts() {
+        func dots(_ ys: [Double]) -> String {
+            ys.flatMap { y in [20.0, 24, 28].map { x in "<g transform=\"translate(\(x), \(y))\"><circle r=\"0.06\" fill=\"currentColor\"/></g>" } }
+                .joined(separator: "\n")
+        }
+        let svg = """
+        <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="210.00mm" height="297.00mm" viewBox="0 0 119.5 169">
+        <a style="color:inherit;" xlink:href="textedit:///s/graphics.ly:3:20:21">
+        \(dots([10, 11, 12]))
+        \(dots([40, 41.5]))
+        </a>
+        <a style="color:inherit;" xlink:href="textedit:///s/graphics.ly:4:2:3">
+        <g transform="translate(60, 60)"><circle r="0.5" fill="currentColor"/></g>
+        </a>
+        </svg>
+        """
+        let page = EngravedPage(svg: Data(svg.utf8))
+        XCTAssertNil(page.hitTest(Point(22, 11)), "nothing is directly under the click")
+        XCTAssertEqual(page.regionHit(Point(22, 11))?.link?.position, SourcePosition(line: 3, character: 20))
+        XCTAssertEqual(page.regionHit(Point(26, 41))?.link?.position, SourcePosition(line: 3, character: 20))
+        XCTAssertNil(page.regionHit(Point(22, 25)), "between the systems")
+        XCTAssertNil(page.regionHit(Point(60, 60)), "a single graphic is hit-tested directly, not as a region")
+        let linked = page.graphics.filter { $0.link?.line == 3 }
+        XCTAssertEqual(EngravedPage.regions(of: linked).count, 2)
+    }
+
     func testTextRuns() throws {
         let page = EngravedPage(svg: try Data(contentsOf: try fixture("etude.svg")))
         let texts: [TextRun] = page.graphics.compactMap {

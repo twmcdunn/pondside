@@ -136,9 +136,14 @@ final class SourceEditorView: NSView, NSTextViewDelegate {
 
     /// Merges an external edit as a single minimal replacement, so the caret,
     /// selection and scroll position of untouched text stay exactly where
-    /// they were. The change is undoable like any other edit.
-    func mergeExternal(_ newText: String, into key: URL) {
+    /// they were. The change is undoable like any other edit unless
+    /// `registeringUndo` is false (an agent change keeps its own single
+    /// cross-file undo step instead).
+    func mergeExternal(_ newText: String, into key: URL, registeringUndo: Bool = true) {
         guard let view = views[key] else { return }
+        let manager = view.undoManager
+        if !registeringUndo { manager?.disableUndoRegistration() }
+        defer { if !registeringUndo { manager?.enableUndoRegistration() } }
         if view !== textView {
             applyingProgrammaticChange = true
             if let r = TextDiff.minimalReplacement(from: view.string, to: newText) {

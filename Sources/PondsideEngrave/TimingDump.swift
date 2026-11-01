@@ -15,6 +15,9 @@ public enum TimingDump {
 
     public static let listener = """
     #(define pondside-timing-last-meter #f)
+    % front-matter.ily sets it while it draws a legend example (a \\score
+    % in markup), which is not part of the piece's time.
+    #(define pondside-in-example #f)
 
     % ly:duration-length in 2.24, ly:duration->moment later.
     #(define pondside-duration-moment
@@ -22,7 +25,7 @@ public enum TimingDump {
 
     #(define (pondside-timing-row context kind . values)
        (let ((m (ly:context-current-moment context)))
-         (if (zero? (ly:moment-grace m))
+         (if (and (zero? (ly:moment-grace m)) (not pondside-in-example))
              (let* ((bar (ly:context-property context 'currentBarNumber 1))
                     (pos (ly:context-property context 'measurePosition (ly:make-moment 0)))
                     ; 2.26 renamed timeSignatureFraction to timeSignature (and warns on the old name)
@@ -73,7 +76,14 @@ public enum TimingDump {
                      (let ((lex (ly:event-property event 'pondside-lexicon #f)))
                        (if (pair? lex)
                            (pondside-timing-row context "lexicon" cue (car lex) (cadr lex) (caddr lex)))))
-                    (mark (apply pondside-timing-row context "text" mark where))))))
+                    (mark (apply pondside-timing-row context "text" mark where))
+                    ; the older workflow's marks (its timing.ily): a hidden text
+                    ; "improv 1", "improv end" or "end"
+                    (else
+                     (let ((s (string-delete (string->char-set "[]")
+                                             (markup->string (ly:event-property event 'text)))))
+                       (if (or (string-prefix? "improv " s) (string=? s "end"))
+                           (apply pondside-timing-row context "text" s where))))))))
          ((note-event engraver event)
           (let ((p (ly:event-property event 'pitch #f)))
             (if (ly:pitch? p)
@@ -88,19 +98,9 @@ public enum TimingDump {
 
     """
 
-    /// Interprets `source` (no pages are written) and returns its timing log.
+    /// Interprets `source` (no pages are written) and returns its timing
+    /// log: the playback's, so cue times agree with the mockup (PlaybackScore).
     public static func run(_ installation: LilyPondInstallation, source: URL) async throws -> TimingLog {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-timing-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let settings = dir.appendingPathComponent("timing.ily")
-        try Data(listener.utf8).write(to: settings)
-        let output = try await ProcessRunner.run(
-            installation.executable,
-            ["-dinclude-settings=\(settings.path)", "-dno-print-pages", "-dbackend=null",
-             "-o", dir.appendingPathComponent("out").path, source.path],
-            currentDirectory: source.deletingLastPathComponent().path)
-        guard output.status == 0 else { throw EventDump.Failure(log: output.stderrString) }
-        return TimingLog(parsing: output.stdoutString, prefix: marker)
+        try await PlaybackScore.compile(installation, source: source).timing
     }
 }

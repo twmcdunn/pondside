@@ -19,8 +19,8 @@ Lexicon with its graphics kit and agent workflow are built. CI builds and tests 
 `docs/DESIGN.md` §9 lists what remains.
 
 - **Open and engrave.** Open a `.ly` file. It is engraved by the LilyPond
-  you already have, detected on `PATH`, Homebrew, MacPorts or
-  `/Applications`. Nothing is installed for you.
+  the installer put in place, or one you already have, detected on `PATH`,
+  Homebrew, MacPorts or `/Applications`.
 - **Point-and-click both ways.** Click a glyph to select its source; move
   the caret to highlight the glyph; drag a rectangle to select a span.
 - **Multi-file scores just work.** Clicking a note that lives in an
@@ -68,9 +68,18 @@ Lexicon with its graphics kit and agent workflow are built. CI builds and tests 
   MCP resources.
 - **For agents.** `pondside mcp` is an MCP server: check, query (events
   with resolved absolute pitches), render, cues, Lexicon checks, and the
-  Lexicon as resources. See [docs/API.md](docs/API.md).
+  Lexicon as resources. Opening a score writes `.mcp.json` and
+  `opencode.json` beside it, so `claude` or `opencode` typed in the
+  terminal pane finds the server with no setup. See [docs/API.md](docs/API.md).
 - **Export.** `⌘E` exports a PDF with point-and-click disabled, then checks
   the output for local filesystem paths.
+- **Mockup audio.** After each good engraving the app renders `score.wav`
+  beside it in a separate process (`pondside mockup`: MuseScore with Muse
+  Sounds when installed, else fluidsynth), for in-app audition and the
+  SuperCollider quark. No `\midi` block needed: Pondside generates the
+  playback (repeats, tremolos and trills played out, `\articulate`,
+  instruments from staff names), and cue times follow the same music
+  ([docs/API.md](docs/API.md#playback)).
 
 ### Score keys
 
@@ -95,6 +104,17 @@ Keys are LilyPond wherever LilyPond has an answer.
 | `⌘J` | switch between score and source |
 | `⌘⇧]` `⌘⇧[` | next / previous file |
 
+## Install
+
+Download `Pondside-<version>-arm64.pkg` and double-click it. The first
+time, macOS refuses to open it because it is not notarized: open
+**System Settings → Privacy & Security**, click **Open Anyway** beside the
+Pondside message, and confirm. The installer then puts Pondside in
+Applications with LilyPond, FluidSynth and a SoundFont. Its
+**Customize** page has checkboxes for the command-line tool, FluidSynth,
+SuperCollider and MuseScore Studio; the last two are downloaded from their
+projects during installation. Pondside opens without a further prompt.
+
 ## Build
 
 Requires Swift 6 (Xcode 16+) and macOS 14+ on Apple Silicon for the app.
@@ -104,6 +124,7 @@ The portable modules and the CLI also build on Linux.
 swift build                      # everything (the app only on macOS)
 swift test                       # integration tests run if LilyPond is installed
 scripts/make-app.sh              # → .build/Pondside.app
+scripts/make-installer.sh        # → .build/Pondside-<version>-<arch>.pkg (app + LilyPond + FluidSynth)
 open .build/Pondside.app --args "$PWD/path/to/score.ly"   # open runs the app from /
 ```
 
@@ -119,6 +140,7 @@ pondside cues score.ly --format cues     # seconds<TAB>bar<TAB>cue N, for SuperC
 pondside handlers score.ly --scd cues.scd
 pondside lexicon list                    # tier 0 of the Lexicon
 pondside mcp                             # MCP server on stdio (claude mcp add pondside -- pondside mcp)
+pondside agents                          # .mcp.json + opencode.json here, for agents started in this folder
 ```
 
 Everything the CLI and MCP server offer is documented in [docs/API.md](docs/API.md).

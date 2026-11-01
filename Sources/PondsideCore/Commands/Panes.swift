@@ -1,7 +1,13 @@
 /// What a pane can show. Panes are frames; content is cargo: swapping
 /// content never changes a pane's geometry.
 public enum PaneContent: String, CaseIterable, Codable, Hashable, Sendable {
-    case score, lilypond, compilerOutput, terminal, supercollider, python, agent, cues, lexicon
+    case score, lilypond, compilerOutput, terminal, supercollider, python, cues, lexicon, agentLog
+
+    /// Layouts saved before a content was retired fall back to the terminal
+    /// (the Agent pane was a terminal running an agent).
+    public init(from decoder: Decoder) throws {
+        self = Self(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .terminal
+    }
 
     public var title: String {
         switch self {
@@ -11,9 +17,9 @@ public enum PaneContent: String, CaseIterable, Codable, Hashable, Sendable {
         case .terminal: return "Terminal"
         case .supercollider: return "SuperCollider Source"
         case .python: return "Python Source"
-        case .agent: return "Agent"
         case .cues: return "Cue Inspector"
         case .lexicon: return "Lexicon"
+        case .agentLog: return "Agent Log"
         }
     }
 
@@ -32,9 +38,9 @@ public enum PaneContent: String, CaseIterable, Codable, Hashable, Sendable {
         case .terminal: return "t"
         case .supercollider: return "c"
         case .python: return "y"
-        case .agent: return "a"
         case .cues: return "u"
         case .lexicon: return "x"
+        case .agentLog: return "a"
         }
     }
 }
@@ -91,6 +97,26 @@ public struct PaneLayout: Codable, Hashable, Sendable {
 
     /// Shows `content` in the focused pane. If another pane shows it already,
     /// the two swap, so nothing is shown twice and nothing moves.
+    /// Shows `content` in a pane of its own beside the others (taking
+    /// `share` of the window), or, if a pane shows it already, closes that
+    /// pane and gives its room back. Focus stays on the pane it was on.
+    public mutating func toggle(_ content: PaneContent, share: Double = 0.3) {
+        if let i = contents.firstIndex(of: content) {
+            guard contents.count > 1 else { return }
+            let freed = fractions.indices.contains(i) ? fractions[i] : 0
+            contents.remove(at: i)
+            if fractions.indices.contains(i) { fractions.remove(at: i) }
+            let rest = fractions.reduce(0, +)
+            fractions = rest > 0 ? fractions.map { $0 / rest * (rest + freed) } : Array(repeating: 1 / Double(contents.count), count: contents.count)
+            if focused > i || focused >= contents.count { focused = max(0, focused - 1) }
+        } else {
+            let s = min(max(share, 0.1), 0.6)
+            if fractions.count != contents.count { fractions = Array(repeating: 1 / Double(max(contents.count, 1)), count: contents.count) }
+            fractions = fractions.map { $0 * (1 - s) } + [s]
+            contents.append(content)
+        }
+    }
+
     public mutating func show(_ content: PaneContent) {
         guard let current = focusedContent, current != content else { return }
         if let other = contents.firstIndex(of: content) { contents[other] = current }

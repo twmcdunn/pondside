@@ -381,6 +381,35 @@ extension EngravingSetting {
     }
 }
 
+extension EngravingSetting {
+    /// Marks a header value that is not a plain string (shown, not rewritten).
+    static let rawMarker = "\u{1}"
+
+    /// A `\header` text field (`title = "…"`), not shown in the settings panel.
+    static func headerText(_ key: String) -> EngravingSetting {
+        EngravingSetting("header.\(key)", group: "Header", title: key, help: "", location: .header, kind: .choice([]),
+                         default: .choice(""), keys: [key],
+                         render: { ["\(key) = \(StaffSetup.quoted($0.choice ?? ""))"] },
+                         parse: { found in
+                             guard let s = found[key], let eq = s.firstIndex(of: "=") else { return nil }
+                             let v = s[s.index(after: eq)...].trimmedSpaces
+                             if v.count >= 2, v.hasPrefix("\""), v.hasSuffix("\""), !v.dropFirst().dropLast().contains("\"") {
+                                 return .choice(unescape(String(v.dropFirst().dropLast())))
+                             }
+                             return .choice(rawMarker + v)
+                         })
+    }
+
+    static func unescape(_ s: String) -> String {
+        var out = ""
+        var escaped = false
+        for c in s {
+            if escaped { out.append(c); escaped = false } else if c == "\\" { escaped = true } else { out.append(c) }
+        }
+        return out
+    }
+}
+
 extension StringProtocol {
     var trimmedSpaces: String {
         let s = drop { $0 == " " || $0 == "\t" }

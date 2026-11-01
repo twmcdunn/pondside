@@ -92,7 +92,7 @@ public struct MockupRenderer: Sendable {
 
     public init(sampleRate: Int = 48000, soundFont: URL? = nil, cacheDirectory: URL? = nil) {
         self.sampleRate = sampleRate
-        self.soundFont = soundFont
+        self.soundFont = soundFont ?? BundledToolchain.soundFont()
         self.cacheDirectory = cacheDirectory
             ?? FileManager.default.temporaryDirectory.appendingPathComponent("pondside-mockups")
     }
@@ -109,8 +109,10 @@ public struct MockupRenderer: Sendable {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    /// The installer's fluidsynth first (built for every supported macOS),
+    /// then one on PATH.
     public static func findFluidSynth(environment: [String: String] = ProcessInfo.processInfo.environment) -> String? {
-        (environment["PATH"] ?? "/usr/bin:/usr/local/bin:/opt/homebrew/bin").split(separator: ":")
+        BundledToolchain.fluidSynth() ?? (environment["PATH"] ?? "/usr/bin:/usr/local/bin:/opt/homebrew/bin").split(separator: ":")
             .map { "\($0)/fluidsynth" }.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
@@ -164,7 +166,7 @@ public struct MockupRenderer: Sendable {
             guard let mscore = Self.findMuseScore() else { throw Failure(description: "MuseScore is not installed") }
             result = try await ProcessRunner.run(mscore, ["-o", output.path, midi.path])
         case .fluidsynth:
-            guard let fluid = Self.findFluidSynth() else { throw Failure(description: "fluidsynth is not installed (brew install fluid-synth)") }
+            guard let fluid = Self.findFluidSynth() else { throw Failure(description: "fluidsynth is not installed (run the Pondside installer, or brew install fluid-synth)") }
             guard let soundFont else { throw Failure(description: "fluidsynth needs a SoundFont (--soundfont path.sf2)") }
             result = try await ProcessRunner.run(fluid, ["-ni", "-F", output.path, "-r", String(sampleRate), soundFont.path, midi.path])
         }

@@ -98,11 +98,33 @@ final class ToolchainTests: XCTestCase {
     }
 
     func testCandidatesIncludeStandardLocations() {
-        let d = ToolchainDetector(environment: ["PATH": "/a/bin:/b/bin", "HOME": "/nonexistent"])
+        let d = ToolchainDetector(environment: ["PATH": "/a/bin:/b/bin", "HOME": "/nonexistent"], bundledDirectory: nil)
         let paths = d.lilyPondCandidates().map { $0.path }
         XCTAssertEqual(Array(paths.prefix(2)), ["/a/bin/lilypond", "/b/bin/lilypond"])
         XCTAssertTrue(paths.contains("/opt/homebrew/bin/lilypond"))
         XCTAssertTrue(paths.contains("/opt/local/bin/lilypond"))
+    }
+
+    func testBundledToolchainComesAfterOverrideBeforePath() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-toolchain-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for sub in ["lilypond-2.26.0/bin", "fluidsynth/bin", "soundfonts"] {
+            try FileManager.default.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        let fluid = dir.appendingPathComponent("fluidsynth/bin/fluidsynth")
+        try "#!/bin/sh\n".write(to: fluid, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fluid.path)
+        try Data().write(to: dir.appendingPathComponent("soundfonts/GeneralUser-GS.sf2"))
+
+        let d = ToolchainDetector(environment: ["PATH": "/a/bin", "HOME": "/nonexistent", "PONDSIDE_LILYPOND": "/x/lilypond"],
+                                  bundledDirectory: dir.path)
+        let candidates = d.lilyPondCandidates()
+        XCTAssertEqual(candidates.prefix(3).map(\.path), ["/x/lilypond", dir.path + "/lilypond-2.26.0/bin/lilypond", "/a/bin/lilypond"])
+        XCTAssertEqual(candidates[1].origin, .bundled)
+        XCTAssertEqual(BundledToolchain.fluidSynth(in: dir.path), fluid.path)
+        XCTAssertEqual(BundledToolchain.soundFont(in: dir.path)?.lastPathComponent, "GeneralUser-GS.sf2")
+        XCTAssertNil(BundledToolchain.fluidSynth(in: "/nonexistent"))
+        XCTAssertNil(BundledToolchain.soundFont(in: nil))
     }
 }
 

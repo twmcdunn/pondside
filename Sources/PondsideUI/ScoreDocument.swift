@@ -3,6 +3,8 @@ import PondsideCore
 import PondsideEngrave
 import PondsideTiming
 import PondsideLexicon
+import PondsideBridge
+import os
 
 enum CompileStatus: Equatable {
     case idle
@@ -24,6 +26,8 @@ protocol ScoreDocumentDelegate: AnyObject {
     func documentDidLoadCachedRender(_ document: ScoreDocument)
     /// Files joined or left the include graph.
     func documentFilesDidChange(_ document: ScoreDocument)
+    /// The playback's timing arrived (with the mockup): cue times changed.
+    func documentDidUpdatePlayback(_ document: ScoreDocument)
 }
 
 /// Detected LilyPond installs, probed once per launch.
@@ -102,6 +106,9 @@ final class ScoreDocument {
     weak var delegate: ScoreDocumentDelegate?
 
     private(set) var status: CompileStatus = .idle
+    /// When the latest compile started (it reads the files as they were
+    /// then), so a script that wrote a file knows when its result is in.
+    private(set) var compileStarted: Date?
     /// LilyPond's output from the latest compile, for the compiler-output pane.
     private(set) var lastLog = ""
     /// Cue times from the latest compile (every canvas compile logs them).
@@ -137,6 +144,18 @@ final class ScoreDocument {
     private var storeTask: Task<Void, Never>?
     /// Checkpoints of the score's files, half a minute after the last save.
     private var historyTask: Task<Void, Never>?
+    /// One mockup render at a time; an engraving during it asks for one more.
+    private var mockupRunning = false {
+        didSet { if mockupRunning != oldValue { delegate?.documentStatusDidChange(self) } }
+    }
+
+    /// What runs in the background besides engraving, for the status bar.
+    var activities: [String] {
+        (mockupRunning ? ["Rendering the mockup..."] : []) + (mixRunning ? ["Rendering the mix..."] : [])
+    }
+    private var mockupPending = false
+    /// The cue sheet is the playback's, not the canvas's.
+    private var hasPlaybackTiming = false
 
     static let historyRoot: URL? = FileManager.default
         .urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
@@ -385,6 +404,7 @@ final class ScoreDocument {
         renderGeneration += 1
         let generation = renderGeneration
         prior?.cancel()
+        compileStarted = Date()
         setStatus(.compiling)
         let engraver = LilyPondEngraver(installation: installation, daemon: daemon)
         let source = url
@@ -405,6 +425,141 @@ final class ScoreDocument {
             self.renderTask = nil
             self.finish(outcome)
         }
+    }
+
+    /// The audio mockup beside the score (`pondside mockup`: MuseScore with
+    /// Muse Sounds when installed, else fluidsynth), in its own process after
+    /// each good engraving; a score without `\midi` gets a generated playback
+    /// (PlaybackScore). The same compile's timing replaces the canvas's for
+    /// cue times, so they match the audio (repeats played out, \articulate).
+    /// A render is never killed (MuseScore would be orphaned): engravings
+    /// during one queue a single re-render of the newest text.
+    private func renderMockup() {
+        guard let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
+              FileManager.default.isExecutableFile(atPath: tool.path) else { return }
+        if mockupRunning {
+            mockupPending = true
+            return
+        }
+        let process = Process()
+        process.executableURL = tool
+        let timing = workDirectory.appendingPathComponent("playback-\(UUID().uuidString).timing")
+        try? FileManager.default.createDirectory(at: workDirectory, withIntermediateDirectories: true)
+        process.arguments = ["mockup", url.path, "--timing", timing.path]
+        process.currentDirectoryURL = url.deletingLastPathComponent()
+        process.standardOutput = FileHandle.nullDevice
+        let errors = Pipe()
+        process.standardError = errors
+        let ref = WeakRef(self)
+        process.terminationHandler = { p in
+            let message = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            if p.terminationStatus != 0 {
+                Logger(subsystem: "app.pondside", category: "mockup").notice("\(message, privacy: .public)")
+            }
+            let text = try? String(contentsOf: timing, encoding: .utf8)
+            try? FileManager.default.removeItem(at: timing)
+            let rendered = p.terminationStatus == 0
+            Task { @MainActor in
+                guard let doc = ref.value else { return }
+                doc.mockupRunning = false
+                if let text, !doc.mockupPending { doc.adoptTiming(TimingLog(parsing: text, prefix: TimingDump.marker)) }
+                if doc.mockupPending {
+                    doc.mockupPending = false
+                    doc.renderMockup()
+                } else if rendered {
+                    doc.syncPatch()
+                    doc.renderMix()
+                }
+            }
+        }
+        do {
+            try process.run()
+            mockupRunning = true
+        } catch {
+            Logger(subsystem: "app.pondside", category: "mockup").notice("\(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    // MARK: The patch
+
+    /// The Pondside patch beside the score (`[supercollider] handlers`, else
+    /// `<name>.scd`), if there is one.
+    var patchURL: URL? {
+        PatchRender.patch(for: url, configured: (try? ProjectConfig.find(from: url))?.handlers)
+    }
+
+    /// Stubs for new cues in the patch, its cue comments brought up to date
+    /// (HandlerSync); the SuperCollider pane merges the change in.
+    private func syncPatch() {
+        guard let patch = patchURL, let sheet = cueSheet,
+              let text = try? String(contentsOf: patch, encoding: .utf8) else { return }
+        let (new, _) = HandlerSync.sync(text, with: sheet)
+        if new != text { try? Data(new.utf8).write(to: patch, options: .atomic) }
+        // The engine is Pondside's: always the current one.
+        try? PatchMigration.ensureEngine(patch: patch, name: url.deletingPathExtension().lastPathComponent)
+    }
+
+    /// One mix render at a time; a mockup during it asks for one more.
+    private var mixRunning = false {
+        didSet { if mixRunning != oldValue { delegate?.documentStatusDidChange(self) } }
+    }
+    private var mixPending = false
+
+    /// The score with its electronics (`pondside mix`: the patch rendered
+    /// offline in mockup mode) into `<name>.mix.wav`, after each mockup.
+    func renderMix() {
+        guard patchURL != nil, let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
+              FileManager.default.isExecutableFile(atPath: tool.path) else { return }
+        if mixRunning {
+            mixPending = true
+            return
+        }
+        let process = Process()
+        process.executableURL = tool
+        process.arguments = ["mix", url.path]
+        process.currentDirectoryURL = url.deletingLastPathComponent()
+        process.standardOutput = FileHandle.nullDevice
+        let errors = Pipe()
+        process.standardError = errors
+        let ref = WeakRef(self)
+        process.terminationHandler = { p in
+            let message = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let ok = p.terminationStatus == 0
+            if !ok { Logger(subsystem: "app.pondside", category: "mix").notice("\(message, privacy: .public)") }
+            Task { @MainActor in
+                guard let doc = ref.value else { return }
+                doc.mixRunning = false
+                doc.mixProblem = ok ? nil : message.split(separator: "\n").last.map(String.init) ?? "the patch didn't render"
+                if doc.mixPending {
+                    doc.mixPending = false
+                    doc.renderMix()
+                }
+            }
+        }
+        do {
+            try process.run()
+            mixRunning = true
+        } catch {
+            Logger(subsystem: "app.pondside", category: "mix").notice("\(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Why the latest mix failed, for the play command to say.
+    private(set) var mixProblem: String?
+
+    private func setTiming(_ log: TimingLog) {
+        let rate = (try? ProjectConfig.find(from: url))?.sampleRate ?? 48000
+        let lex = Lexicon.load(Lexicon.standardScopes(project: url.deletingLastPathComponent()))
+        timingLog = log
+        cueSheet = CueSheet(log: log, score: url.lastPathComponent, sampleRate: rate,
+                            soundParams: { lex.soundParams(entry: $0, params: $1, beatDur: $2, spanDur: $3, tempo: $4) })
+    }
+
+    private func adoptTiming(_ log: TimingLog) {
+        guard !log.rows.isEmpty else { return }
+        setTiming(log)
+        hasPlaybackTiming = true
+        delegate?.documentDidUpdatePlayback(self)
     }
 
     private struct Outcome: Sendable {
@@ -430,11 +585,10 @@ final class ScoreDocument {
     private func finish(_ outcome: Outcome) {
         lastLog = outcome.result?.messages ?? outcome.error ?? ""
         if let result = outcome.result, result.succeeded {
-            let rate = (try? ProjectConfig.find(from: url))?.sampleRate ?? 48000
-            let lex = Lexicon.load(Lexicon.standardScopes(project: url.deletingLastPathComponent()))
-            timingLog = result.timing
-            cueSheet = CueSheet(log: result.timing, score: url.lastPathComponent, sampleRate: rate,
-                                soundParams: { lex.soundParams(entry: $0, params: $1, beatDur: $2, spanDur: $3, tempo: $4) })
+            renderMockup()
+            // The canvas's timing until the first playback timing arrives with
+            // the mockup; after that the last playback's, until the next one.
+            if !hasPlaybackTiming { setTiming(result.timing) }
         }
         if let result = outcome.result {
             for f in files {

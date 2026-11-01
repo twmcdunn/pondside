@@ -118,8 +118,7 @@ final class PanePlaceholder: NSView {
         layer?.backgroundColor = Theme.editorBackground.cgColor
         let when: String
         switch content {
-        case .supercollider, .python: when = "Arrives with the editor milestone (M5): LSP-backed editing."
-        case .agent: when = "Arrives with programmability (M6). Meanwhile any agent can edit the .ly files directly."
+        case .python: when = "Arrives with the editor milestone (M5)."
         case .lexicon: when = "Arrives with the Lexicon (M7)."
         default: when = ""
         }

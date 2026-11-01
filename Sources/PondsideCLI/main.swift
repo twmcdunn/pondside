@@ -21,12 +21,15 @@ commands:
       List the point-and-click links in a canvas SVG with their bounds.
   doctor [--json]
       List every LilyPond installation found, with version and origin.
-  cues <file.ly> [--format json|cues] [--rate <hz>] [--out <file>]
+  cues <file.ly> [--format json|cues|marks|ec] [--rate <hz>] [--out <file>]
       Every \\ecue with its moment, bar, beat, seconds and samples, timed
       exactly as LilyPond's MIDI plays (hidden \\playTempo included).
-      --format cues writes the piece.cues lines SuperCollider loaders read.
-  handlers <file.ly> --scd <cues.scd> [--project <dir>] [--rate <hz>]
-      Create or update a SuperCollider file with one handler per cue. New
+      --format cues writes the piece.cues lines SuperCollider loaders read;
+      marks the \\timingMark lines starting with --prefix (default improv);
+      ec the \\collection pitch classes on --staff (default elecUp) as ~ec.
+  handlers <file.ly> [--scd <patch.scd>] [--rate <hz>]
+      Create or update the score's patch (patch/<name>.scd) with one handler
+      per cue, and its engine (patch/dependencies/pondside.scd). New
       cues get stubs; cues that left the score are commented out; code
       inside a handler is never changed.
   lexicon list | search <words> | show <id> | impl <id> [--project <dir>]
@@ -43,12 +46,31 @@ commands:
       Pondside's checkpoints of the score's files (kept apart from your own
       git repository): list them, print a file at one, or restore one
       (the current state is checkpointed first).
+  mix <file.ly> [--scd <patch.scd>] [--out <file.wav>]
+      Render the score's Pondside patch (pondside handlers starts one) offline
+      in mockup mode against the mockup: the score with its electronics, in
+      <name>.mix.wav. The app runs it after each mockup.
+  patch <file.ly> [--scd <patch.scd>] [--from <file.scd>] [--fix [--agent auto|claude|opencode]]
+      Check the score's SuperCollider patch (or, without one, the folder's
+      likeliest .scd) against Pondside's patch layout (docs/SUPERCOLLIDER.md).
+      --fix migrates it into <name>.scd: wraps it in the mode, engine, cue and
+      play sections, converts quark handlers, renames clashing names, feeds
+      SoundIn.ar(0) from ~live, and marks what is left with // pondside:
+      comments for an agent (skill sc-patch-migration). An original that is
+      rewritten is kept as <name>.before-pondside.scd. --agent then has
+      claude -p or opencode run fix the marked lines, unattended.
   mockup <file.ly> [--out <file.wav>] [--rate <hz>] [--renderer musescore|fluidsynth] [--soundfont <sf2>] [--stems]
-      Render the score's MIDI (it needs a \\midi block) to audio for the
-      patch to play cues against: MuseScore 4 first, fluidsynth as the
-      fallback. Silent renders and wrong sample rates are refused. The
-      file is padded with silence to the score's end mark. --stems also
-      writes one file per staff (piece-<staff>.wav), to mute live parts.
+         [--timing <file>]
+      Render the score's playback to audio for the patch to play cues
+      against: MuseScore 4 (Muse Sounds) first, fluidsynth as the fallback.
+      A score without its own \\midi block gets one generated: repeats,
+      tremolos and trills played out, \\articulate, instruments from staff
+      names, electronics staves silent. Silent renders and wrong sample
+      rates are refused. The file is padded with silence to the score's end
+      mark. Beside it, piece.cues: the cue times of the same compile
+      (seconds<TAB>bar<TAB>cue N), what the Pondside quark reads. --stems
+      also writes one file per staff (piece-<staff>.wav), to mute live
+      parts. --timing writes the timing rows of the same compile.
   completion zsh|bash
       Print a completion script: eval "$(pondside completion zsh)".
   rpc <method> [<json params>]
@@ -58,6 +80,11 @@ commands:
       Serve the Model Context Protocol on stdin/stdout: tools (check, query,
       render, cues, lexicon_check) and the Lexicon tiers as resources.
       Claude Code: claude mcp add pondside -- pondside mcp
+  agents [<dir>]
+      Write .mcp.json (Claude Code) and opencode.json (opencode) in the
+      folder (default: the current one), so an agent started there finds
+      pondside mcp. Existing files only gain a missing pondside server.
+      The app does this for each score's folder when it opens the score.
   timeline <file.ly> [--json]
       The tempo map: each tempo step's moment, seconds and quarter notes per minute.
   watch <file> --on-change <command>
@@ -110,7 +137,7 @@ func resolveLilyPond(for source: URL?) async throws -> LilyPondInstallation {
     let pinned = source.flatMap { try? ProjectConfig.find(from: $0) }?.lilypondVersion.flatMap { LilyPondVersion($0) }
     let declared = pinned ?? source.flatMap { try? String(contentsOf: $0, encoding: .utf8) }.flatMap(LilyPondVersion.declared(in:))
     guard let chosen = ToolchainDetector.select(from: installs, for: declared) else {
-        throw CLIError("no LilyPond found. Install it (e.g. `brew install lilypond`) or set PONDSIDE_LILYPOND.")
+        throw CLIError("no LilyPond found. Run the Pondside installer, install it (e.g. `brew install lilypond`) or set PONDSIDE_LILYPOND.")
     }
     if let declared, chosen.version != declared {
         printErr("note: score declares \\version \"\(declared)\"; using LilyPond \(chosen.version) at \(chosen.executable)")
@@ -254,6 +281,10 @@ func watch(_ args: Arguments) async throws -> Int32 {
 }
 
 func cueSheet(_ args: Arguments) async throws -> CueSheet {
+    try await timing(args).sheet
+}
+
+func timing(_ args: Arguments) async throws -> (sheet: CueSheet, log: TimingLog) {
     let source = try sourceURL(args)
     let lily = try await resolveLilyPond(for: source)
     let config = try ProjectConfig.find(from: source)
@@ -263,18 +294,25 @@ func cueSheet(_ args: Arguments) async throws -> CueSheet {
     } ?? config.sampleRate
     let log = try await TimingDump.run(lily, source: source)
     let lex = Lexicon.load(Lexicon.standardScopes(project: source.deletingLastPathComponent()))
-    return CueSheet(log: log, score: source.lastPathComponent, sampleRate: rate,
-                    soundParams: { lex.soundParams(entry: $0, params: $1, beatDur: $2, spanDur: $3, tempo: $4) })
+    return (CueSheet(log: log, score: source.lastPathComponent, sampleRate: rate,
+                     soundParams: { lex.soundParams(entry: $0, params: $1, beatDur: $2, spanDur: $3, tempo: $4) }), log)
 }
 
 func cues(_ args: Arguments) async throws -> Int32 {
-    let sheet = try await cueSheet(args)
+    let (sheet, log) = try await timing(args)
     for w in sheet.warnings { printErr("warning: \(w)") }
     let data: Data
     switch args.options["format"] ?? "json" {
     case "json": data = try sheet.json() + Data("\n".utf8)
     case "cues": data = Data(sheet.cuesText.utf8)
-    case let f: throw CLIError("unknown format '\(f)' (json, cues)")
+    case "marks":
+        let prefix = args.options["prefix"] ?? "improv"
+        data = Data(sheet.marks.filter { $0.text.hasPrefix(prefix) }
+            .map { String(format: "%.3f", $0.seconds) + "\t\($0.position.measure)\t\($0.text)\n" }.joined().utf8)
+    case "ec":
+        let staff = args.options["staff"] ?? "elecUp"
+        data = Data(Collections.scd(Collections.find(in: log, staff: staff), staff: staff, score: sheet.score).utf8)
+    case let f: throw CLIError("unknown format '\(f)' (json, cues, marks, ec)")
     }
     if let out = args.options["out"] {
         try data.write(to: URL(fileURLWithPath: out), options: .atomic)
@@ -285,15 +323,15 @@ func cues(_ args: Arguments) async throws -> Int32 {
 }
 
 func handlers(_ args: Arguments) async throws -> Int32 {
-    let config = try ProjectConfig.find(from: try sourceURL(args))
-    guard let scd = args.options["scd"] ?? config.handlers?.path else {
-        throw CLIError("--scd <file> is required (or [supercollider] handlers in pondside.toml)")
-    }
+    let source = try sourceURL(args)
+    let config = try ProjectConfig.find(from: source)
+    let url = args.options["scd"].map { URL(fileURLWithPath: $0) } ?? PatchMigration.patchURL(score: source, configured: config.handlers)
     let sheet = try await cueSheet(args)
     for w in sheet.warnings { printErr("warning: \(w)") }
-    let url = URL(fileURLWithPath: scd)
+    let name = source.deletingPathExtension().lastPathComponent
     if let existing = try? String(contentsOf: url, encoding: .utf8) {
-        let (text, report) = HandlerSync.sync(existing, with: sheet)
+        let (text, report) = HandlerSync.sync(existing, with: sheet,
+                                              quark: (source.deletingLastPathComponent().appendingPathComponent(HandlerSync.Layout.renders).path, name))
         if text != existing { try Data(text.utf8).write(to: url, options: .atomic) }
         for (what, ids) in [("added", report.added), ("moved", report.moved), ("restored", report.restored),
                             ("commented out", report.orphaned)] where !ids.isEmpty {
@@ -301,11 +339,18 @@ func handlers(_ args: Arguments) async throws -> Int32 {
         }
         if text == existing { print("\(url.lastPathComponent) is up to date") }
     } else {
-        let project = args.options["project"] ?? url.deletingLastPathComponent().path
-        try Data(HandlerSync.starter(sheet, projectPath: project).utf8).write(to: url, options: .atomic)
-        print("wrote \(url.lastPathComponent) with \(sheet.cues.count) handler stubs")
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(HandlerSync.patchStarter(sheet, name: name).utf8).write(to: url, options: .atomic)
+        print("wrote \(url.lastPathComponent): a patch with \(sheet.cues.count) cue stubs")
+    }
+    if existingIsPatch(url), try PatchMigration.ensureEngine(patch: url, name: name) {
+        print("wrote \(HandlerSync.Layout.engineFile)")
     }
     return 0
+}
+
+func existingIsPatch(_ url: URL) -> Bool {
+    (try? String(contentsOf: url, encoding: .utf8))?.contains(HandlerSync.patchMarker) == true
 }
 
 func lexiconCommand(_ args: Arguments) throws -> Int32 {
@@ -399,6 +444,93 @@ func historyCommand(_ args: Arguments) async throws -> Int32 {
     return 0
 }
 
+/// The score with its electronics: the Pondside patch rendered offline in
+/// mockup mode against the mockup (PatchRender), into <name>.mix.wav.
+func mix(_ args: Arguments) async throws -> Int32 {
+    let source = try sourceURL(args)
+    let config = try ProjectConfig.find(from: source)
+    let configured = args.options["scd"].map { URL(fileURLWithPath: $0) } ?? config.handlers
+    guard let patch = PatchRender.patch(for: source, configured: configured) else {
+        throw CLIError("no Pondside patch for \(source.lastPathComponent): `pondside handlers \(source.lastPathComponent) --scd \(source.deletingPathExtension().lastPathComponent).scd` starts one")
+    }
+    let wav = HandlerSync.Layout.mockup(score: source)
+    guard FileManager.default.fileExists(atPath: wav.path) else { throw CLIError("no mockup yet (renders/\(wav.lastPathComponent)): run pondside mockup first") }
+    guard let sclang = SuperColliderToolchain.findSclang(configured: config.sclang?.path) else {
+        throw CLIError("SuperCollider not found (install it, or set [supercollider] path in pondside.toml)")
+    }
+    let out = args.options["out"].map { URL(fileURLWithPath: $0) } ?? PatchRender.output(for: source)
+    let problems = try await PatchRender.render(sclang: sclang, patch: patch, wav: wav, out: out)
+    for p in problems { printErr("warning: " + p) }
+    print("\(out.path): \(patch.lastPathComponent) in mockup mode")
+    return 0
+}
+
+/// Audits the score's SuperCollider patch (or, without one, the folder's
+/// likeliest .scd) against Pondside's patch layout; --fix migrates it.
+func patchCommand(_ args: Arguments) async throws -> Int32 {
+    let source = try sourceURL(args)
+    let config = try ProjectConfig.find(from: source)
+    let configured = args.options["scd"].map { URL(fileURLWithPath: $0) } ?? config.handlers
+    let target = PatchMigration.patchURL(score: source, configured: configured)
+    let found: (source: URL, target: URL, findings: [PatchMigration.Finding])?
+    if let from = args.options["from"].map({ URL(fileURLWithPath: $0) }) {
+        found = (from, target, PatchMigration.audit(try String(contentsOf: from, encoding: .utf8)))
+    } else {
+        found = PatchMigration.candidate(score: source, configured: configured)
+    }
+    guard let c = found else {
+        let marks = PatchMigration.allMarks(patch: target)
+        if !FileManager.default.fileExists(atPath: target.path) { print("no SuperCollider patch beside \(source.lastPathComponent)") }
+        else if marks.isEmpty { print("\(target.lastPathComponent) is a Pondside patch with nothing to fix") }
+        else { print("marked lines still to fix:"); for m in marks { print("  \(m.file):\(m.line): \(m.text)") } }
+        return marks.isEmpty ? 0 : 1
+    }
+    func show(_ f: PatchMigration.Finding, in file: URL) -> String {
+        let name = f.file ?? file.lastPathComponent
+        return (f.line.map { "\(name):\($0): " } ?? "\(name): ") + f.message
+    }
+    guard args.flags.contains("fix") else {
+        if args.flags.contains("json") {
+            struct Item: Encodable { var kind: String; var line: Int?; var message: String; var automatic: Bool }
+            struct Report: Encodable { var source: String; var target: String; var findings: [Item] }
+            try printJSON(Report(source: c.source.path, target: c.target.path, findings: c.findings.map {
+                Item(kind: $0.kind.rawValue, line: $0.line, message: $0.message, automatic: $0.automatic)
+            }))
+            return 1
+        }
+        let auto = c.findings.filter(\.automatic), manual = c.findings.filter { !$0.automatic }
+        if !auto.isEmpty { print("pondside patch --fix does these:"); for f in auto { print("  " + show(f, in: c.source)) } }
+        if !manual.isEmpty { print("for you or an agent (skill sc-patch-migration):"); for f in manual { print("  " + show(f, in: c.source)) } }
+        return 1
+    }
+    let sheet = try? await cueSheet(args)
+    let (result, backup, moved) = try PatchMigration.write(score: source, source: c.source, target: c.target, sheet: sheet)
+    for m in moved { print("moved \(m)") }
+    if let backup { print("kept the original as patch/\(backup.lastPathComponent)") }
+    print("wrote \(c.target.lastPathComponent)")
+    for f in result.applied { print("  done: " + f.message) }
+    if !result.manual.isEmpty {
+        print("left for you or an agent, marked \(PatchMigration.note) (skill sc-patch-migration):")
+        for f in result.manual { print("  " + show(f, in: c.target)) }
+    }
+    guard !result.manual.isEmpty, let preference = args.options["agent"] else { return 0 }
+    guard let agent = AgentRun.choose(preference: preference == "auto" ? nil : preference) else {
+        throw CLIError("no agent found (claude or opencode)")
+    }
+    let me = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
+    let pondside = FileManager.default.isExecutableFile(atPath: me) ? me : "pondside"
+    print("\(agent.harness.title) is finishing \(c.target.lastPathComponent)…")
+    let outcome = try await agent.run(prompt: AgentRun.migrationPrompt(score: source, patch: c.target),
+                                      folder: source.deletingLastPathComponent(), pondside: pondside) { printErr("  " + $0) }
+    print(outcome.summary)
+    if let cost = outcome.costUSD { print(String(format: "(%@: $%.2f)", agent.harness.title, cost)) }
+    let now = (try? String(contentsOf: c.target, encoding: .utf8)) ?? ""
+    let left = PatchMigration.audit(now) + PatchMigration.auditDependencies(of: c.target)
+    let marks = PatchMigration.allMarks(patch: c.target).count
+    print(left.isEmpty && marks == 0 ? "\(c.target.lastPathComponent) is a Pondside patch" : "\(marks) marks and \(left.count) findings left")
+    return outcome.failed ? 1 : 0
+}
+
 func mockup(_ args: Arguments) async throws -> Int32 {
     let source = try sourceURL(args)
     let lily = try await resolveLilyPond(for: source)
@@ -410,26 +542,51 @@ func mockup(_ args: Arguments) async throws -> Int32 {
     }
     let scratch = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: scratch) }
-    let base = scratch.appendingPathComponent(source.deletingPathExtension().lastPathComponent)
-    let compile = try await ProcessRunner.run(lily.executable, ["-dno-print-pages", "-o", base.path, source.path],
-                                              currentDirectory: source.deletingLastPathComponent().path)
-    let midi = ["midi", "mid"].map { base.appendingPathExtension($0) }.first { FileManager.default.fileExists(atPath: $0.path) }
-    guard let midi else {
-        printErr(compile.stderrString.split(separator: "\n").suffix(5).joined(separator: "\n"))
-        throw CLIError("no MIDI was written: add \\midi { } to the score you want rendered")
+    // One compile gives the MIDI and the timing of the same music: the
+    // score's own \midi, else the playback Pondside generates (PlaybackScore).
+    let playback = try await PlaybackScore.compile(lily, source: source, midi: scratch.appendingPathComponent("playback.midi"))
+    if let path = args.options["timing"] {
+        try Data(playback.timingText.utf8).write(to: URL(fileURLWithPath: path), options: .atomic)
     }
+    guard let midi = playback.midi else { throw CLIError("no MIDI was written: the score has no music to play") }
     let out = URL(fileURLWithPath: args.options["out"]
-        ?? source.deletingPathExtension().appendingPathExtension("wav").path)
+        ?? HandlerSync.Layout.mockup(score: source).path)
+    try FileManager.default.createDirectory(at: out.deletingLastPathComponent(), withIntermediateDirectories: true)
     let renderer = MockupRenderer(sampleRate: rate, soundFont: args.options["soundfont"].map { URL(fileURLWithPath: $0) } ?? config.soundFont)
     // The piece lasts until its `end` mark, which may be after the last note.
-    let end = (try? await TimingDump.run(lily, source: source)).flatMap { log in log.end.map { TempoMap(log).seconds(at: $0) } }
+    let end = playback.timing.end.map { TempoMap(playback.timing).seconds(at: $0) }
     func finish(_ file: URL, _ used: MockupRenderer.Renderer, _ info: WAVInfo) {
         var seconds = info.seconds
         if let end, (try? AudioFiles.padWAV(file, toSeconds: end)) == true { seconds = end }
         print("\(file.path): \(String(format: "%.1f", seconds)) s at \(info.sampleRate) Hz via \(used.rawValue), peak \(String(format: "%.1f", 20 * log10(info.peak))) dBFS")
     }
+    // The cue times of this very render beside it (piece.wav, piece.cues),
+    // where the Pondside quark reads both, so they cannot disagree; written
+    // first, so a missing renderer still leaves the times.
+    let sheet = CueSheet(log: playback.timing, score: source.lastPathComponent, sampleRate: rate)
+    if !sheet.cues.isEmpty {
+        let cues = out.deletingPathExtension().appendingPathExtension("cues")
+        try Data(sheet.cuesText.utf8).write(to: cues, options: .atomic)
+        print("\(cues.path): \(sheet.cues.count) cues")
+    }
     let (used, info) = try await renderer.render(midi: midi, to: out, only: only)
     finish(out, used, info)
+    // Passages the MIDI can't play (improvisations), at their marks.
+    let partsDirs = MockupParts.folders(score: source, configured: config.parts)
+    if let hook = config.hook {
+        guard let sclang = SuperColliderToolchain.findSclang(configured: config.sclang?.path) else {
+            throw CLIError("[audio] hook needs SuperCollider (not found)")
+        }
+        try await MockupParts.runHook(sclang: sclang, hook: hook, wav: out, marks: sheet.marks, prefix: config.hookMarks,
+                                      partsDir: partsDirs[0])
+        print("\(out.lastPathComponent): \(hook.lastPathComponent) rendered the \(config.hookMarks) parts into it")
+    } else {
+        let parts = MockupParts.find(marks: sheet.marks, folders: partsDirs)
+        if !parts.isEmpty {
+            try MockupParts.mix(parts, into: out)
+            print("\(out.lastPathComponent): mixed in " + parts.map { "\($0.file.lastPathComponent) at \(String(format: "%.1f", $0.start)) s" }.joined(separator: ", "))
+        }
+    }
     // --stems: one file per staff, so a patch can mute the parts played live.
     if args.flags.contains("stems"), let data = try? Data(contentsOf: midi), let (_, tracks) = AudioFiles.midiTracks(data) {
         for i in tracks.indices.dropFirst() {
@@ -453,8 +610,8 @@ func mockup(_ args: Arguments) async throws -> Int32 {
     return 0
 }
 
-let completionCommands = ["render", "check", "cues", "timeline", "handlers", "mockup", "rpc", "lexicon", "links", "doctor", "watch", "mcp",
-                          "completion", "version", "help"]
+let completionCommands = ["render", "check", "cues", "timeline", "handlers", "mockup", "mix", "rpc", "lexicon", "links", "doctor", "watch", "mcp",
+                          "agents", "completion", "version", "help"]
 
 func completion(_ args: Arguments) throws -> Int32 {
     let commands = completionCommands.joined(separator: " ")
@@ -535,8 +692,8 @@ let command = argv.count > 1 ? argv[1] : "help"
 let rest = argv.dropFirst(2)
 
 do {
-    let args = try Arguments(rest, valued: ["format", "out", "on-change", "rate", "scd", "project", "renderer", "soundfont",
-                                            "to", "show", "file", "restore"])
+    let args = try Arguments(rest, valued: ["format", "out", "on-change", "rate", "scd", "project", "from", "agent", "renderer", "soundfont",
+                                            "to", "show", "file", "restore", "timing"])
     let status: Int32
     switch command {
     case "render": status = try await render(args)
@@ -551,6 +708,8 @@ do {
     case "history": status = try await historyCommand(args)
     case "completion": status = try completion(args)
     case "mockup": status = try await mockup(args)
+    case "mix": status = try await mix(args)
+    case "patch": status = try await patchCommand(args)
     case "rpc":
         guard let method = args.positional.first else { throw CLIError("rpc needs a method name") }
         let params = try args.positional.dropFirst().first.map { try JSONDecoder().decode(JSONValue.self, from: Data($0.utf8)) } ?? [:]
@@ -558,8 +717,21 @@ do {
         status = 0
     case "mcp":
         let project = URL(fileURLWithPath: args.options["project"] ?? FileManager.default.currentDirectoryPath)
-        await MCPServer(project: project).serveStdio()
+        // `--role graphics|patch`: the tools and files of one of the app's agents.
+        await MCPServer(project: project, role: args.options["role"].flatMap(MCPServer.Role.init(rawValue:))).serveStdio()
         status = 0
+    case "agents":
+        let dir = URL(fileURLWithPath: args.positional.first ?? FileManager.default.currentDirectoryPath)
+        var failed = false
+        for change in AgentSetup.ensure(in: dir) {
+            switch change.outcome {
+            case .created: print("\(change.file): created")
+            case .added: print("\(change.file): added the pondside server")
+            case .present: print("\(change.file): already has a pondside server")
+            case .skipped(let why): printErr("\(change.file): left alone (\(why))"); failed = true
+            }
+        }
+        status = failed ? 1 : 0
     case "version", "--version": print("pondside 0.1.0 (M1)"); status = 0
     case "help", "--help", "-h": print(usage); status = 0
     default:

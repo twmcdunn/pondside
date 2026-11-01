@@ -18,6 +18,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private let canvasScroll = NSScrollView()
     private let firstEngraving = EngravingPlaceholderView()
     private var settingsPanel: EngravingSettingsPanel?
+    var scoreSetupPanel: ScoreSetupPanel?
     private var player: AVAudioPlayer?
     private let editorPane = NSView()
     private let compilerOutput = CompilerOutputView(frame: .zero)
@@ -29,8 +30,48 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         return pane
     }()
     private var panes: PaneHost!
+    private lazy var agentLogView = AgentLogView()
+    /// The SuperCollider pane, once something has shown it.
+    private var scPane: SuperColliderPane?
     private var help: HelpOverlay!
     private var chord = ChordRecognizer()
+    /// The unattended agent finishing a patch migration, while it runs.
+    private var agentHandle: AgentRun.Handle?
+    private var agentNote: String?
+    private var agentProgress: AgentProgress?
+    private let requestPopover = AgentRequestPopover()
+    /// The agent conversation for requests from the lens, kept between them.
+    private var requestSession: AgentSession?
+    private var requestRunning = false
+    private var requestIdle: Task<Void, Never>?
+    /// The patch agent's conversation (DESIGN.md §8): its own process and
+    /// tools, so the score's agent stays lean. Its memory is the patch doc,
+    /// so losing this conversation loses little.
+    private var patchSession: AgentSession?
+    private var patchIdle: Task<Void, Never>?
+    /// Whether a legend page filled the view at the last scroll.
+    private var legendWasInView = false
+    /// After a request changed the score, the work badge and the pulsing dot
+    /// stay until an engraving that started after the agent's last write has
+    /// finished, so the user sees the change land, not the old pages.
+    private var agentRender: (written: Date, done: () -> Void)?
+    private var agentRenderTimeout: Task<Void, Never>?
+    /// The score's files as they were before the agent's last request, and
+    /// the files it actually changed, as it left them.
+    private var agentUndo: [URL: String]?
+    private var agentAfter: [URL: String] = [:]
+    /// The files the agent changed, so their external reloads don't add
+    /// their own undo step (the whole request is one ⌘Z).
+    private var agentChanged: Set<URL> = []
+    private var agentWritesInFlight: Set<URL> = []
+    /// The single undo action that puts the agent's change back; it follows
+    /// the active file so ⌘Z works from whichever file is showing.
+    private final class AgentUndoCookie: @unchecked Sendable {
+        weak var controller: DocumentWindowController?
+        init(_ controller: DocumentWindowController) { self.controller = controller }
+    }
+    private var agentUndoCookie: AgentUndoCookie?
+    private weak var agentUndoManager: UndoManager?
     private var keyMonitor: Any?
     private let statusBar = StatusBarView(frame: .zero)
 
@@ -86,7 +127,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         score.open()
         updateStatus()
         DispatchQueue.main.async { [weak self] in self?.offerToRestoreConvertedSettings() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.offerPatchMigration() }
+        _ = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))   // found in the background, for the lens
         if !window.setFrameUsingName(window.frameAutosaveName) { window.center() }
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillTerminate(_:)),
+                                               name: NSApplication.willTerminateNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(undoHistoryChanged(_:)),
                                                name: .NSUndoManagerDidUndoChange, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(undoHistoryChanged(_:)),
@@ -109,6 +154,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         canvasScroll.backgroundColor = Theme.background
         canvasScroll.allowsMagnification = false
         canvasScroll.contentView.postsBoundsChangedNotifications = true
+        // Scrolling a legend page into view offers ␣ f a in the hints.
+        NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: canvasScroll.contentView,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let now = self.canvas.legendInView
+                if now != self.legendWasInView { self.legendWasInView = now; self.updateHints() }
+            }
+        }
         // The empty pane's "engraving" animation floats over the clip view.
         canvasScroll.addSubview(firstEngraving)
 
@@ -141,15 +195,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             editor.bottomAnchor.constraint(equalTo: editorPane.bottomAnchor),
         ])
 
+        // The overlay first: panes built now register their controls with it.
+        help = HelpOverlay(window: window!)
         // Panes are frames, content is cargo (DESIGN.md, M3).
         panes = PaneHost(layout: Self.savedLayout()) { [unowned self] content in self.makeContent(content) }
         let split = panes.split
         split.translatesAutoresizingMaskIntoConstraints = false
-        help = HelpOverlay(window: window!)
         help.register(fileMenu, "go.file")
         help.register(statusBar, "help.context")
 
         statusBar.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.onStopAgent = { [weak self] in self?.stopAgent() }
         content.addSubview(split)
         content.addSubview(statusBar)
 
@@ -172,6 +228,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private func wire() {
         canvas.delegate = self
         canvas.onZoomChange = { [weak self] _ in self?.updateStatus() }
+        canvas.legendValues = { [weak self] in
+            let fm = FrontMatter(self?.frontMatterFile?.text ?? "")
+            return (fm.legendLayout ?? .init(), fm.legendItems.map(\.example))
+        }
+        canvas.onLegendStatus = { [weak self] in self?.statusBar.flash($0) }
+        canvas.onLegendCommit = { [weak self] in self?.commitLegend($0) }
         // Show where keys go: a focus ring on the score (the one place glow
         // is allowed) and a word in the status line.
         canvasScroll.wantsLayer = true
@@ -215,6 +277,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         lastPageAnchor = nil
         activeFile = file
         editor.show(file.url, text: file.text, undoManager: file.undoManager)
+        moveAgentUndo(to: file.undoManager)
         rebuildFileMenu()
         rebuildEngravingMap()
         showDiagnostics()
@@ -270,8 +333,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             lensLog.debug("no lens for selection \(selection.lowerBound)..<\(selection.upperBound)")
             if closesOnRender {
                 if !lensWasExplicit { closeLens() }
+            } else if let r = ScoreGraphic.commandRange(at: selectionUTF8().lowerBound, in: editor.text),
+                      String(decoding: Array(editor.text.utf8)[r], as: UTF8.self).hasPrefix("\\start") {
+                // a graphic (its start command is the selection): its lens is the request line
+                showRequest(fromLens: false)
             } else {
-                statusBar.flash("Put the caret in a note to open the Notation Lens")
+                statusBar.flash("Put the caret in a note or a graphic to open the Notation Lens")
             }
             return
         }
@@ -712,6 +779,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             // Never fail silently: say which music can't be clicked, and why.
             note = "\(f.displayName) has notes but no point-and-click links"
         }
+        statusBar.setActivities(score.activities + (agentNote.map { [$0] } ?? []))
+        statusBar.setAgentWorking(agentWorking)
         statusBar.set(status: score.status, detail: firstErrorText(), zoom: canvas.zoom, toolchain: lily, note: note,
                       stale: score.showingCachedRender)
         firstEngraving.setActive(canvas.pages.isEmpty && score.status == .compiling)
@@ -736,6 +805,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             hints.insert("Keys type text here: click the score (or ⌘J) for note keys", at: 0)
         }
         if case .errors = score.status { hints.insert("Errors are underlined in the source", at: 0) }
+        // The legend on screen, or its file in the source: how to arrange it.
+        if canvas.legendArranging {
+            hints = ["Drag edges, gaps and examples · ⌥ all examples · ⌘ no snapping", "⎋ done arranging"]
+        } else if canvas.legendInView || activeFile.url.lastPathComponent == FrontMatter.fileName {
+            hints.insert("␣ f a arrange legend", at: 0)
+        }
         statusBar.setHints(Array(hints.prefix(3)) + ["⌘/ all actions"])
     }
 
@@ -793,8 +868,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: NSWindowDelegate
 
+    /// Agents started for this window don't outlive Pondside.
+    @objc private func appWillTerminate(_ notification: Notification) {
+        agentHandle?.stop()
+        requestSession?.close()
+        patchSession?.close()
+    }
+
     func windowWillClose(_ notification: Notification) {
+        agentHandle?.stop()
+        requestIdle?.cancel()
+        requestSession?.close()
+        patchIdle?.cancel()
+        patchSession?.close()
         closeLens()
+        flushSuperCollider()
         NotificationCenter.default.removeObserver(self)
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
@@ -852,6 +940,11 @@ extension DocumentWindowController: ScoreCanvasDelegate {
         var range: Range<Int>
         if let n = tree.noteIndex(startingAt: offset), let e = tree.notes[n].event, tree.events[e].kind == .chord {
             range = tree.notes[n].spelledRange
+        } else if let command = ScoreGraphic.commandRange(at: offset, in: editor.text) {
+            // A graphic links to the command that starts it (`\startGrains`,
+            // `\startGraphic`): selecting that word is the graphic's cursor.
+            range = command
+            statusBar.flash("⌘L: describe a change to this graphic")
         } else if let e = tree.eventIndex(at: offset) {
             range = tree.events[e].range
         } else {
@@ -890,14 +983,23 @@ extension DocumentWindowController: ScoreCanvasDelegate {
     }
 
     func canvas(_ canvas: ScoreCanvasView, handleKey event: NSEvent) -> Bool {
-        handleScoreKey(event)
+        if canvas.legendArranging, event.keyCode == 53 {      // ⎋ ends arranging
+            arrangeLegend(false)
+            return true
+        }
+        return handleScoreKey(event)
     }
 
 }
 
 extension DocumentWindowController: ScoreDocumentDelegate {
     func document(_ document: ScoreDocument, didReloadFromDisk file: SourceFile) {
-        editor.mergeExternal(file.text, into: file.url)
+        // An agent's write is part of its one request, undone with ⌘Z as a
+        // whole; adopting it must not add a second step to this file.
+        let fromAgent = requestRunning || agentChanged.contains(file.url)
+        editor.mergeExternal(file.text, into: file.url, registeringUndo: !fromAgent)
+        if requestRunning { agentWritesInFlight.insert(file.url) }
+        agentChanged.remove(file.url)
         AppRPC.shared.publish("score.changed", ["path": .string(file.url.path), "by": "disk"])
         rebuildEngravingMap()
         refreshHighlight(reveal: false)
@@ -924,6 +1026,8 @@ extension DocumentWindowController: ScoreDocumentDelegate {
 
     func documentStatusDidChange(_ document: ScoreDocument) {
         updateStatus()
+        // A compile that produced no pages never reaches documentDidEngrave.
+        if case .failed = document.status { checkAgentRender() }
     }
 
     func documentFilesDidChange(_ document: ScoreDocument) {
@@ -932,6 +1036,10 @@ extension DocumentWindowController: ScoreDocumentDelegate {
         } else {
             rebuildFileMenu()
         }
+    }
+
+    func documentDidUpdatePlayback(_ document: ScoreDocument) {
+        cueInspector.show(score.cueSheet, scoreFolder: score.url.deletingLastPathComponent())
     }
 
     func documentDidLoadCachedRender(_ document: ScoreDocument) {
@@ -953,8 +1061,10 @@ extension DocumentWindowController: ScoreDocumentDelegate {
         refreshHighlight(reveal: false)
         showDiagnostics()
         updateStatus()
+        checkAgentRender()
         closeLensIfRendered()
         refreshEngravingSettings()
+        refreshScoreSetup()
     }
 }
 
@@ -976,11 +1086,12 @@ extension DocumentWindowController: CommandResponder {
 
     var commandContext: CommandContext {
         let responder = window?.firstResponder
-        let focus: CommandContext.Focus = responder === canvas ? .score : responder === editor.textView ? .source : .other
+        let focus: CommandContext.Focus = responder === canvas ? .score : responder === editor.textView ? .source
+            : scPane.map { responder === $0.editor } == true ? .supercollider : .other
         var errors = false
         if case .errors = score.status { errors = true }
         return CommandContext(focus: focus, hasSelection: hasSelection, durationArmed: noteInput.armedDuration != nil,
-                              hasErrors: errors, fileCount: score.files.count)
+                              hasErrors: errors, fileCount: score.files.count, agentWorking: agentWorking)
     }
 
     /// Runs a catalog command. Menus, chords and the palette all end here.
@@ -998,6 +1109,7 @@ extension DocumentWindowController: CommandResponder {
         switch id.rawValue {
         case "file.exportPDF": exportPDF(nil)
         case "file.reveal": revealInFinder(nil)
+        case "file.migratePatch": offerPatchMigration(asked: true)
         case "file.close": window?.performClose(nil)
 
         case "go.file": showFilePicker()
@@ -1051,14 +1163,18 @@ extension DocumentWindowController: CommandResponder {
             updateInputStatus()
 
         case "file.engravingSettings": showEngravingSettings()
+        case "file.scoreSetup": showScoreSetup()
+        case "file.arrangeLegend": arrangeLegend(!canvas.legendArranging)
         case "file.lilypond": showLilyPondPicker()
         case "view.play": togglePlayback()
+        case "view.playMix": togglePlayback(electronics: true)
         case "view.lens": showLens(closesOnRender: false)
         case "view.zoomIn": zoomIn(nil)
         case "view.zoomOut": zoomOut(nil)
         case "view.actualSize": actualSize(nil)
         case "view.fitWidth": zoomToFitWidth(nil)
         case "view.fullScreen": window?.toggleFullScreen(nil)
+        case "view.agentLog": toggleAgentLog()
 
         case "pane.focusNext":
             syncFocusedPane()
@@ -1069,6 +1185,31 @@ extension DocumentWindowController: CommandResponder {
         case "pane.cyclePrevious": cyclePane(forward: false)
         case "workspace.save": saveWorkspace()
         case "workspace.open": showWorkspacePicker()
+
+        case "sc.evaluate": scPane?.evaluate(line: false)
+        case "sc.evaluateLine": scPane?.evaluate(line: true)
+        case "sc.help": scPane?.lookUpHelp()
+        case "sc.complete": scPane?.editor.complete(nil)
+        case "sc.stop":
+            SCLangHost.shared.stopSound()
+            statusBar.flash("Stopped all sound (CmdPeriod)")
+        case "sc.boot":
+            ensureSuperCollider()
+            SCLangHost.shared.toggleServer()
+        case "sc.openFile": showSuperColliderFilePicker()
+        case "edit.undoAgent": undoAgentChange()
+        case "edit.stopAgent": stopAgent()
+        case "edit.newAgentConversation": newAgentConversation()
+        case "edit.patchRequest": showPatchRequest(fromLens: false)
+        case "edit.newPatchConversation": newPatchConversation()
+        case "sc.openInIDE": openInSuperColliderIDE()
+        case "sc.clearPost": SCLangHost.shared.clearLog()
+        case "sc.recompile":
+            ensureSuperCollider()
+            SCLangHost.shared.recompile()
+        case "sc.restart":
+            ensureSuperCollider()
+            SCLangHost.shared.restart()
 
         case "help.palette": showCommandPalette(onlyAvailable: false, placeholder: "Type a command — two letters are usually enough")
         case "help.context": showCommandPalette(onlyAvailable: true, placeholder: "What can I do here?")
@@ -1093,6 +1234,8 @@ extension DocumentWindowController: CommandResponder {
         case .errors: return "No errors: the score compiles cleanly"
         case .severalFiles: return "This score is a single file"
         case .scoreFocus: return "\(spec.title) works in the score: ⌘J to focus it"
+        case .supercollider: return "\(spec.title) works in the SuperCollider pane: ␣ p c shows it"
+        case .agentWorking: return "No agent is working"
         case .always: return spec.title
         }
     }
@@ -1119,6 +1262,12 @@ extension DocumentWindowController: CommandResponder {
         help.optionChanged(isDown: false)
         if event.keyCode == 53, lens?.isOpen == true {
             closeLens()
+            return true
+        }
+        // ⇥ in the lens: the request line for this passage.
+        if event.keyCode == 48, lens?.isOpen == true, flags.subtracting([.numericPad, .function]).isEmpty {
+            closeLens()
+            showRequest(fromLens: true)
             return true
         }
         // Plain ←→ step through the lens's voice; with modifiers they keep
@@ -1272,11 +1421,79 @@ extension DocumentWindowController: CommandResponder {
         let text = editor.text
         let r = selectionUTF8()
         let start = SourceText(text).position(of: text.utf8.index(text.utf8.startIndex, offsetBy: min(r.lowerBound, text.utf8.count)))
-        var context = ScoreContext.describe(text: text, file: activeFile.url.path, line: start.line, character: start.character)
+        let files = score.files.map { (path: $0.url.path, text: $0 === activeFile ? text : $0.text) }
+        var context = ScoreContext.describe(text: text, file: activeFile.url.path, line: start.line, character: start.character,
+                                            files: files, cues: score.cueSheet)
         guard case var .object(o) = context else { return context }
+        if let part = canvas.graphicPartSelection, o["graphic"] != nil {
+            let scale = part.space > 0 ? part.space : 1
+            let width = max(part.piece.width, 0.001)
+            func y(_ pageY: Double) -> Double { (part.staffMiddle - pageY) / scale }
+            var selection: [String: JSONValue] = [
+                "kind": .string("graphic-part"),
+                "page": .number(Double(part.page)),
+                // Fractions of the broken piece's width, so they do not depend on the
+                // system's page offset. The drawing code's x runs from (car (g-span grob)).
+                "x": .array([.number((part.part.minX - part.piece.minX) / width),
+                             .number((part.part.maxX - part.piece.minX) / width)]),
+                // Staff spaces above the middle line, as the drawing code's y.
+                "y": .array([.number(y(part.part.maxY)), .number(y(part.part.minY))]),
+                // The clicked system's piece, so the same x on another system is not changed too.
+                "spanner_x": .array([.number(part.piece.minX), .number(part.piece.maxX)]),
+                "units": .string("x is a fraction of the piece's width (from (car (g-span grob)) to its right edge); y is in staff spaces above the middle line; spanner_x is that piece's page x"),
+            ]
+            // The exact test for "inside the highlight", ready to paste into the
+            // drawing loop: the agent changes this and no wider.
+            let f0 = (part.part.minX - part.piece.minX) / width, f1 = (part.part.maxX - part.piece.minX) / width
+            let y0 = y(part.part.maxY), y1 = y(part.part.minY)
+            func r(_ v: Double) -> String { String(format: "%.3f", v) }
+            selection["scope"] = .string("(let ((f (/ (- x x0) (- x1 x0)))) (and (>= f \(r(f0))) (<= f \(r(f1))) (>= y \(r(y0))) (<= y \(r(y1)))))"
+                + "   ; x0 x1 = (car/cdr (g-span grob)); only on the piece at page x \(r(part.piece.minX))–\(r(part.piece.maxX))")
+            if let musical = clickedMusicalContext(for: part) {
+                for (key, value) in musical { selection[key] = value }
+            }
+            o["selection"] = .object(selection)
+        }
         if let system = systemOfSelection(text: text) { o["system"] = system }
         context = .object(o)
         return context
+    }
+
+    /// The bar/moment nearest the click and, when the system's other
+    /// linked glyphs bracket it, the musical range of the clicked part
+    /// (the graphic itself only links to the spanner's start).
+    private func clickedMusicalContext(for part: ScoreCanvasView.GraphicPartSelection) -> [String: JSONValue]? {
+        struct Hit { var x: Double; var bar: Int; var moment: String; var event: String? }
+        var hits: [Hit] = []
+        for anchor in part.anchors {
+            guard let file = score.file(for: anchor.link.path), let engraved = file.engravedText else { continue }
+            let text = file.text
+            let map = EngravingMap(engraved: engraved, current: text)
+            guard let engravedOffset = map.engravedOffset(of: anchor.link.position) else { continue }
+            let source = SourceText(text)
+            let p = source.position(of: source.index(utf16Offset: map.currentOffset(forEngraved: engravedOffset)))
+            let files = score.files.map { (path: $0.url.path, text: $0 === file ? text : $0.text) }
+            let context = ScoreContext.describe(text: text, file: file.url.path, line: p.line, character: p.character,
+                                                files: files, cues: score.cueSheet)
+            guard let bar = context["bar"]?.int, let moment = context["moment"]?.string else { continue }
+            hits.append(Hit(x: anchor.x, bar: bar, moment: moment, event: context["event"]?["text"]?.string))
+        }
+        guard !hits.isEmpty else { return nil }
+        func json(_ hit: Hit) -> JSONValue {
+            var out: [String: JSONValue] = ["bar": .number(Double(hit.bar)), "moment": .string(hit.moment)]
+            if let event = hit.event { out["event"] = .string(event) }
+            return .object(out)
+        }
+        let target = part.part.midX
+        let nearest = hits.min { abs($0.x - target) < abs($1.x - target) }!
+        var out: [String: JSONValue] = ["at": json(nearest)]
+        let left = hits.filter { $0.x <= part.part.minX }.max { $0.x < $1.x }
+        let right = hits.filter { $0.x >= part.part.maxX }.min { $0.x < $1.x }
+        if let left, let right, left.bar != right.bar || left.moment != right.moment {
+            // The music on either side: wider than the highlight, for "from here", never for scoping.
+            out["music_around"] = .object(["from": json(left), "to": json(right)])
+        }
+        return out
     }
 
     private func systemOfSelection(text: String) -> JSONValue? {
@@ -1305,7 +1522,7 @@ extension DocumentWindowController: CommandResponder {
         Task {
             let installs = await ToolchainStore.shared.installs()
             guard !installs.isEmpty else {
-                self.statusBar.flash("No LilyPond found — brew install lilypond")
+                self.statusBar.flash("No LilyPond found — run the Pondside installer, or brew install lilypond")
                 return
             }
             let current = self.score.installation
@@ -1332,26 +1549,39 @@ extension DocumentWindowController: CommandResponder {
 
     // MARK: Audition
 
-    /// The mockup `pondside mockup` wrote: beside the score, or in the
-    /// project's SuperCollider resources folder.
+    /// The mockup, `renders/<name>.wav` (⌘⇧P plays it).
     private var mockupURL: URL? {
-        let name = score.url.deletingPathExtension().lastPathComponent + ".wav"
-        var places = [score.url.deletingLastPathComponent().appendingPathComponent(name)]
-        if let res = (try? ProjectConfig.find(from: score.url))?.resources {
-            places += [res.appendingPathComponent(name), res.appendingPathComponent("piece.wav")]
-        }
-        return places.first { FileManager.default.fileExists(atPath: $0.path) }
+        let url = HandlerSync.Layout.mockup(score: score.url)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    private func togglePlayback() {
+    /// The score with its electronics (`pondside mix`), after each mockup.
+    private var mixURL: URL? {
+        let url = PatchRender.output(for: score.url)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    /// Plays the mockup, or with `electronics` the mix, from the selection's
+    /// bar; either command stops whatever is playing.
+    private func togglePlayback(electronics: Bool = false) {
         if let player, player.isPlaying {
             player.stop()
             self.player = nil
             statusBar.flash("Stopped")
             return
         }
-        guard let url = mockupURL else {
-            statusBar.flash("No mockup yet: run pondside mockup \(score.url.lastPathComponent) in the terminal pane")
+        let found = electronics ? mixURL : mockupURL
+        guard let url = found else {
+            if !electronics {
+                statusBar.flash("No mockup yet: it renders after each engraving (MuseScore or fluidsynth needed)")
+            } else if score.patchURL == nil {
+                let scd = PatchMigration.patchURL(score: score.url)
+                statusBar.flash(FileManager.default.fileExists(atPath: scd.path)
+                    ? "\(scd.lastPathComponent) isn't a Pondside patch: move it aside and open the SuperCollider pane to start one"
+                    : "No patch yet: open the SuperCollider pane to start \(scd.lastPathComponent)")
+            } else {
+                statusBar.flash("No mix yet" + (score.mixProblem.map { ": \($0)" } ?? ": it renders after each mockup (SuperCollider needed)"))
+            }
             NSSound.beep()
             return
         }
@@ -1367,7 +1597,7 @@ extension DocumentWindowController: CommandResponder {
             p.currentTime = min(start, max(0, p.duration - 0.1))
             p.play()
             player = p
-            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", start)) s — ⌘⇧P stops")
+            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", start)) s — \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
         } catch {
             statusBar.flash("Can't play \(url.lastPathComponent): \(error.localizedDescription)")
         }
@@ -1475,6 +1705,647 @@ extension DocumentWindowController: CommandResponder {
             self.applyText(self.settingsDocument.edits(for: settings), to: self.score.root, name: "Restore Defaults")
             self.statusBar.flash("Restored LilyPond's defaults")
         }
+    }
+
+    /// A SuperCollider patch beside the score that doesn't follow Pondside's
+    /// layout (PatchMigration): offered once per version of the file, or
+    /// whenever the command asks. Pondside does what it can, then the
+    /// chosen agent (Settings, ⌘,) finishes the marked lines unattended; without
+    /// one, the dialog says how to finish them in the terminal.
+    private func offerPatchMigration(asked: Bool = false) {
+        if let run = agentHandle {
+            if asked { confirmStopAgent(run) }
+            return
+        }
+        let scoreURL = score.url
+        let configured = (try? ProjectConfig.find(from: scoreURL))?.handlers
+        let preference = UserDefaults.standard.string(forKey: Self.agentKey)
+        let model = Self.opencodeModel
+        Task { [weak self] in
+            let (found, agent) = await Task.detached {
+                (PatchMigration.candidate(score: scoreURL, configured: configured), AgentRun.choose(preference: preference, model: model))
+            }.value
+            guard let self, let window = self.window else { return }
+            guard let c = found else {
+                if asked { self.statusBar.flash("The SuperCollider patch is ready for Pondside") }
+                return
+            }
+            let text = (try? String(contentsOf: c.source, encoding: .utf8)) ?? ""
+            let key = "Pondside.patchMigrationDeclined"
+            var declined = UserDefaults.standard.dictionary(forKey: key) as? [String: Int] ?? [:]
+            let version = text.utf8.reduce(5381) { ($0 &* 33) &+ Int($1) }
+            guard asked || declined[c.source.path] != version else { return }
+
+            let auto = c.findings.filter(\.automatic), manual = c.findings.filter { !$0.automatic }
+            let useAgent = manual.isEmpty ? nil : agent
+            func list(_ fs: [PatchMigration.Finding]) -> String {
+                fs.prefix(6).map { "• " + ($0.line.map { "line \($0): " } ?? "") + $0.message }.joined(separator: "\n")
+                    + (fs.count > 6 ? "\n• … and \(fs.count - 6) more" : "")
+            }
+            let alert = NSAlert()
+            alert.messageText = "\(c.source.lastPathComponent) isn't fully a Pondside patch"
+            var info = ""
+            if !auto.isEmpty { info += "Pondside does this itself:\n" + list(auto) + "\n\n" }
+            if !manual.isEmpty {
+                info += "Needs an agent (each line gets a // pondside: comment):\n" + list(manual) + "\n\n"
+                if let a = useAgent {
+                    info += "\(a.harness.title) then fixes them in the background, unattended: a few minutes, on your "
+                        + "\(a.harness.title) plan or credits. "
+                        + (a.harness == .claude ? "It may only read and edit files in this folder and use Pondside's tools. "
+                           : "opencode auto-approves its file edits (it can't be limited to this folder); Pondside turns off its shell. ")
+                        + "Choose the agent in Settings (⌘,).\n\n"
+                } else {
+                    info += "No agent is set up (Settings, ⌘,), so finish them in the terminal (⌃4): run claude, then type "
+                        + "\(Self.agentCommand). Refactor copies that command.\n\n"
+                }
+            }
+            info += c.source == c.target ? "The original is kept as \(c.target.deletingPathExtension().lastPathComponent).before-pondside.scd."
+                : "The patch goes in \(c.target.lastPathComponent); \(c.source.lastPathComponent) stays as it is."
+            alert.informativeText = info
+            if let a = useAgent {
+                alert.addButton(withTitle: "Refactor with \(a.harness.title)")
+                alert.addButton(withTitle: "Refactor Only")
+            } else {
+                alert.addButton(withTitle: "Refactor")
+            }
+            alert.addButton(withTitle: "Not Now")
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard let self else { return }
+                let withAgent = useAgent != nil && response == .alertFirstButtonReturn
+                let refactor = response == .alertFirstButtonReturn || (useAgent != nil && response == .alertSecondButtonReturn)
+                guard refactor else {
+                    declined[c.source.path] = version
+                    UserDefaults.standard.set(declined, forKey: key)
+                    return
+                }
+                let before = try? String(contentsOf: c.target, encoding: .utf8)
+                let log = AgentLog.Run(kind: .refactor)
+                log.log("start", "Refactor \(c.source.lastPathComponent) → \(c.target.lastPathComponent)"
+                            + (withAgent ? " with \(useAgent?.harness.title ?? "the agent")" : ", Pondside's part only"),
+                        detail: "score \(scoreURL.path)\nsource \(c.source.path)\ntarget \(c.target.path)\n\nautomatic:\n"
+                            + auto.map { "line \($0.line.map(String.init) ?? "-"): \($0.message)" }.joined(separator: "\n")
+                            + "\n\nfor the agent:\n" + manual.map { "line \($0.line.map(String.init) ?? "-"): \($0.message)" }.joined(separator: "\n"))
+                do {
+                    let (result, _, _) = try PatchMigration.write(score: scoreURL, source: c.source, target: c.target, sheet: self.score.cueSheet)
+                    log.log("migrate", "Pondside wrote \(c.target.lastPathComponent): \(result.manual.count) lines marked for an agent")
+                    self.score.renderMix()
+                    self.scPane?.open(c.target)   // the patch now lives in patch/
+                    if result.manual.isEmpty {
+                        self.statusBar.flash("\(c.target.lastPathComponent) is a Pondside patch")
+                    } else if withAgent, let a = useAgent {
+                        self.runAgent(a, score: scoreURL, patch: c.target, before: before, log: log)
+                    } else {
+                        log.log("outcome", "\(result.manual.count) marked lines left; the agent command was copied")
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(Self.agentCommand, forType: .string)
+                        self.statusBar.flash("\(c.target.lastPathComponent): \(result.manual.count) lines for an agent; \(Self.agentCommand) copied")
+                    }
+                } catch {
+                    log.log("outcome", "Couldn't write \(c.target.lastPathComponent): \(error.localizedDescription)", level: .error)
+                    self.statusBar.flash("Couldn't write \(c.target.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    static let agentKey = "Pondside.patchAgent"
+    /// opencode's model (`provider/model`), chosen in Settings; absent: opencode's default.
+    static let opencodeModelKey = "Pondside.opencodeModel"
+    static var opencodeModel: String? { UserDefaults.standard.string(forKey: opencodeModelKey) }
+    static let agentCommand = "/mcp__pondside__sc-patch-migration"
+
+    private func runAgent(_ agent: AgentRun, score scoreURL: URL, patch: URL, before: String?, log: AgentLog.Run) {
+        guard let pondside = Bundle.main.resourceURL?.appendingPathComponent("pondside").path,
+              FileManager.default.isExecutableFile(atPath: pondside) else {
+            log.log("refused", "The bundled pondside CLI is missing", level: .error)
+            statusBar.flash("Pondside's command-line tool is missing from the app bundle")
+            return
+        }
+        let handle = AgentRun.Handle()
+        agentHandle = handle
+        // n/total marked lines fixed (read from the patch), then what the
+        // agent is doing (from its event stream).
+        let total = PatchMigration.allMarks(patch: patch).count
+        agentProgress = AgentProgress(label: "\(agent.harness.title) fixing \(patch.lastPathComponent)", total: total)
+        showAgentProgress()
+        let poll = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(1))
+                guard let self, self.agentHandle === handle else { return }
+                let left = PatchMigration.allMarks(patch: patch).count
+                if let was = self.agentProgress?.fixed, max(0, total - left) != was {
+                    log.log("progress", "\(max(0, total - left))/\(total) marked lines fixed")
+                }
+                self.agentProgress?.fixed = max(0, total - left)
+                self.showAgentProgress()
+            }
+        }
+        let started = Date()
+        Task { [weak self] in
+            let outcome: AgentRun.Outcome
+            let prompt = AgentRun.migrationPrompt(score: scoreURL, patch: patch)
+            log.log("prompt", "Migration prompt, \(prompt.count) characters, \(total) marked lines", detail: prompt, limit: AgentLog.promptLimit)
+            do {
+                outcome = try await agent.run(prompt: prompt, folder: scoreURL.deletingLastPathComponent(), pondside: pondside,
+                                              handle: handle, log: log) { words in
+                    Task { @MainActor in
+                        guard let self, self.agentHandle === handle else { return }
+                        self.agentProgress?.doing = words
+                        self.showAgentProgress()
+                    }
+                }
+            } catch {
+                outcome = AgentRun.Outcome(summary: error.localizedDescription, failed: true, costUSD: nil)
+            }
+            poll.cancel()
+            let left = PatchMigration.allMarks(patch: patch).count
+            log.log("outcome", (outcome.failed ? "Failed: " : "") + (outcome.summary.split(separator: "\n").first.map(String.init) ?? "(no reply)")
+                        + " · \(left) marked lines left" + String(format: " · %.0f s", log.elapsed)
+                        + (outcome.costUSD.map { String(format: " · $%.3f", $0) } ?? ""),
+                    level: outcome.failed ? .error : left > 0 ? .warning : .info, detail: outcome.summary)
+            guard let self else { return }
+            self.agentHandle = nil
+            self.agentProgress = nil
+            self.agentNote = nil
+            self.updateStatus()
+            self.score.renderMix()
+            self.showAgentResult(agent, outcome, patch: patch, before: before, minutes: Date().timeIntervalSince(started) / 60)
+        }
+    }
+
+    struct AgentProgress {
+        var label: String
+        var total: Int
+        var fixed = 0
+        var doing = "starting"
+    }
+
+    /// "Claude Code fixing score.scd: 3/7 · editing...", in the status bar;
+    /// without a count for a request ("Claude Code: “taller” · editing...").
+    private func showAgentProgress() {
+        guard let p = agentProgress else { return }
+        let note = p.total > 0 ? "\(p.label): \(p.fixed)/\(p.total) · \(p.doing)..." : "\(p.label) · \(p.doing)..."
+        guard note != agentNote else { return }
+        agentNote = note
+        updateStatus()
+    }
+
+    private func showAgentResult(_ agent: AgentRun, _ outcome: AgentRun.Outcome, patch: URL, before: String?, minutes: Double) {
+        let marks = PatchMigration.allMarks(patch: patch).count
+        let alert = NSAlert()
+        alert.messageText = outcome.failed ? "\(agent.harness.title) didn't finish \(patch.lastPathComponent)"
+            : marks == 0 ? "\(patch.lastPathComponent) is a Pondside patch" : "\(agent.harness.title) left \(marks) marked lines"
+        var info = String(outcome.summary.prefix(1500))
+        info += "\n\n" + String(format: "%.0f min", max(1, minutes.rounded()))
+        if let cost = outcome.costUSD { info += String(format: " · $%.2f", cost) }
+        if marks > 0 { info += " · the rest: \(Self.agentCommand) in the terminal (⌃4)" }
+        info += ". The mix is rendering; ⌘⌥P plays it."
+        alert.informativeText = info
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Undo Refactor")
+        guard let window else { return }
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .alertSecondButtonReturn else { return }
+            do {
+                if let before { try Data(before.utf8).write(to: patch, options: .atomic) }
+                else { try FileManager.default.removeItem(at: patch) }
+                self.score.renderMix()
+                self.statusBar.flash("\(patch.lastPathComponent) is back as it was")
+            } catch {
+                self.statusBar.flash("Couldn't restore \(patch.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func confirmStopAgent(_ handle: AgentRun.Handle) {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Stop the agent?"
+        alert.informativeText = "It is still finishing the patch. What it has changed so far stays; Undo Refactor in the next dialog restores the patch."
+        alert.addButton(withTitle: "Stop")
+        alert.addButton(withTitle: "Keep Going")
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn { handle.stop() }
+        }
+    }
+
+    // MARK: Requests
+
+    /// The request line for the selection: a graphic's own lens, or the
+    /// notation lens's other side (⇥ from the lens, ⇥ back).
+    private func showRequest(fromLens: Bool) {
+        guard let anchor = lensAnchor() else { return }
+        // Shown at once: the title is the selected command word, the agent the
+        // one found in the background; the full context is built on ↩.
+        let text = editor.text
+        let sel = selectionUTF8()
+        let word = sel.upperBound <= text.utf8.count
+            ? String(decoding: Array(text.utf8)[sel.lowerBound..<min(sel.upperBound, sel.lowerBound + 40)], as: UTF8.self) : ""
+        let title = word.hasPrefix("\\") ? word : "the selection"
+        let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
+        // ⇥ goes on to the patch agent when the score has a patch, then back to the lens.
+        let hasPatch = score.patchURL != nil
+        requestPopover.tabLabel = hasPatch ? "patch" : "lens"
+        requestPopover.onTab = hasPatch ? { [weak self] in self?.showPatchRequest(fromLens: fromLens) }
+            : fromLens ? { [weak self] in self?.showLens(closesOnRender: false) } : nil
+        requestPopover.placeholder = nil
+        requestPopover.mode = .graphics
+        requestPopover.onSwitch = hasPatch ? { [weak self] _ in self?.showPatchRequest(fromLens: fromLens) } : nil
+        requestPopover.onSubmit = { [weak self] request in
+            guard let self else { return }
+            guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
+                self.statusBar.flash("No agent: choose one in Settings (⌘,)")
+                return
+            }
+            self.runRequest(request, agent: agent, context: self.rpcContext)
+        }
+        let turns = requestSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
+        let who = agent.map { $0.harness.title + (turns > 0 ? " (continuing, ␣ e n new)" : "") } ?? "the agent"
+        requestPopover.present(title: title, agent: who, anchor: anchor.rect, in: anchor.view)
+    }
+
+    /// The request line for the patch agent: a change to the SuperCollider
+    /// patch at the selection's point in the score (its cue).
+    private func showPatchRequest(fromLens: Bool) {
+        guard let anchor = lensAnchor() else { return }
+        guard let patch = score.patchURL else {
+            statusBar.flash("This score has no Pondside patch: File › Make Patch Pondside-Ready… (␣ f m)")
+            return
+        }
+        let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
+        let context = rpcPatchContext(cue: nil)
+        let cue = context["cue"]?["name"]?.string
+        let title = cue.map { "cue \($0) in \(patch.lastPathComponent)" } ?? patch.lastPathComponent
+        requestPopover.tabLabel = "lens"
+        requestPopover.onTab = { [weak self] in self?.showLens(closesOnRender: false) }
+        requestPopover.mode = .patch
+        requestPopover.onSwitch = { [weak self] _ in self?.showRequest(fromLens: fromLens) }
+        requestPopover.placeholder = "Describe the electronics here… e.g. more reverb, a grain cloud on this chord"
+        requestPopover.onSubmit = { [weak self] request in
+            guard let self else { return }
+            guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
+                self.statusBar.flash("No agent: choose one in Settings (⌘,)")
+                return
+            }
+            self.runPatchRequest(request, agent: agent, patch: patch, context: self.rpcPatchContext(cue: nil))
+        }
+        let turns = patchSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
+        let who = agent.map { "patch agent (\($0.harness.title)" + (turns > 0 ? ", continuing, ␣ e N new" : "") + ")" } ?? "the patch agent"
+        requestPopover.present(title: title, agent: who, anchor: anchor.rect, in: anchor.view)
+    }
+
+    /// `patch_context` at the selection (DESIGN.md §8): the cue there, its
+    /// handler, what it touches, the collections, the patch doc.
+    func rpcPatchContext(cue: String?) -> JSONValue {
+        guard let patch = score.patchURL else { return ["error": "no Pondside patch"] }
+        let here = rpcContext
+        // The clicked part of a large drawing has its own time; else the event's.
+        let moment = (here["selection"]?["at"]?["moment"] ?? here["moment"])?.string.flatMap(Rational.init(parsing:))
+        let bar = here["selection"]?["at"]?["bar"]?.int ?? here["bar"]?.int
+        let seconds = moment.flatMap { m in score.timingLog.map { TempoMap($0).seconds(at: m) } }
+        let point = PatchContext.Point(bar: bar, moment: moment, cue: cue, seconds: seconds)
+        return PatchContext.describe(score: score.url, patch: patch, sheet: score.cueSheet, at: point,
+                                     collections: score.timingLog.map(PatchContext.collections(in:)) ?? [], scoreContext: here,
+                                     lexicon: SCLexicon.load(project: score.url.deletingLastPathComponent()))
+    }
+
+    /// The patch's files: what a patch request may change and ⌘Z restores.
+    private func patchFiles(_ patch: URL) -> [URL: String] {
+        var out: [URL: String] = [:]
+        for url in [patch] + PatchMigration.dependencies(of: patch) + [PatchDoc.url(patch: patch)] {
+            if let t = try? String(contentsOf: url, encoding: .utf8) { out[url.standardizedFileURL] = t }
+        }
+        return out
+    }
+
+    /// The patch agent carries out a request in the background; the mix
+    /// re-renders when it is done, and ⌘Z puts the patch back.
+    private func runPatchRequest(_ request: String, agent: AgentRun, patch: URL, context: JSONValue) {
+        var agent = agent
+        agent.model = agent.harness == .opencode ? Self.opencodeModel : nil
+        let log = AgentLog.Run(kind: .patch)
+        log.log("request", "“\(request)” · patch agent (\(agent.harness.title)\(agent.model.map { ", \($0)" } ?? "")) · \(patch.lastPathComponent)",
+                detail: "score \(score.url.path)\npatch \(patch.path)\nagent \(agent.executable)")
+        guard agentHandle == nil, !requestRunning else {
+            // One request at a time per score: the two agents never edit at once.
+            log.log("refused", "Another agent is still working", level: .warning)
+            statusBar.flash("An agent is still working (␣ e k stops it)")
+            return
+        }
+        guard let pondside = Bundle.main.resourceURL?.appendingPathComponent("pondside").path,
+              FileManager.default.isExecutableFile(atPath: pondside) else {
+            log.log("refused", "The bundled pondside CLI is missing", level: .error)
+            statusBar.flash("Pondside's command-line tool is missing from the app bundle")
+            return
+        }
+        if let s = patchSession, s.agent.harness != agent.harness || s.agent.executable != agent.executable || s.agent.model != agent.model {
+            s.reset()
+            patchSession = nil
+        }
+        let session = patchSession ?? AgentSession(agent: agent, folder: score.url.deletingLastPathComponent(), pondside: pondside, role: .patch)
+        patchSession = session
+        patchIdle?.cancel()
+        let snapshot = patchFiles(patch)
+        let scoreBefore = Dictionary(score.files.map { ($0.url.standardizedFileURL, $0.text) }, uniquingKeysWith: { a, _ in a })
+        requestRunning = true
+        canvas.beginWork(label: "Patch agent working…")
+        let short = request.count > 28 ? String(request.prefix(27)) + "…" : request
+        agentProgress = AgentProgress(label: "Patch: “\(short)”", total: 0)
+        showAgentProgress()
+        let contextText = context.jsonString(pretty: true)
+        let prompt = AgentRun.patchPrompt(request: request, context: contextText, score: score.url, patch: patch,
+                                          followUp: session.turns > 0)
+        log.log("context", "Cue \(context["cue"]?["name"]?.string ?? "none") · \(context["cue"]?["touches"]?.array?.count ?? 0) items it touches",
+                detail: contextText)
+        log.log("prompt", "\(session.turns > 0 ? "Follow-up" : "First") request, \(prompt.count) characters", detail: prompt, limit: AgentLog.promptLimit)
+        Task { [weak self] in
+            let outcome = await session.send(prompt, log: log) { words in
+                Task { @MainActor in
+                    guard let self, self.patchSession === session, self.requestRunning else { return }
+                    self.agentProgress?.doing = words
+                    self.showAgentProgress()
+                }
+            }
+            guard let self else { return }
+            self.requestRunning = false
+            self.agentProgress = nil
+            self.patchIdle = Task { [weak session] in
+                try? await Task.sleep(for: .seconds(30 * 60))
+                if !Task.isCancelled { session?.close() }
+            }
+            let now = self.patchFiles(patch)
+            let changed = Set(now.keys.filter { now[$0] != snapshot[$0] && snapshot[$0] != nil })
+            // The score is the other agent's: say so if this one touched it.
+            let strays = scoreBefore.filter { url, text in (try? String(contentsOf: url, encoding: .utf8)) != text }.keys
+            if !strays.isEmpty {
+                log.log("files", "The patch agent changed score files too: " + strays.map(\.lastPathComponent).sorted().joined(separator: ", "), level: .warning)
+            }
+            if !changed.isEmpty {
+                self.agentUndo = snapshot.filter { changed.contains($0.key) }
+                self.agentAfter = now.filter { changed.contains($0.key) }
+                self.registerAgentUndo(on: self.activeFile.undoManager)
+            }
+            let line = outcome.summary.split(separator: "\n").first.map(String.init) ?? ""
+            let cost = outcome.costUSD.map { String(format: "   $%.2f", $0) } ?? ""
+            log.log("files", changed.isEmpty ? "No patch file changed" : "Changed " + changed.map(\.lastPathComponent).sorted().joined(separator: ", "),
+                    level: changed.isEmpty && !outcome.failed ? .warning : .info)
+            log.log("outcome", (outcome.failed ? "Failed: " : "") + (line.isEmpty ? "(no reply)" : line)
+                        + String(format: " · %.1f s", log.elapsed) + (outcome.costUSD.map { String(format: " · $%.3f", $0) } ?? ""),
+                    level: outcome.failed ? .error : .info, detail: outcome.summary)
+            self.canvas.endWork()
+            self.updateStatus()
+            // The agent's patch_check rendered the mix; render again in case it didn't.
+            if !changed.isEmpty { self.score.renderMix() }
+            if outcome.providerProblem {
+                self.showProviderProblem(agent, outcome.summary, changed: !changed.isEmpty)
+                return
+            }
+            self.statusBar.flash(outcome.failed
+                ? "The patch agent didn't finish: \(line.isEmpty ? "no reply" : line)" + (changed.isEmpty ? "" : "   ⌘Z undo") + "   ⌘⌥A log"
+                : line + cost + (changed.isEmpty ? "" : "   ⌘Z undo   ⌘⌥P play the mix"))
+        }
+    }
+
+    /// ␣ e N: the patch agent's next request starts a new conversation (the
+    /// patch doc keeps what it knew).
+    private func newPatchConversation() {
+        AgentLog.Run(kind: .patch).log("reset", "New conversation: the next patch request starts a new session")
+        patchSession?.reset()
+        patchSession = nil
+        statusBar.flash("The patch agent's next request starts a new conversation; its notes are in the patch doc")
+    }
+
+    /// The installed agent for `preference`, found once in the background
+    /// (it asks the login shell for its PATH) and remembered.
+    private static var agentCache: [String: AgentRun?] = [:]
+    static func agent(_ preference: String?) -> AgentRun? {
+        let key = preference ?? "auto"
+        if let known = agentCache[key] { return known }
+        Task.detached {
+            let found = AgentRun.choose(preference: preference)
+            await MainActor.run { agentCache[key] = .some(found) }
+        }
+        return nil
+    }
+
+    /// The agent carries out a request about the selection in the
+    /// background; the status bar shows what it is doing, and ␣ e z undoes
+    /// its change.
+    private func runRequest(_ request: String, agent: AgentRun, context: JSONValue) {
+        var agent = agent
+        agent.model = agent.harness == .opencode ? Self.opencodeModel : nil
+        let log = AgentLog.Run(kind: .graphics)
+        log.log("request", "“\(request)” · \(agent.harness.title)\(agent.model.map { " (\($0))" } ?? "") · \(score.url.lastPathComponent)",
+                detail: "score \(score.url.path)\nagent \(agent.executable)")
+        guard agentHandle == nil, !requestRunning else {
+            log.log("refused", "Another agent is still working", level: .warning)
+            statusBar.flash("An agent is still working (␣ e k stops it)")
+            return
+        }
+        guard let pondside = Bundle.main.resourceURL?.appendingPathComponent("pondside").path,
+              FileManager.default.isExecutableFile(atPath: pondside) else {
+            log.log("refused", "The bundled pondside CLI is missing (\(Bundle.main.resourceURL?.path ?? "?"))", level: .error)
+            statusBar.flash("Pondside's command-line tool is missing from the app bundle")
+            return
+        }
+        // One conversation per window, kept between requests (the agent
+        // compacts it when it grows long); a new one when the agent or
+        // opencode's model changed in Settings, or on ␣ e n.
+        if let s = requestSession, s.agent.harness != agent.harness || s.agent.executable != agent.executable
+            || s.agent.model != agent.model {
+            s.reset()
+            requestSession = nil
+        }
+        let session = requestSession ?? AgentSession(agent: agent, folder: score.url.deletingLastPathComponent(), pondside: pondside)
+        requestSession = session
+        requestIdle?.cancel()
+        let snapshot = Dictionary(score.files.map { ($0.url, $0.text) }, uniquingKeysWith: { a, _ in a })
+        finishAgentRender()
+        requestRunning = true
+        canvas.beginWork(label: "\(agent.harness.title) working…")
+        let short = request.count > 28 ? String(request.prefix(27)) + "…" : request
+        agentProgress = AgentProgress(label: "\(agent.harness.title): “\(short)”", total: 0)
+        showAgentProgress()
+        let contextText = context.jsonString(pretty: true)
+        let prompt = AgentRun.graphicsPrompt(request: request, context: contextText, score: score.url,
+                                             followUp: session.turns > 0)
+        let graphic = context["graphic"]
+        log.log("context", graphic == nil ? "No graphic at the selection: the agent gets the event and staff only"
+                    : "Selection: \(graphic?["command"]?.string ?? graphic?["entry"]?.string ?? "a graphic")"
+                      + (graphic?["drawing"] == nil ? "" : " with its drawing code"),
+                level: graphic == nil ? .warning : .info, detail: contextText)
+        log.log("prompt", "\(session.turns > 0 ? "Follow-up" : "First") request, \(prompt.count) characters"
+                    + (session.turns > 0 ? " (turn \(session.turns + 1))" : ""), detail: prompt, limit: AgentLog.promptLimit)
+        Task { [weak self] in
+            let outcome = await session.send(prompt, log: log) { words in
+                Task { @MainActor in
+                    guard let self, self.requestSession === session, self.requestRunning else { return }
+                    self.agentProgress?.doing = words
+                    self.showAgentProgress()
+                }
+            }
+            guard let self else { return }
+            self.requestRunning = false
+            self.agentProgress = nil
+            // An idle conversation's process ends after a while; the next request resumes it.
+            self.requestIdle = Task { [weak session] in
+                try? await Task.sleep(for: .seconds(30 * 60))
+                if !Task.isCancelled { session?.close() }
+            }
+            let changedFiles = Set(snapshot.filter { url, text in (try? String(contentsOf: url, encoding: .utf8)) != text }.keys)
+            let changed = !changedFiles.isEmpty
+            if changed {
+                self.agentUndo = snapshot
+                self.agentAfter = changedFiles.reduce(into: [:]) { after, url in
+                    if let text = try? String(contentsOf: url, encoding: .utf8) { after[url] = text }
+                }
+                self.agentChanged = changedFiles.subtracting(self.agentWritesInFlight)
+                self.registerAgentUndo(on: self.activeFile.undoManager)
+            }
+            self.agentWritesInFlight.removeAll()
+            let line = outcome.summary.split(separator: "\n").first.map(String.init) ?? ""
+            let cost = outcome.costUSD.map { String(format: "   $%.2f", $0) } ?? ""
+            log.log("files", changed ? "Changed " + changedFiles.map(\.lastPathComponent).sorted().joined(separator: ", ") : "No file changed",
+                    level: changed || outcome.failed ? .info : .warning)
+            log.log("outcome", (outcome.failed ? "Failed: " : "") + (line.isEmpty ? "(no reply)" : line)
+                        + String(format: " · %.1f s", log.elapsed) + (outcome.costUSD.map { String(format: " · $%.3f", $0) } ?? ""),
+                    level: outcome.failed ? .error : .info, detail: outcome.summary)
+            // The reply shows once the score shows the change.
+            let report: () -> Void = { [weak self] in
+                guard let self else { return }
+                if outcome.providerProblem {
+                    self.showProviderProblem(agent, outcome.summary, changed: changed)
+                    return
+                }
+                // A run that edited the score and then failed (a dropped
+                // connection on its last reply) still changed the music.
+                self.statusBar.flash(outcome.failed
+                    ? "\(agent.harness.title) didn't finish: \(line.isEmpty ? "no reply" : line)" + (changed ? "   it changed files: ⌘Z undo" : "") + "   ⌘⌥A log"
+                    : line + cost + (changed ? "   ⌘Z undo" : ""))
+            }
+            let scoreFiles = Set(self.score.files.map { $0.url.standardizedFileURL })
+            let written = changedFiles.filter { scoreFiles.contains($0.standardizedFileURL) }
+                .compactMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date }.max()
+            if let written {
+                log.log("render", "Waiting for the app to engrave the change")
+                self.awaitAgentRender(written: written, log: log, then: report)
+            } else {
+                self.canvas.endWork()
+                self.agentNote = nil
+                self.updateStatus()
+                report()
+            }
+        }
+    }
+
+    private func awaitAgentRender(written: Date, log: AgentLog.Run, then done: @escaping () -> Void) {
+        agentRender = (written, { [weak self] in
+            if let self { log.log("render", String(format: "Engraved · %.1f s", log.elapsed), detail: "\(self.score.status)") }
+            done()
+        })
+        agentNote = "Engraving the change..."
+        updateStatus()
+        // The watcher polls; don't wait for its next tick.
+        score.revalidate()
+        agentRenderTimeout?.cancel()
+        agentRenderTimeout = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled, let self, let wait = self.agentRender else { return }
+            // Nothing picked the change up: engrave it now.
+            if (self.score.compileStarted ?? .distantPast) < wait.written, self.score.status != .compiling {
+                self.score.engrave()
+            }
+            try? await Task.sleep(for: .seconds(115))
+            guard !Task.isCancelled else { return }
+            log.log("render", "No engraving of the change within 2 minutes", level: .warning)
+            self.finishAgentRender()
+        }
+        checkAgentRender()
+    }
+
+    /// Ends the wait once the pages on screen come from the agent's files.
+    private func checkAgentRender() {
+        guard let wait = agentRender, let started = score.compileStarted,
+              started >= wait.written, score.status != .compiling else { return }
+        finishAgentRender()
+    }
+
+    private func finishAgentRender() {
+        guard let wait = agentRender else { return }
+        agentRender = nil
+        agentRenderTimeout?.cancel()
+        agentRenderTimeout = nil
+        canvas.endWork()
+        agentNote = nil
+        updateStatus()
+        wait.done()
+    }
+
+    /// ␣ e n: the next request starts a new conversation.
+    private func newAgentConversation() {
+        AgentLog.Run(kind: .graphics).log("reset", "New conversation: the next request starts a new session")
+        requestSession?.reset()
+        requestSession = nil
+        statusBar.flash("The next request starts a new conversation")
+    }
+
+    /// One undo step for the agent's whole request, on the active file's
+    /// stack, so ⌘Z works like any other edit even when the agent changed
+    /// another file. Switching files moves it along.
+    private func registerAgentUndo(on manager: UndoManager) {
+        guard agentUndo != nil else { return }
+        if let old = agentUndoCookie { agentUndoManager?.removeAllActions(withTarget: old) }
+        let cookie = AgentUndoCookie(self)
+        agentUndoCookie = cookie
+        agentUndoManager = manager
+        manager.registerUndo(withTarget: cookie) { cookie in
+            MainActor.assumeIsolated { cookie.controller?.undoAgentChange(fromUndoManager: true) }
+        }
+        manager.setActionName("Agent Change")
+    }
+
+    private func moveAgentUndo(to manager: UndoManager) {
+        guard agentUndo != nil, agentUndoManager !== manager else { return }
+        registerAgentUndo(on: manager)
+    }
+
+    /// Puts back the files the agent's last request changed. Files changed
+    /// since (by the user or another program) are left alone.
+    private func undoAgentChange(fromUndoManager: Bool = false) {
+        guard let snapshot = agentUndo else { statusBar.flash("No agent change to undo"); return }
+        let after = agentAfter
+        var restored = 0
+        var kept = 0
+        var restoredURLs = Set<URL>()
+        for (url, text) in snapshot where after[url] != nil {
+            let current = try? String(contentsOf: url, encoding: .utf8)
+            guard current != text else { continue }
+            if let current, let expected = after[url], current != expected {
+                // Someone edited it after the agent: don't overwrite that.
+                kept += 1
+                continue
+            }
+            if (try? Data(text.utf8).write(to: url, options: .atomic)) != nil {
+                restored += 1
+                restoredURLs.insert(url)
+            }
+        }
+        // The reloads these writes cause are part of this undo, not new edits.
+        agentChanged = restoredURLs
+        if !fromUndoManager, let cookie = agentUndoCookie {
+            agentUndoManager?.removeAllActions(withTarget: cookie)
+        }
+        agentUndoCookie = nil
+        agentUndoManager = nil
+        agentUndo = nil
+        agentAfter = [:]
+        AgentLog.Run(kind: .graphics, id: "user").log("undo",
+            "Undid the agent's last change: \(restored) file\(restored == 1 ? "" : "s") restored"
+            + (kept > 0 ? ", \(kept) changed since and kept" : ""))
+        statusBar.flash(restored == 0
+            ? (kept > 0 ? "The agent's files changed since; left as they are" : "Nothing to undo")
+            : "Undid the agent's change (\(restored) file\(restored == 1 ? "" : "s")"
+              + (kept > 0 ? "; \(kept) changed since, kept" : "") + ")")
     }
 
     /// The Lexicon pane's "Insert over Selection": the graphic from the
@@ -1713,7 +2584,7 @@ extension DocumentWindowController: CommandResponder {
     private static let layoutKey = "Pondside.layout"
     private static let workspacesKey = "Pondside.workspaces"
     /// Content that exists today; the rest shows a placeholder naming its milestone.
-    private static let builtContent: [PaneContent] = [.score, .lilypond, .compilerOutput, .terminal, .agent, .cues, .lexicon]
+    private static let builtContent: [PaneContent] = [.score, .lilypond, .compilerOutput, .terminal, .supercollider, .cues, .lexicon, .agentLog]
 
     private static func savedLayout() -> PaneLayout {
         if let data = UserDefaults.standard.data(forKey: layoutKey),
@@ -1736,14 +2607,12 @@ extension DocumentWindowController: CommandResponder {
             compilerOutput.show(score.lastLog)
             return compilerOutput
         case .terminal: return TerminalPane(directory: score.url.deletingLastPathComponent())
-        case .agent:
-            // Any agent; it reaches Pondside through `pondside mcp` (docs/API.md).
-            let config = try? ProjectConfig.find(from: score.url)
-            return TerminalPane(directory: score.url.deletingLastPathComponent(), command: config?.agentCommand ?? "claude")
+        case .supercollider: return makeSuperColliderPane()
         case .lexicon:
             lexiconBrowser.model.installation = score.installation
             lexiconBrowser.model.reload()
             return lexiconBrowser
+        case .agentLog: return agentLogView
         case .cues:
             cueInspector.onJump = { [weak self] cue in self?.reveal(cue) }
             cueInspector.show(score.cueSheet, scoreFolder: score.url.deletingLastPathComponent())
@@ -1757,8 +2626,9 @@ extension DocumentWindowController: CommandResponder {
         case .score: return canvas
         case .lilypond: return editor.textView
         case .cues: return cueInspector.responder
+        case .agentLog: return agentLogView.responder
+        case .supercollider: return (panes.view(for: .supercollider) as? SuperColliderPane)?.responder ?? panes.view(for: content)
         case .terminal: return (panes.view(for: .terminal) as? TerminalPane)?.responder ?? panes.view(for: .terminal)
-        case .agent: return (panes.view(for: .agent) as? TerminalPane)?.responder ?? panes.view(for: .agent)
         default: return panes.view(for: content)
         }
     }
@@ -1784,6 +2654,23 @@ extension DocumentWindowController: CommandResponder {
         l.cycle(forward: forward, available: Self.builtContent)
         applyLayout(l)
         if let c = l.focusedContent { statusBar.flash("\(c.title) · ⌃⇥ next, ⌃1–⌃0 jump") }
+    }
+
+    /// ⌘⌥A: the Agent Log in a pane of its own beside the others, or closes
+    /// it. The keyboard stays where it was (HIG: don't move focus without
+    /// the user's interaction); ⌘J reaches the log.
+    private func toggleAgentLog() {
+        syncFocusedPane()
+        var l = panes.layout
+        let showing = l.contents.contains(.agentLog)
+        if showing, l.contents.count == 1 {
+            statusBar.flash("The Agent Log is the only pane: ⌃⇥ shows something else")
+            return
+        }
+        l.toggle(.agentLog)
+        panes.apply(l)
+        saveLayout()
+        if !showing { statusBar.flash("Agent Log · ⌘⌥A hides it · in the log: d details, v verbose, f filter") }
     }
 
     private func showInFocusedPane(_ content: PaneContent) {
@@ -1832,4 +2719,337 @@ extension DocumentWindowController: CommandResponder {
             self?.applyLayout(all[i])
         }
     }
+
+    // MARK: SuperCollider
+
+    private func makeSuperColliderPane() -> SuperColliderPane {
+        let pane = SuperColliderPane(score: score.url, cues: score.cueSheet)
+        pane.flash = { [weak self] message in self?.statusBar.flash(message) }
+        help.register(pane.bootButton, "sc.boot")
+        help.register(pane.stopButton, "sc.stop")
+        help.register(pane.ideButton, "sc.openInIDE")
+        pane.openInIDE = { [weak self] in self?.openInSuperColliderIDE() }
+        scPane = pane
+        return pane
+    }
+
+    /// Starts the interpreter for commands run before the pane is shown.
+    private func ensureSuperCollider() {
+        if scPane == nil { SCLangHost.shared.start(near: score.url) }
+    }
+
+    func flushSuperCollider() { scPane?.flushSave() }
+
+    /// The SuperCollider file in the pane (else the patch) in the SuperCollider
+    /// IDE, by launching the IDE itself: while Pondside's own sclang runs,
+    /// macOS takes it for SuperCollider.app and a double-clicked .scd fails
+    /// ("cannot open files in the Plain Text format").
+    private func openInSuperColliderIDE() {
+        flushSuperCollider()
+        let config = try? ProjectConfig.find(from: score.url)
+        guard let file = scPane?.fileURL ?? score.patchURL ?? config?.handlers
+                ?? Optional(PatchMigration.patchURL(score: score.url)),
+              FileManager.default.fileExists(atPath: file.path) else {
+            statusBar.flash("No SuperCollider file to open")
+            return
+        }
+        guard let sclang = SuperColliderToolchain.findSclang(configured: config?.sclang?.path),
+              let ide = SuperColliderToolchain.ide(forSclang: sclang) else {
+            statusBar.flash("SuperCollider's IDE isn't installed")
+            return
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ide)
+        p.arguments = [file.path]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do {
+            try p.run()
+            statusBar.flash("Opening \(file.lastPathComponent) in the SuperCollider IDE")
+        } catch {
+            statusBar.flash("Couldn't start the SuperCollider IDE: \(error.localizedDescription)")
+        }
+    }
+
+    private func showSuperColliderFilePicker() {
+        let files = SuperColliderPane.scdFiles(near: score.url)
+        let folder = score.url.deletingLastPathComponent().path + "/"
+        var choices = files.map { (title: $0.path.hasPrefix(folder) ? String($0.path.dropFirst(folder.count)) : $0.lastPathComponent,
+                                   detail: nil as String?) }
+        choices.append((title: "New File…", detail: "Name a new .scd beside the score"))
+        showPicker(placeholder: "Open SuperCollider file", choices: choices) { [weak self] i in
+            guard let self else { return }
+            self.showInFocusedPane(.supercollider)
+            guard let pane = self.scPane else { return }
+            if files.indices.contains(i) { pane.open(files[i]) } else { pane.chooseFile(creating: true) }
+        }
+    }
 }
+
+// MARK: - Score Setup
+
+extension DocumentWindowController {
+    /// The included `front-matter.ily` beside the root, once the score has one.
+    private var frontMatterFile: SourceFile? {
+        let url = score.url.deletingLastPathComponent().appendingPathComponent(FrontMatter.fileName).standardizedFileURL
+        return score.files.first { $0.url.standardizedFileURL == url }
+    }
+
+    private var frontMatterURL: URL {
+        score.url.deletingLastPathComponent().appendingPathComponent(FrontMatter.fileName)
+    }
+
+    private var staffSetup: StaffSetup { StaffSetup(files: score.files.map(\.text)) }
+
+    func showScoreSetup() {
+        let panel = scoreSetupPanel ?? makeScoreSetupPanel()
+        scoreSetupPanel = panel
+        refreshScoreSetup(force: true)
+        panel.orderFront(nil)
+    }
+
+    private func makeScoreSetupPanel() -> ScoreSetupPanel {
+        let panel = ScoreSetupPanel()
+        let model = panel.model
+        model.onStaffChange = { [weak self] index, change in
+            guard let self else { return }
+            let setup = self.staffSetup
+            let label = setup.staves.indices.contains(index) ? setup.staves[index].label : "Staff"
+            for (file, edits) in setup.edits(staff: index, change).sorted(by: { $0.key < $1.key }) where self.score.files.indices.contains(file) {
+                self.applyText(edits, to: self.score.files[file], name: "Set Up \(label)")
+            }
+            self.refreshScoreSetup()
+        }
+        model.onShowStaff = { [weak self] index in
+            guard let self else { return }
+            let staves = self.staffSetup.staves
+            guard staves.indices.contains(index), self.score.files.indices.contains(staves[index].file) else { return }
+            let staff = staves[index]
+            let file = self.score.files[staff.file]
+            if file !== self.activeFile { self.showFile(file) }
+            self.setSelection(utf8: staff.offset..<staff.offset)
+            self.window?.makeKeyAndOrderFront(nil)
+            self.window?.makeFirstResponder(self.editor.textView)
+        }
+        model.onHeader = { [weak self] key, value in
+            guard let self else { return }
+            let doc = EngravingSettingsDocument(root: self.score.root.text,
+                                                others: self.score.files.dropFirst().map { (file: $0.displayName, text: $0.text) })
+            let label = FrontMatter.headerFields.first { $0.key == key }?.label ?? key
+            self.applyText(doc.edits(headerField: key, to: value), to: self.score.root, name: "Set \(label)")
+            self.refreshScoreSetup()
+        }
+        model.onSection = { [weak self] section, on in
+            self?.editFrontMatter(name: on ? "Add \(section.title)" : "Remove \(section.title)", creating: on ? [section] : nil) {
+                $0.edits(section: section, enabled: on)
+            }
+        }
+        model.onHeading = { [weak self] section, text in
+            self?.editFrontMatter(name: "Set \(section.title) Heading") { $0.edits(heading: section, to: text) }
+        }
+        model.onParagraphs = { [weak self] paragraphs in
+            self?.editFrontMatter(name: "Edit Notes") { $0.edits(paragraphs: paragraphs) }
+        }
+        model.onAddLegend = { [weak self] items in
+            self?.editFrontMatter(name: "Add to Legend", creating: [.legend]) { fm in
+                let present = Set(fm.legendItems.map(\.id))
+                return fm.edits(adding: items.filter { !present.contains($0.id) })
+            }
+        }
+        model.onAddSymbol = { [weak self] in
+            guard let self else { return }
+            let taken = Set(FrontMatter(self.frontMatterFile?.text ?? "").legendItems.map(\.id))
+            let id = (1...).lazy.map { "symbol-\($0)" }.first { !taken.contains($0) }!
+            let item = FrontMatter.NewLegendItem(id: id, title: "New symbol", text: "What it asks of the performer.",
+                                                 example: "\\null % notation: \\score { \\new Staff { c''1 } \\layout { indent = 0 line-width = 40\\mm } }")
+            self.editFrontMatter(name: "Add to Legend", creating: [.legend]) { $0.edits(adding: [item]) }
+        }
+        model.onRemoveLegend = { [weak self] id in
+            self?.editFrontMatter(name: "Remove from Legend") { $0.edits(removingLegend: id) }
+        }
+        model.onEditLegend = { [weak self] id, title, text in
+            self?.editFrontMatter(name: "Edit Legend") { $0.edits(legend: id, title: title, text: text) }
+        }
+        model.onArrangeLegend = { [weak self] on in self?.arrangeLegend(on) }
+        model.onShowFrontMatter = { [weak self] section in
+            guard let self else { return }
+            if section == .cover {
+                // The cover's words are the root's \header.
+                let root = self.score.root.text
+                let offset = root.range(of: "\\header").map { root.utf8.distance(from: root.startIndex, to: $0.lowerBound) } ?? 0
+                if self.activeFile !== self.score.root { self.showFile(self.score.root) }
+                self.setSelection(utf8: offset..<offset)
+            } else if let file = self.frontMatterFile {
+                if file !== self.activeFile { self.showFile(file) }
+                let offset = section.flatMap { FrontMatter(file.text).range(of: $0)?.lowerBound } ?? 0
+                self.setSelection(utf8: offset..<offset)
+            }
+            self.window?.makeKeyAndOrderFront(nil)
+            self.window?.makeFirstResponder(self.editor.textView)
+        }
+        if let frame = window?.frame, !panel.setFrameUsingName("Pondside.scoreSetup") {
+            panel.setFrameTopLeftPoint(NSPoint(x: frame.maxX - panel.frame.width - 24, y: frame.maxY - 64))
+        }
+        return panel
+    }
+
+    /// Edits `front-matter.ily` as one undoable change in that file. A score
+    /// without one gets it (with `creating`'s sections) and the include
+    /// before its first `\score`; nothing happens if `creating` is nil.
+    private func editFrontMatter(name: String, creating: Set<FrontMatter.Section>? = nil,
+                                 _ change: (FrontMatter) -> [TextEdit]) {
+        if let file = frontMatterFile {
+            applyText(change(FrontMatter(file.text)), to: file, name: name)
+        } else if let creating {
+            // A file of that name the score doesn't include yet is the user's: build on it.
+            let existing = (try? String(contentsOf: frontMatterURL, encoding: .utf8)).map(FrontMatter.init)
+            var fm = existing ?? FrontMatter(FrontMatter.template(creating))
+            for section in creating where !fm.sections.contains(section) {
+                fm = FrontMatter(fm.edits(section: section, enabled: true).apply(to: fm.text))
+            }
+            fm = FrontMatter(change(fm).apply(to: fm.text))
+            do {
+                try Data(fm.text.utf8).write(to: frontMatterURL, options: .atomic)
+            } catch {
+                statusBar.flash("Can't write \(FrontMatter.fileName): \(error.localizedDescription)")
+                NSSound.beep()
+                return
+            }
+            if let include = FrontMatter.includeEdit(root: score.root.text) {
+                applyText([include], to: score.root, name: "Include \(FrontMatter.fileName)")
+            }
+            statusBar.flash("Wrote \(FrontMatter.fileName); \(score.root.displayName) includes it before the score")
+        }
+        refreshScoreSetup()
+    }
+
+    /// Arrange mode for the legend (␣ f a, Score Setup › Legend). A file
+    /// written before the legend could be arranged gets its layout and
+    /// current definitions first, so the engraving carries the markers.
+    func arrangeLegend(_ on: Bool) {
+        guard on else {
+            canvas.legendArranging = false
+            scoreSetupPanel?.model.arrangingLegend = false
+            updateHints()
+            statusBar.flash("Done arranging the legend")
+            return
+        }
+        guard let file = frontMatterFile, FrontMatter(file.text).sections.contains(.legend) else {
+            statusBar.flash("No legend yet: Score Setup (⌘⇧U) › Legend adds one")
+            return
+        }
+        let fm = FrontMatter(file.text)
+        if fm.legendLayout == nil || !fm.upgradeEdits.isEmpty {
+            editFrontMatter(name: "Arrange Legend") { fm in
+                fm.legendLayout == nil ? fm.edits(legendLayout: .init()) : fm.upgradeEdits
+            }
+        }
+        canvas.legendArranging = true
+        scoreSetupPanel?.model.arrangingLegend = true
+        canvas.revealLegend()
+        updateHints()
+        window?.makeFirstResponder(canvas)
+        statusBar.flash("Arranging the legend: drag the table, a column edge or a row gap; an example's edges crop it, "
+                        + "its corner scales it (⌥ all). ⌘ while dragging: no snapping. ⎋ done")
+    }
+
+    /// Writes a finished legend drag as one undoable edit.
+    private func commitLegend(_ outcome: LegendArrangement.Outcome) {
+        editFrontMatter(name: "Arrange Legend") { fm in
+            var text = fm.edits(legendLayout: outcome.layout).apply(to: fm.text)
+            if let (row, layout) = outcome.example {
+                let next = FrontMatter(text)
+                let items = next.legendItems
+                if items.indices.contains(row) {
+                    text = next.edits(legend: items[row].id, example: layout).apply(to: text)
+                }
+            }
+            return EngravingSettingsDocument.span(from: Array(fm.text.utf8), to: Array(text.utf8))
+        }
+    }
+
+    func refreshScoreSetup(force: Bool = false) {
+        guard let panel = scoreSetupPanel, force || panel.isVisible else { return }
+        let model = panel.model
+        let setup = staffSetup
+        model.staves = setup.staves
+        model.fileNames = score.files.map(\.displayName)
+        model.rootName = score.root.displayName
+        let doc = EngravingSettingsDocument(root: score.root.text,
+                                            others: score.files.dropFirst().map { (file: $0.displayName, text: $0.text) })
+        model.header = Dictionary(uniqueKeysWithValues: FrontMatter.headerFields.map { ($0.key, doc.headerField($0.key)) })
+        let fm = FrontMatter(frontMatterFile?.text ?? "")
+        model.sections = fm.sections
+        model.notesHeading = fm.heading(.notes)?.value ?? ""
+        model.paragraphs = fm.sections.contains(.notes) ? fm.paragraphs?.values : []
+        model.legendHeading = fm.heading(.legend)?.value ?? ""
+        model.legendItems = fm.legendItems
+        // What the instrumental music uses: Lexicon entries, then the score's own symbols.
+        let front = frontMatterFile
+        let music = score.files.filter { $0 !== front }
+        let lex = Lexicon.load(Lexicon.standardScopes(project: score.url.deletingLastPathComponent()))
+        var seen = Set<String>()
+        var candidates: [ScoreSetupModel.Candidate] = []
+        for use in music.flatMap({ LexiconUse.find(in: $0.text) }) where seen.insert(use.id).inserted {
+            guard let entry = lex.entries[use.id]?.entry else { continue }
+            let item = entry.legendItem
+            candidates.append(.init(id: use.id, title: item.title, detail: "Lexicon entry \(use.id)", printed: true, item: item))
+        }
+        let names = music.map(\.displayName)
+        for c in LegendScan.candidates(files: music.map(\.text)) where seen.insert(c.id).inserted {
+            let place = names.indices.contains(c.file) ? "\(names[c.file]):\(c.line)" : ""
+            candidates.append(.init(id: c.id, title: c.title, detail: "\(c.invocation) · \(c.staff) · \(place) · \(c.uses)×",
+                                    printed: c.printed, item: c.legendItem))
+        }
+        model.candidates = candidates
+    }
+}
+
+// MARK: - Stopping the agent
+
+extension DocumentWindowController {
+    /// An agent is carrying out a lens request or finishing a patch migration.
+    var agentWorking: Bool { agentHandle != nil || requestRunning }
+
+    /// Cancels whatever the agent is doing (⌘⌥., ␣ e k, the status bar's
+    /// Stop). A lens request is interrupted and its conversation kept, so
+    /// the next request resumes it; a patch migration's process is ended.
+    /// Files it already changed stay changed: ␣ e z puts them back.
+    func stopAgent() {
+        if let h = agentHandle {
+            AgentLog.Run(kind: .refactor, id: "user").log("stop", "Stopped by the user", level: .warning)
+            h.stop()
+            statusBar.flash("Stopping the agent… (␣ e z undoes what it changed)")
+        } else if requestRunning {
+            AgentLog.Run(kind: .graphics, id: "user").log("stop", "Stopped by the user", level: .warning)
+            requestSession?.interrupt()
+            patchSession?.interrupt()
+            statusBar.flash("Stopping the agent… (␣ e z undoes what it changed)")
+        } else {
+            statusBar.flash("No agent is working")
+        }
+    }
+}
+
+// MARK: - Provider problems
+
+extension DocumentWindowController {
+    /// The model's provider refused the request (a usage limit, no credit,
+    /// a bad key) or went quiet. HIG Alerts: the user must act, so it is an
+    /// alert on the window, not a flash in the status bar, with the action
+    /// that fixes it most often: choosing another model.
+    func showProviderProblem(_ agent: AgentRun, _ message: String, changed: Bool) {
+        statusBar.flash("\(agent.harness.title) couldn't finish: see the alert")
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "\(agent.harness.title) couldn't carry out the request"
+        alert.informativeText = message + (changed ? "\n\nIt changed files before it stopped: ␣ e z puts them back." : "")
+        alert.addButton(withTitle: "Open Settings")
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn { SettingsWindowController.shared.show() }
+        }
+    }
+}
+

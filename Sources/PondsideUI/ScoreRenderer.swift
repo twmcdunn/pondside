@@ -47,6 +47,12 @@ final class RenderedPage {
         for (i, item) in items.enumerated() {
             if !removed.isEmpty, removed.contains(page.graphics[i]) { continue }
             if let visible, !page.graphics[i].bounds.intersects(visible) { continue }
+            let clip = page.graphics[i].clip
+            if let clip {
+                ctx.saveGState()
+                ctx.clip(to: CGRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height))
+            }
+            defer { if clip != nil { ctx.restoreGState() } }
             switch item {
             case let .path(path, fill, stroke, style):
                 if let fill {

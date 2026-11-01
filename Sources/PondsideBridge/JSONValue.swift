@@ -50,6 +50,7 @@ public enum JSONValue: Hashable, Sendable, Codable, ExpressibleByStringLiteral, 
     public var number: Double? { if case .number(let n) = self { return n }; return nil }
     public var int: Int? { number.map { Int($0) } }
     public var bool: Bool? { if case .bool(let b) = self { return b }; return nil }
+    public var array: [JSONValue]? { if case .array(let a) = self { return a }; return nil }
 
     /// Any Encodable, as a JSON value.
     public static func from<T: Encodable>(_ value: T) throws -> JSONValue {

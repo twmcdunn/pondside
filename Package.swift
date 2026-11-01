@@ -20,7 +20,7 @@ var dependencies: [Package.Dependency] = []
 var targets: [Target] = [
     // Portable — no AppKit, no SwiftUI, no Apple-only Foundation.
     .target(name: "PondsideCore"),
-    .target(name: "PondsideEngrave", dependencies: ["PondsideCore", "PondsideTiming"]),
+    .target(name: "PondsideEngrave", dependencies: ["PondsideCore", "PondsideTiming"], resources: [.copy("Playback")]),
     .target(name: "PondsideTiming", dependencies: ["PondsideCore"]),
     .target(name: "PondsideLexicon", dependencies: ["PondsideCore"], resources: [.copy("Core")]),
     .target(name: "PondsideBridge", dependencies: ["PondsideCore", "PondsideEngrave", "PondsideTiming", "PondsideLexicon"]),

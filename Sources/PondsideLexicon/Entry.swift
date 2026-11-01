@@ -1,4 +1,5 @@
 import Foundation
+import PondsideCore
 
 /// One Lexicon entry: a notational idea with typed parameters, a LilyPond
 /// implementation and, optionally, the sound it stands for (DESIGN.md §3).
@@ -265,8 +266,13 @@ extension LexiconEntry.Param {
         case .string, .markup, .duration, .pitch:
             if v.string == nil { return "expected a string" }
         case .envelope:
-            // 2, or (swell 3 0.5 4): see the graphics kit's env-at.
-            if v.number != nil { return nil }
+            // 2, or (swell 3 0.5 4): see the graphics kit's env-at. A plain
+            // number keeps to the param's range.
+            if let n = v.number {
+                if let min, n < min { return "\(n) is below the minimum \(min)" }
+                if let max, n > max { return "\(n) is above the maximum \(max)" }
+                return nil
+            }
             guard let a = v.array, let head = a.first?.string else {
                 return "expected a number or an envelope such as (swell 3 0.5 4)"
             }
@@ -277,5 +283,16 @@ extension LexiconEntry.Param {
             if v.array == nil { return "expected a list" }
         }
         return nil
+    }
+}
+
+extension LexiconEntry {
+    /// The entry as a row of the score's legend (front-matter.ily): its
+    /// name, its gloss, and its own example drawn as notation.
+    public var legendItem: FrontMatter.NewLegendItem {
+        let words = id.split(separator: "-").map(String.init)
+        let title = words.enumerated().map { $0 == 0 ? $1.prefix(1).uppercased() + $1.dropFirst() : $1 }.joined(separator: " ")
+        let example = kind == .graphic ? FrontMatter.example(graphic: id) : FrontMatter.example(music: command ?? "c''1")
+        return FrontMatter.NewLegendItem(id: id, title: title, text: gloss, example: example)
     }
 }

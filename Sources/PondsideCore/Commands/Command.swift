@@ -87,15 +87,18 @@ public struct Chord: Hashable, Sendable, CustomStringConvertible, ExpressibleByS
 /// What the user is looking at when a command runs. Commands declare what
 /// they need; the palette and overlays rank and filter by it.
 public struct CommandContext: Hashable, Sendable {
-    public enum Focus: String, Hashable, Sendable { case score, source, other }
+    public enum Focus: String, Hashable, Sendable { case score, source, supercollider, other }
     public var focus: Focus
     public var hasSelection: Bool
     public var durationArmed: Bool
     public var hasErrors: Bool
     public var fileCount: Int
+    /// An agent is carrying out a request or finishing a patch.
+    public var agentWorking: Bool
 
     public init(focus: Focus = .score, hasSelection: Bool = false, durationArmed: Bool = false,
-                hasErrors: Bool = false, fileCount: Int = 1) {
+                hasErrors: Bool = false, fileCount: Int = 1, agentWorking: Bool = false) {
+        self.agentWorking = agentWorking
         self.focus = focus
         self.hasSelection = hasSelection
         self.durationArmed = durationArmed
@@ -111,6 +114,10 @@ public enum CommandRequirement: Hashable, Sendable {
     case scoreFocus
     case errors
     case severalFiles
+    /// The SuperCollider pane has the keyboard.
+    case supercollider
+    /// An agent is working in the background.
+    case agentWorking
 
     public func isMet(in c: CommandContext) -> Bool {
         switch self {
@@ -119,6 +126,8 @@ public enum CommandRequirement: Hashable, Sendable {
         case .scoreFocus: return c.focus == .score
         case .errors: return c.hasErrors
         case .severalFiles: return c.fileCount > 1
+        case .supercollider: return c.focus == .supercollider
+        case .agentWorking: return c.agentWorking
         }
     }
 }

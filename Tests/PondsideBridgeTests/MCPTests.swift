@@ -26,17 +26,31 @@ final class MCPTests: XCTestCase {
 
         let tools = try await call(server, #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
         guard case .array(let list)? = tools["result"]?["tools"] else { return XCTFail("\(tools)") }
-        XCTAssertEqual(list.compactMap { $0["name"]?.string },
-                       ["check", "query", "render", "cues", "lexicon_check", "score_context", "lexicon_search",
-                        "lexicon_entry", "graphic_preview", "graphic_insert", "lexicon_propose"])
+        let names = list.compactMap { $0["name"]?.string }
+        XCTAssertEqual(names.first, "edit")
+        for t in ["check", "query", "render", "cues", "lexicon_check", "score_context", "lexicon_search", "lexicon_entry",
+                  "graphic_preview", "graphic_insert", "lexicon_propose", "patch_context", "patch_doc", "patch_note",
+                  "patch_check", "sc_lexicon_search", "sc_lexicon_entry", "sc_lexicon_add"] {
+            XCTAssertTrue(names.contains(t), t)
+        }
 
-        // The two skills, as prompts and as resources.
+        // The skills, as prompts and as resources: the two guides first.
         let prompts = try await call(server, #"{"jsonrpc":"2.0","id":7,"method":"prompts/list"}"#)
         guard case .array(let promptList)? = prompts["result"]?["prompts"] else { return XCTFail("\(prompts)") }
-        XCTAssertEqual(promptList.compactMap { $0["name"]?.string }, ["graphic-notation", "lexicon-entries"])
+        XCTAssertEqual(promptList.compactMap { $0["name"]?.string }, ["graphic-notation", "lexicon-entries", "lilypond",
+                       "lilypond-contemporary-notation", "lilypond-electronics-staff", "lilypond-supercollider",
+                       "sc-patch-editing", "sc-patch-migration"])
         let guide = try await call(server, #"{"jsonrpc":"2.0","id":8,"method":"resources/read","params":{"uri":"lexicon://guide/graphics"}}"#)
         guard case .array(let guideContents)? = guide["result"]?["contents"] else { return XCTFail("\(guide)") }
         XCTAssertTrue(guideContents.first?["text"]?.string?.contains("score_context") ?? false)
+        // A skill lists its files, and they read as resources, inside the skill only.
+        let lily = try await call(server, #"{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"skill://lilypond-electronics-staff"}}"#)
+        XCTAssertTrue(lily["result"]?["contents"]?.jsonString().contains("skill://lilypond-electronics-staff/assets/electronics.ily") ?? false)
+        let lib = try await call(server, #"{"jsonrpc":"2.0","id":10,"method":"resources/read","params":{"uri":"skill://lilypond-electronics-staff/assets/electronics.ily"}}"#)
+        guard case .array(let libContents)? = lib["result"]?["contents"] else { return XCTFail("\(lib)") }
+        XCTAssertTrue(libContents.first?["text"]?.string?.contains("ecue") ?? false)
+        let escape = try await call(server, #"{"jsonrpc":"2.0","id":11,"method":"resources/read","params":{"uri":"skill://lilypond/../graphic-notation/SKILL.md"}}"#)
+        XCTAssertNotNil(escape["error"])
 
         let index = try await call(server, #"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"lexicon://index"}}"#)
         guard case .array(let contents)? = index["result"]?["contents"] else { return XCTFail("\(index)") }

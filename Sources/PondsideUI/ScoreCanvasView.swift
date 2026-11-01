@@ -68,6 +68,8 @@ final class ScoreCanvasView: NSView {
     /// Replaces the pages, cross-fading so a recompile never flickers.
     func setPages(_ newPages: [EngravedPage]) {
         lastInserted = nil
+        legend = legendArranging ? LegendArrangement(pages: newPages) : nil
+        legendPages = Set(LegendArrangement(pages: newPages).sheets.map(\.page))
         let rendered = newPages.map(RenderedPage.init)
         let animate = !pages.isEmpty
         pages = rendered
@@ -79,11 +81,78 @@ final class ScoreCanvasView: NSView {
             addSubview(v)
             pageViews.append(v)
         }
-        for (v, p) in zip(pageViews, rendered) {
+        for (n, (v, p)) in zip(pageViews, rendered).enumerated() {
             if animate { v.crossFade() }
+            v.pageIndex = n
             v.rendered = p
         }
         relayout()
+    }
+
+    // MARK: Arranging the legend
+
+    /// Arrange mode: the legend's handles show, and drags on a legend page
+    /// move its table, columns and rows, or crop and scale an example.
+    var legendArranging = false {
+        didSet {
+            guard legendArranging != oldValue else { return }
+            legend = legendArranging ? LegendArrangement(pages: pages.map(\.page)) : nil
+            pageViews.forEach { $0.legendDrag = nil; $0.needsDisplay = true; $0.window?.invalidateCursorRects(for: $0) }
+        }
+    }
+    private(set) var legend: LegendArrangement?
+    /// The pages that hold the legend's table.
+    private(set) var legendPages: Set<Int> = []
+
+    /// A legend page fills most of what is on screen: the status bar then
+    /// offers to arrange it.
+    var legendInView: Bool {
+        guard !legendPages.isEmpty else { return false }
+        let visible = self.visibleRect
+        guard visible.height > 0 else { return false }
+        var legendArea: CGFloat = 0, all: CGFloat = 0
+        for (n, v) in pageViews.enumerated() {
+            let r = v.frame.intersection(visible)
+            guard !r.isNull else { continue }
+            all += r.width * r.height
+            if legendPages.contains(n) { legendArea += r.width * r.height }
+        }
+        return all > 0 && legendArea / all > 0.5
+    }
+    /// The layout and each row's example options, as the file has them now.
+    var legendValues: () -> (FrontMatter.LegendLayout, [FrontMatter.ExampleLayout]) = { (.init(), []) }
+    /// A finished drag: write it.
+    var onLegendCommit: (LegendArrangement.Outcome) -> Void = { _ in }
+    /// What a drag is doing, for the status bar.
+    var onLegendStatus: (String) -> Void = { _ in }
+
+    /// Scrolls to the legend's first page.
+    func revealLegend() {
+        guard let page = legend?.sheets.first?.page, pageViews.indices.contains(page) else { return }
+        let v = pageViews[page]
+        scrollToVisible(NSRect(x: v.frame.minX, y: v.frame.minY - 12, width: v.frame.width, height: min(v.frame.height, (enclosingScrollView?.contentView.bounds.height ?? 600) - 24)))
+    }
+
+    fileprivate func legendSheet(_ v: PageView) -> LegendArrangement.Sheet? {
+        guard legendArranging, let n = v.pageIndex else { return nil }
+        return legend?.sheet(page: n)
+    }
+
+    /// Handle tolerance: 5 points on screen, in page units.
+    fileprivate func legendTolerance(_ v: PageView) -> Double {
+        guard let vb = v.rendered?.page.viewBox, v.bounds.width > 0 else { return 1 }
+        return 5 * vb.width / v.bounds.width
+    }
+
+    fileprivate func legendDrag(_ v: PageView, handle: LegendArrangement.Handle, from start: Point, to p: Point,
+                                event: NSEvent) -> LegendArrangement.Outcome? {
+        guard let legend, let sheet = legendSheet(v) else { return nil }
+        let (layout, examples) = legendValues()
+        let outcome = legend.drag(handle, on: sheet, from: start, to: p, layout: layout, examples: examples,
+                                  snap: !event.modifierFlags.contains(.command), all: event.modifierFlags.contains(.option),
+                                  threshold: 2 * legendTolerance(v))
+        onLegendStatus(outcome.summary)
+        return outcome
     }
 
     func setZoom(_ z: CGFloat, anchor: NSPoint? = nil) {
@@ -120,6 +189,7 @@ final class ScoreCanvasView: NSView {
         let clip = enclosingScrollView?.contentView.bounds.size ?? .zero
         setFrameSize(NSSize(width: max(contentWidth, clip.width), height: max(contentHeight, clip.height)))
         layoutPageViews()
+        placeWorkBadge()
     }
 
     private func layoutPageViews() {
@@ -154,13 +224,40 @@ final class ScoreCanvasView: NSView {
         return []
     }
 
+    /// Where the last click landed, so a large drawing highlights the shape
+    /// under it rather than all of itself.
+    private var clickFocus: (view: PageView, point: Point, link: PointAndClickLocation)?
+
+    /// The shape a click selected inside a drawing of many parts, for the
+    /// agent: its bounds and the broken spanner piece it belongs to, in
+    /// page (staff-space) coordinates.
+    struct LinkAnchor {
+        var x: Double
+        var link: PointAndClickLocation
+    }
+    struct GraphicPartSelection {
+        var page: Int
+        var part: Rect
+        var piece: Rect
+        var staffMiddle: Double
+        var space: Double
+        /// Other linked glyphs on the clicked system, for the bar/moment
+        /// nearest the part.
+        var anchors: [LinkAnchor]
+    }
+    private(set) var graphicPartSelection: GraphicPartSelection?
+
     /// Highlights every graphic produced by the given source positions.
     /// The highlight is an overlay; the music itself is never recoloured.
     func highlight(_ positions: Set<SourcePosition>, path: String?, reveal: Bool) {
         var firstRect: NSRect?
         selectionAnchor = nil
+        graphicPartSelection = nil
         var sameFile: [String: Bool] = [:]
-        for v in pageViews {
+        // A drawing of many parts (a 20-bar texture, a spanner of separate
+        // bursts) shows only the shape that was clicked, or its first one.
+        var shownLarge = Set<PointAndClickLocation>()
+        for (index, v) in pageViews.enumerated() {
             guard let page = v.rendered?.page else { continue }
             let matches = page.graphics.filter { g in
                 guard !v.removed.contains(g) else { return false }
@@ -171,8 +268,46 @@ final class ScoreCanvasView: NSView {
                 sameFile[link.path] = same
                 return same
             }
-            v.highlights = matches.map(\.bounds)
-            if firstRect == nil, let r = EngravedPage.bounds(of: matches) {
+            // A drawing of many parts is outlined by shape, not part by part.
+            var parts: [PointAndClickLocation: [Graphic]] = [:]
+            for g in matches { parts[g.link!, default: []].append(g) }
+            let space = v.staves.first?.space ?? 1
+            var rects: [Rect] = []
+            for (link, group) in parts {
+                guard group.count > 8 else { rects += group.map(\.bounds); continue }
+                guard !shownLarge.contains(link) else { continue }
+                let shapes = EngravedPage.clusters(of: group, gap: EngravedPage.clusterGap * space)
+                if let focus = clickFocus, focus.link == link {
+                    guard focus.view === v else { continue }
+                    let near = shapes.min { $0.distance(to: focus.point) < $1.distance(to: focus.point) }
+                    if let near {
+                        rects.append(near)
+                        shownLarge.insert(link)
+                        if graphicPartSelection == nil,
+                           let staff = page.staff(at: Point(near.midX, near.midY), among: v.staves) {
+                            let band = EngravedPage.systems(of: v.staves)
+                                .first { ($0.lowerBound - 6)...($0.upperBound + 6) ~= near.midY }
+                            let pieceParts = band.map { b in group.filter { b.contains($0.bounds.midY) } } ?? group
+                            if let piece = EngravedPage.bounds(of: pieceParts) {
+                                let middle = staff.lineYs.count > 2 ? staff.lineYs[staff.lineYs.count / 2] : staff.top
+                                let anchors = page.graphics.compactMap { g -> LinkAnchor? in
+                                    guard let gl = g.link, gl != link, band.map({ $0.contains(g.bounds.midY) }) ?? true else { return nil }
+                                    return LinkAnchor(x: g.bounds.midX, link: gl)
+                                }.sorted { abs($0.x - near.midX) < abs($1.x - near.midX) }.prefix(16)
+                                graphicPartSelection = GraphicPartSelection(page: index + 1, part: near, piece: piece,
+                                                                            staffMiddle: middle, space: staff.space,
+                                                                            anchors: Array(anchors))
+                            }
+                        }
+                    }
+                } else if let first = shapes.first {
+                    rects.append(first)
+                    shownLarge.insert(link)
+                }
+            }
+            v.highlights = rects
+            let shown: Rect? = rects.dropFirst().reduce(rects.first) { acc, r in acc?.union(r) }
+            if firstRect == nil, let r = shown {
                 firstRect = convert(v.viewRect(for: r), from: v)
                 var band = r
                 if let staff = page.staff(at: Point(r.midX, r.midY), among: v.staves) {
@@ -187,12 +322,69 @@ final class ScoreCanvasView: NSView {
         }
     }
 
+    // MARK: Agent at work
+
+    /// The capsule above the region an agent is working on: a spinner and
+    /// who is working. Chrome over content, so it sits beside the music
+    /// (above it), never on it.
+    private var workBadge: NSView?
+
+    /// Marks the current selection as the agent's work in progress: its
+    /// outline pulses until `endWork`, and a capsule above it says who is
+    /// working. HIG Progress indicators: indeterminate, on the content it
+    /// describes; the music stays fully readable (no blur, no dimming).
+    func beginWork(label: String) {
+        for v in pageViews { v.working = v.highlights }
+        guard pageViews.contains(where: { !$0.working.isEmpty }) else { return }
+        workBadge?.removeFromSuperview()
+        let badge = WorkBadge(label: label)
+        addSubview(badge)
+        workBadge = badge
+        placeWorkBadge()
+        NSAccessibility.post(element: NSApp.mainWindow as Any, notification: .announcementRequested,
+                             userInfo: [.announcement: "\(label) on the selection", .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+    }
+
+    /// The work is over: the outline and the capsule fade out.
+    func endWork() {
+        for v in pageViews { v.working = [] }
+        guard let badge = workBadge else { return }
+        workBadge = nil
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2
+            badge.animator().alphaValue = 0
+        }, completionHandler: { badge.removeFromSuperview() })
+    }
+
+    /// On the top-right corner of the first page's work region, straddling
+    /// its outline: it marks the region without covering the music around it
+    /// (the status bar says in words what the agent is doing).
+    private func placeWorkBadge() {
+        guard let badge = workBadge else { return }
+        guard let (v, r) = pageViews.lazy.compactMap({ v in v.workBounds.map { (v, $0) } }).first else {
+            badge.isHidden = true
+            return
+        }
+        badge.isHidden = false
+        let region = convert(r, from: v)
+        let size = badge.fittingSize
+        var origin = NSPoint(x: region.maxX - size.width / 2, y: region.minY - size.height / 2)
+        origin.x = min(max(origin.x, v.frame.minX + 2), v.frame.maxX - size.width - 2)
+        origin.y = max(origin.y, v.frame.minY + 2)
+        badge.frame = NSRect(origin: origin, size: size)
+        // Pages added by a recompile must not cover it.
+        addSubview(badge, positioned: .above, relativeTo: nil)
+    }
+
     // MARK: Events
 
     fileprivate func pageView(_ v: PageView, clickedAt p: Point, event: NSEvent) {
         window?.makeFirstResponder(self)
         let tolerance = 0.3 / max(zoom, 0.5)
+        // Between the parts of a drawing (a grain cloud's dots) still selects it.
         let link = v.rendered?.page.hitTest(p, tolerance: tolerance, excluding: v.removed)?.link
+            ?? v.rendered?.page.regionHit(p, excluding: v.removed)?.link
+        clickFocus = link.map { (v, p, $0) }
         if link == nil, let page = v.rendered?.page,
            page.graphics.contains(where: { $0.bounds.insetBy(-tolerance).contains(p) && $0.bounds.width < page.viewBox.width * 0.5 }) {
             // Something is there, but it can't lead back to the source.
@@ -347,7 +539,10 @@ private final class PageView: NSView {
             removed = []
             highlights = []
             badges = []
+            legendDrag = nil
+            legendCommitted = false
             needsDisplay = true
+            updateWork()
         }
     }
     private(set) var staves: [Staff] = []
@@ -358,8 +553,26 @@ private final class PageView: NSView {
     var badges: [(Rect, String)] = [] { didSet { needsDisplay = true } }
     var highlights: [Rect] = [] { didSet { if highlights != oldValue { needsDisplay = true } } }
     var lightsOut = false { didSet { needsDisplay = true } }
+    /// The region an agent is working on (page coordinates): outlined on a
+    /// layer of its own, so the pulse never redraws the music.
+    var working: [Rect] = [] { didSet { if working != oldValue { updateWork() } } }
+    private let workLayer = CAShapeLayer()
+    private var displayOptionsObserver: NSObjectProtocol?
+
+    /// The work region in view coordinates, padded like the outline.
+    var workBounds: NSRect? {
+        guard let first = working.first else { return nil }
+        return working.dropFirst().reduce(viewRect(for: first)) { $0.union(viewRect(for: $1)) }.insetBy(dx: -4, dy: -4)
+    }
     private var dragStart: NSPoint?
     private var dragRect: NSRect? { didSet { needsDisplay = true } }
+    var pageIndex: Int?
+    /// A legend drag: its handle, where it began, and what it makes so far
+    /// (kept, drawn, until the next engraving replaces the page).
+    var legendDrag: (handle: LegendArrangement.Handle, start: Point, outcome: LegendArrangement.Outcome?)? {
+        didSet { needsDisplay = true }
+    }
+    private var legendCommitted = false
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
@@ -368,6 +581,13 @@ private final class PageView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+        workLayer.isHidden = true
+        workLayer.zPosition = 1
+        layer?.addSublayer(workLayer)
+        displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateWork() }
+        }
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.55)
         shadow.shadowBlurRadius = 18
@@ -383,7 +603,52 @@ private final class PageView: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         let changed = newSize != frame.size
         super.setFrameSize(newSize)
-        if changed { needsDisplay = true }
+        if changed {
+            needsDisplay = true
+            updateWork()
+        }
+    }
+
+    /// The pulsing outline: the selection's own accent and shape, breathing
+    /// slowly (1.1 s each way) between full and faint. Reduce Motion: no
+    /// pulse, a dashed outline instead, so "working" still differs from
+    /// "selected". Increase Contrast: a heavier line and fill.
+    private func updateWork() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard !working.isEmpty else {
+            workLayer.removeAllAnimations()
+            workLayer.isHidden = true
+            return
+        }
+        let path = CGMutablePath()
+        for r in working {
+            path.addRoundedRect(in: viewRect(for: r).insetBy(dx: -4, dy: -4), cornerWidth: 4, cornerHeight: 4)
+        }
+        let ws = NSWorkspace.shared
+        let contrast = ws.accessibilityDisplayShouldIncreaseContrast
+        let still = ws.accessibilityDisplayShouldReduceMotion
+        workLayer.frame = bounds
+        workLayer.path = path
+        workLayer.fillColor = Theme.accent.withAlphaComponent(contrast ? 0.22 : 0.12).cgColor
+        workLayer.strokeColor = Theme.accent.cgColor
+        workLayer.lineWidth = contrast ? 2.5 : 1.75
+        workLayer.lineDashPattern = still ? [5, 3] : nil
+        workLayer.isHidden = false
+        if still {
+            workLayer.removeAnimation(forKey: "pondside.working")
+            workLayer.opacity = 1
+        } else if workLayer.animation(forKey: "pondside.working") == nil {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = contrast ? 0.55 : 0.3
+            pulse.duration = 1.1
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            workLayer.add(pulse, forKey: "pondside.working")
+        }
     }
 
     func crossFade() {
@@ -421,8 +686,24 @@ private final class PageView: NSView {
         ctx.translateBy(x: -vb.x, y: -vb.y)
         let visible = Rect(x: vb.x + dirtyRect.minX / s, y: vb.y + dirtyRect.minY / s,
                            width: dirtyRect.width / s, height: dirtyRect.height / s)
-        rendered.draw(in: ctx, visible: visible, excluding: removed)
+        let moves = legendDrag?.outcome?.moves ?? []
+        var moving: [(Graphic, PondsideEngrave.AffineTransform)] = []
+        if !moves.isEmpty {
+            for g in rendered.page.graphics {
+                let c = Point(g.bounds.midX, g.bounds.midY)
+                if let m = moves.first(where: { $0.region.contains(c) }) { moving.append((g, m.transform)) }
+            }
+        }
+        rendered.draw(in: ctx, visible: visible, excluding: moving.isEmpty ? removed : removed.union(moving.map(\.0)))
+        for (g, t) in moving {
+            ctx.saveGState()
+            ctx.concatenate(CGAffineTransform(a: t.a, b: t.b, c: t.c, d: t.d, tx: t.e, ty: t.f))
+            if let clip = g.clip { ctx.clip(to: CGRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height)) }
+            RenderedPage.draw(g, in: ctx)
+            ctx.restoreGState()
+        }
         ctx.restoreGState()
+        if let sheet = owner?.legendSheet(self) { drawLegendOverlay(sheet, in: ctx) }
 
         if lightsOut {
             // Display filter only: dims paper and ink alike, never exported.
@@ -506,11 +787,101 @@ private final class PageView: NSView {
         ctx.strokePath()
     }
 
+    /// The table's outline and columns, each example's crop edges and
+    /// scale corner, and while dragging the guides it snapped to and what
+    /// the crop hides. Accent on the paper; the music is never recoloured.
+    private func drawLegendOverlay(_ sheet: LegendArrangement.Sheet, in ctx: CGContext) {
+        let accent = Theme.accent
+        ctx.saveGState()
+        defer { ctx.restoreGState() }
+        let outcome = legendDrag?.outcome
+        for r in outcome?.hidden ?? [] {
+            ctx.setFillColor(Theme.paper.withAlphaComponent(0.82).cgColor)
+            ctx.fill(viewRect(for: r))
+        }
+        ctx.setLineWidth(1)
+        ctx.setStrokeColor(accent.withAlphaComponent(0.55).cgColor)
+        ctx.setLineDash(phase: 0, lengths: [4, 3])
+        ctx.stroke(viewRect(for: sheet.table).insetBy(dx: -3, dy: -3))
+        if let w = sheet.rows.compactMap(\.words).first {
+            let t = viewRect(for: sheet.table)
+            let x = viewRect(for: w).minX
+            ctx.move(to: CGPoint(x: x - 1, y: t.minY - 3))
+            ctx.addLine(to: CGPoint(x: x - 1, y: t.maxY + 3))
+            ctx.strokePath()
+        }
+        ctx.setLineDash(phase: 0, lengths: [])
+        for row in sheet.rows {
+            guard let e = row.example else { continue }
+            let r = viewRect(for: e)
+            ctx.setStrokeColor(accent.withAlphaComponent(0.35).cgColor)
+            ctx.stroke(r.insetBy(dx: -1, dy: -1))
+            // Crop edges: short bars at mid-height; scale: a corner square.
+            ctx.setFillColor(accent.cgColor)
+            for x in [r.minX, r.maxX] { ctx.fill(CGRect(x: x - 1.5, y: r.midY - 7, width: 3, height: 14)) }
+            ctx.fill(CGRect(x: r.maxX - 3.5, y: r.maxY - 3.5, width: 7, height: 7))
+        }
+        ctx.setStrokeColor(accent.cgColor)
+        ctx.setLineWidth(1)
+        for g in outcome?.guides ?? [] {
+            if g.axis == .vertical {
+                let x = viewRect(for: Rect(x: g.at, y: 0, width: 0, height: 0)).minX
+                ctx.move(to: CGPoint(x: x, y: 0)); ctx.addLine(to: CGPoint(x: x, y: bounds.height))
+            } else {
+                let y = viewRect(for: Rect(x: 0, y: g.at, width: 0, height: 0)).minY
+                ctx.move(to: CGPoint(x: 0, y: y)); ctx.addLine(to: CGPoint(x: bounds.width, y: y))
+            }
+        }
+        ctx.strokePath()
+        ctx.setLineDash(phase: 0, lengths: [2, 2])
+        let t = viewRect(for: sheet.table)
+        for g in outcome?.marks ?? [] where g.axis == .vertical {
+            let x = viewRect(for: Rect(x: g.at, y: 0, width: 0, height: 0)).minX
+            ctx.move(to: CGPoint(x: x, y: t.minY - 6)); ctx.addLine(to: CGPoint(x: x, y: t.maxY + 6))
+        }
+        ctx.strokePath()
+    }
+
+    private func legendHandle(at p: NSPoint) -> LegendArrangement.Handle? {
+        guard let owner, let sheet = owner.legendSheet(self), let legend = owner.legend else { return nil }
+        return legend.handle(at: pagePoint(p), on: sheet, tolerance: owner.legendTolerance(self))
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect], owner: self))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard owner?.legendArranging == true else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        switch legendHandle(at: p) {
+        case .some(let h) where h.isHorizontalResize: NSCursor.resizeLeftRight.set()
+        case .some(.rowGap): NSCursor.resizeUpDown.set()
+        case .some(.scale): NSCursor.crosshair.set()
+        case .some(.table): NSCursor.openHand.set()
+        default: NSCursor.arrow.set()
+        }
+    }
+
     override func mouseDown(with event: NSEvent) {
-        dragStart = convert(event.locationInWindow, from: nil)
+        let p = convert(event.locationInWindow, from: nil)
+        if !legendCommitted, let handle = legendHandle(at: p) {
+            if case .table = handle { NSCursor.closedHand.set() }
+            legendDrag = (handle, pagePoint(p), nil)
+            return
+        }
+        dragStart = p
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if let drag = legendDrag, let owner {
+            let p = pagePoint(convert(event.locationInWindow, from: nil))
+            legendDrag = (drag.handle, drag.start, owner.legendDrag(self, handle: drag.handle, from: drag.start, to: p, event: event))
+            autoscroll(with: event)
+            return
+        }
         guard let start = dragStart else { return }
         let p = convert(event.locationInWindow, from: nil)
         dragRect = NSRect(x: min(start.x, p.x), y: min(start.y, p.y), width: abs(p.x - start.x), height: abs(p.y - start.y))
@@ -518,6 +889,16 @@ private final class PageView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let drag = legendDrag, let owner {
+            if let outcome = drag.outcome {
+                // The preview stays until the engraving replaces the page.
+                legendCommitted = true
+                owner.onLegendCommit(outcome)
+            } else {
+                legendDrag = nil
+            }
+            return
+        }
         defer { dragStart = nil; dragRect = nil }
         guard let owner else { return }
         if let r = dragRect, r.width > 4 || r.height > 4 {
@@ -539,3 +920,41 @@ enum PathMatching {
         return ra == rb
     }
 }
+
+/// A small spinner on the work region's corner, on the app's chrome (solid,
+/// so Reduce Transparency changes nothing). Its words are for VoiceOver and
+/// the tooltip; the status bar shows them too.
+@MainActor
+private final class WorkBadge: NSView {
+    init(label: String) {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.backgroundColor = Theme.chrome.cgColor
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.borderColor = Theme.accent.cgColor
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isIndeterminate = true
+        spinner.startAnimation(nil)
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(spinner)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: centerXAnchor), spinner.centerYAnchor.constraint(equalTo: centerYAnchor),
+            widthAnchor.constraint(equalToConstant: 20), heightAnchor.constraint(equalToConstant: 20),
+            spinner.widthAnchor.constraint(equalToConstant: 14), spinner.heightAnchor.constraint(equalToConstant: 14),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.progressIndicator)
+        setAccessibilityLabel(label)
+        toolTip = "\(label): the outlined music is being changed. ⌘⌥. stops it."
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// Clicks go through to the page: the badge is information, not a control.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+

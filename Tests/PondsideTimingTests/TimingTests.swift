@@ -125,3 +125,36 @@ final class CueSheetTests: XCTestCase {
         XCTAssertEqual(CueSheet.handlerName("fx swell"), "fx_swell")
     }
 }
+
+/// `pondside cues --format ec`: the `~ec` arrays patches have always
+/// loaded from piece.ec.scd, from Pondside's own timing.
+final class CollectionsTests: XCTestCase {
+    func testCollectionsOnOneStaffWithTheirCue() {
+        let log = TimingLog(rows: [
+            .init(moment: Rational(0), bar: 1, kind: .tempo(quartersPerMinute: 60)),
+            .init(moment: Rational(0), bar: 1, kind: .text("cue 1")),
+            .init(moment: Rational(1), bar: 2, kind: .group(staff: "elecUp", start: true)),
+            .init(moment: Rational(1), bar: 2, kind: .note(staff: "elecUp", midi: 62)),
+            .init(moment: Rational(1), bar: 2, kind: .note(staff: "elecUp", midi: 60)),
+            .init(moment: Rational(1), bar: 2, kind: .note(staff: "flute", midi: 79)),
+            .init(moment: Rational(1), bar: 2, kind: .note(staff: "elecUp", midi: 74)),
+            .init(moment: Rational(1), bar: 2, kind: .group(staff: "elecUp", start: false)),
+        ])
+        let found = Collections.find(in: log, staff: "elecUp")
+        XCTAssertEqual(found.map(\.midi), [[62, 60, 74]])
+        XCTAssertEqual(found.first?.pitchClasses, [0, 2])
+        XCTAssertEqual(Collections.scd(found, staff: "elecUp", score: "s.ly"), """
+        // Collections on staff elecUp, from s.ly (pondside cues --format ec):
+        // pitch classes ascending from C; each line: index: bar, time, last cue: the notes as written.
+        ~ec = [
+        \t[0, 2]    // 0: bar 2, 4.0 s, cue 1: D C D
+        ];
+        // where each one is in the score (seconds at the render's tempo; cue: the last cue
+        // at or before it), e.g. to check that the patch plays it in that cue's window
+        ~ecWhere = [
+        \t(bar: 2, time: 4.000, cue: "cue 1")
+        ];
+
+        """)
+    }
+}

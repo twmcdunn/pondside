@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 import PondsideEngrave
 import PondsideTiming
+import PondsideCore
 @testable import PondsideLexicon
 
 final class TOMLTests: XCTestCase {
@@ -362,6 +363,58 @@ final class LexiconEngravingTests: XCTestCase {
     }
 }
 
+/// front-matter.ily as Score Setup writes it: a cover from the header,
+/// notes, and a legend drawing real Lexicon entries, before the score.
+final class FrontMatterEngravingTests: XCTestCase {
+    func testFrontMatterEngravesAndItsExamplesTakeNoTime() async throws {
+        let installs = await ToolchainDetector().detectLilyPond()
+        guard let lily = ToolchainDetector.select(from: installs, for: nil) else { throw XCTSkip("LilyPond not installed") }
+        let lex = Lexicon.load(Lexicon.standardScopes(project: nil).filter { $0.0 == .core })
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-front-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        try lex.includeFile(for: ["air-tone", "grain-cloud"]).write(to: dir.appendingPathComponent("lexicon.ily"), atomically: true, encoding: .utf8)
+
+        var fm = FrontMatter(FrontMatter.template(Set(FrontMatter.Section.allCases)))
+        fm = FrontMatter(fm.edits(paragraphs: ["Play without pause; \"quotes\" survive.", "A second paragraph."]).apply(to: fm.text))
+        let items = try ["air-tone", "grain-cloud"].map { try XCTUnwrap(lex.entries[$0]?.entry).legendItem }
+        fm = FrontMatter(fm.edits(adding: items).apply(to: fm.text))
+        try fm.text.write(to: dir.appendingPathComponent(FrontMatter.fileName), atomically: true, encoding: .utf8)
+
+        var root = """
+        \\version "2.24.0"
+        \\include "lexicon.ily"
+        \\header { title = "Pond" composer = "T. M." instrumentation = "Flute, Cello" }
+        \\score { <<
+          \\new Staff \\with { instrumentName = "Flute" } \\relative c'' { \\tempo 4 = 60 c4 \\lexicon "air-tone" #'() { d2 e } }
+          \\new Staff { c1 c }
+        >> \\layout { } }
+
+        """
+        root = [FrontMatter.includeEdit(root: root)!].apply(to: root)
+        let setup = StaffSetup(files: [root])
+        root = (setup.edits(staff: 1, .init(instrument: try XCTUnwrap(Instrument.named("cello"))))[0] ?? []).apply(to: root)
+        XCTAssert(root.contains(#"\clef bass"#), root)
+        let file = dir.appendingPathComponent("score.ly")
+        try root.write(to: file, atomically: true, encoding: .utf8)
+
+        let result = try await LilyPondEngraver(installation: lily).engrave(file, purpose: .canvas, outputDirectory: dir.appendingPathComponent("out"))
+        XCTAssertTrue(result.succeeded, result.log)
+        XCTAssertTrue(result.errors.isEmpty, result.log)
+        let warnings = result.diagnostics.filter { d in
+            d.severity == .warning && [FrontMatter.fileName, "score.ly"].contains { d.file?.hasSuffix($0) == true }
+        }
+        XCTAssertTrue(warnings.isEmpty, "\(warnings.map { "\($0.file ?? ""):\($0.line ?? 0): \($0.message)" })")
+        // Cover, notes, legend, then the score.
+        XCTAssertEqual(result.outputFiles.count, 4, result.log)
+
+        // The legend's air-tone example is drawn, but only the score's own cue is timed.
+        let sheet = CueSheet(log: try await TimingDump.run(lily, source: file), score: "score.ly")
+        XCTAssertEqual(sheet.cues.map(\.name), ["airTone"])
+        XCTAssertEqual(sheet.cues.first?.seconds ?? 0, 1, accuracy: 1e-6)
+    }
+}
+
 final class ProjectConfigTests: XCTestCase {
     func testFindsTheNearestConfigAbove() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-proj-\(UUID().uuidString)")
@@ -401,5 +454,123 @@ final class ProjectConfigTests: XCTestCase {
         let config = try ProjectConfig.find(from: dir.appendingPathComponent("x.ly"))
         XCTAssertEqual(config.sampleRate, 48000)
         XCTAssertNil(config.handlers)
+    }
+}
+
+/// The skills Pondside serves agree with what Pondside writes: every file a
+/// skill names exists in it, and the SuperCollider skill describes the cue
+/// file the mockup actually writes.
+final class SkillConsistencyTests: XCTestCase {
+    private var skills: URL { Lexicon.coreDirectory!.appendingPathComponent("Skills") }
+
+    func testEveryFileASkillNamesIsBundledWithIt() throws {
+        let folders = try FileManager.default.contentsOfDirectory(atPath: skills.path).filter { !$0.hasPrefix(".") }
+        XCTAssertFalse(folders.isEmpty)
+        let pattern = try NSRegularExpression(pattern: #"`((?:assets|templates|references|scripts|sc)/[A-Za-z0-9_./-]+)`"#)
+        for folder in folders {
+            let dir = skills.appendingPathComponent(folder)
+            let text = try String(contentsOf: dir.appendingPathComponent("SKILL.md"), encoding: .utf8)
+            for m in pattern.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+                let path = String(text[Range(m.range(at: 1), in: text)!])
+                XCTAssertTrue(FileManager.default.fileExists(atPath: dir.appendingPathComponent(path).path),
+                              "\(folder)/SKILL.md names \(path), which isn't in the skill")
+            }
+        }
+    }
+
+    /// The skills describe front-matter.ily as Score Setup writes it.
+    func testTheSkillsDescribePondsidesFrontMatter() throws {
+        let graphic = try String(contentsOf: skills.appendingPathComponent("graphic-notation/SKILL.md"), encoding: .utf8)
+        let lily = try String(contentsOf: skills.appendingPathComponent("lilypond/SKILL.md"), encoding: .utf8)
+        var fm = FrontMatter(FrontMatter.template(Set(FrontMatter.Section.allCases)))
+        fm = FrontMatter(fm.edits(adding: [.init(id: "wedge", title: "Wedge", text: "x", example: "\\null")]).apply(to: fm.text))
+        for written in ["%% legend: wedge", "\\markup \\pondside-legend-item \"Wedge\"", "%% ---- legend", "\\markuplist \\pondside-paragraphs #'("] {
+            XCTAssertTrue(fm.text.contains(written), written)
+        }
+        XCTAssertTrue(graphic.contains("`%% legend: <entry-id>`") && graphic.contains("\\pondside-legend-item") && graphic.contains("`front-matter.ily`"))
+        XCTAssertTrue(lily.contains("`%% ---- cover`") && lily.contains("\\pondside-paragraphs #'(") && lily.contains("`front-matter.ily`"))
+        XCTAssertEqual(FrontMatter.fileName, "front-matter.ily")
+        for (key, _) in FrontMatter.headerFields { XCTAssertTrue(lily.contains("`\(key)`"), key) }
+    }
+
+    func testTheSuperColliderSkillDescribesPondsidesCueFile() throws {
+        let text = try String(contentsOf: skills.appendingPathComponent("lilypond-supercollider/SKILL.md"), encoding: .utf8)
+        XCTAssertTrue(text.contains("`seconds<TAB>bar<TAB>cue N`"))
+        let log = TimingLog(rows: [.init(moment: Rational(1, 2), bar: 2, kind: .text("cue 12"))])
+        XCTAssertEqual(CueSheet(log: log, score: "s.ly").cuesText, "2.000\t2\tcue 12\n")
+        // The patch Pondside starts reads <name>.cues and plays <name>.wav: what the mockup writes.
+        XCTAssertTrue(text.contains("`renders/score.cues`"))
+        XCTAssertTrue(text.contains(#"`~cue[\cue12] = { |cue| … };`"#))
+        let engine = HandlerSync.engine(name: "score")
+        XCTAssertTrue(engine.contains(#"e[\renders] +/+ e[\name] ++ ".cues""#) && engine.contains(#"e[\renders] +/+ e[\name] ++ ".wav""#))
+        for legacy in ["timing.ily\"", "lily_timing.py ", "export_piece.sh ", "~scoreSync"] {
+            XCTAssertFalse(text.contains("`" + legacy), "the skill must not set up a second timing pipeline (\(legacy))")
+        }
+    }
+}
+
+/// The SuperCollider Lexicon's entries load, document every param their
+/// code uses, and compile in sclang (skipped without SuperCollider).
+final class SCLexiconTests: XCTestCase {
+    func testEveryEntryLoadsWithItsParams() throws {
+        let lex = SCLexicon.load(project: nil)
+        let dir = try XCTUnwrap(SCLexicon.coreDirectory).appendingPathComponent("entries")
+        let folders = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { !$0.hasPrefix(".") }
+        XCTAssertEqual(Set(lex.ids), Set(folders), "every folder is an entry named by its id")
+        XCTAssertGreaterThanOrEqual(lex.ids.count, 14)
+        for id in lex.ids {
+            let e = try XCTUnwrap(lex.entries[id])
+            XCTAssertFalse(e.gloss.isEmpty || e.usage.isEmpty || e.readme.isEmpty, id)
+            for r in e.requires { XCTAssertNotNil(lex.entries[r], "\(id) requires \(r)") }
+            if e.kind == "effect" {
+                XCTAssertTrue(e.impl.hasPrefix("~lxFx[\\\(e.name)] = (defaults: ("), id)
+                for p in e.params { XCTAssertTrue(e.impl.contains("\(p.name): \(p.defaultValue)"), "\(id).\(p.name)") }
+            }
+        }
+        XCTAssertEqual(lex.closure(["cloud"]), ["grain", "pitches", "glide", "cloud"])
+        XCTAssertEqual(lex.search("echo").first?.hasPrefix("feedback-delay"), true)
+        XCTAssertTrue(lex.describe("reverb")?.contains("\\lx_reverb_mono") ?? false)
+    }
+
+    func testTheIncludeCompilesInSclang() throws {
+        let candidates = ["/Applications/SuperCollider.app/Contents/MacOS/sclang", "/usr/local/bin/sclang", "/usr/bin/sclang"]
+        guard let sclang = candidates.first(where: FileManager.default.isExecutableFile(atPath:)) else {
+            throw XCTSkip("SuperCollider isn't installed")
+        }
+        let lex = SCLexicon.load(project: nil)
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-sclex-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let include = dir.appendingPathComponent("sc-lexicon.scd")
+        try lex.includeFile(for: lex.ids).write(to: include, atomically: true, encoding: .utf8)
+        let defs = lex.ids.compactMap { lex.entries[$0] }.flatMap { e -> [String] in
+            e.kind == "effect" ? ["\\lx_\(e.name)", "\\lx_\(e.name)_mono"] : e.kind == "synth" ? ["\\lx_\(e.name)"] : []
+        }
+        let script = dir.appendingPathComponent("t.scd")
+        try """
+        (
+        var ok = true;
+        try { "\(include.path)".load } { |e| ("PONDSIDE-FAIL load " ++ e.errorString).postln; ok = false };
+        [\(defs.joined(separator: ", "))].do { |n| if(SynthDescLib.global[n].isNil) { ("PONDSIDE-FAIL no " ++ n).postln; ok = false } };
+        try { ~lx[\\cloud].([0, 3, 7], ~lx[\\glide].(2, 30, 10)).asStream.next(Event.default).isNil.if { ok = false } } { |e| ("PONDSIDE-FAIL cloud " ++ e.errorString).postln; ok = false };
+        try { ~lx[\\density].(2, 20, 5).asStream.nextN(3) } { |e| ("PONDSIDE-FAIL density " ++ e.errorString).postln; ok = false };
+        (if(ok) { "PONDSIDE-OK" } { "PONDSIDE-FAILED" }).postln;
+        0.exit;
+        )
+        """.write(to: script, atomically: true, encoding: .utf8)
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: sclang)
+        p.arguments = [script.path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        try p.run()
+        let deadline = Date().addingTimeInterval(60)
+        var output = Data()
+        while p.isRunning, Date() < deadline { output.append(pipe.fileHandleForReading.availableData) }
+        if p.isRunning { p.terminate() }
+        output.append(pipe.fileHandleForReading.readDataToEndOfFile())
+        let text = String(decoding: output, as: UTF8.self)
+        XCTAssertTrue(text.contains("PONDSIDE-OK"), text.split(separator: "\n").filter { $0.contains("PONDSIDE") || $0.contains("ERROR") }.joined(separator: "\n"))
     }
 }

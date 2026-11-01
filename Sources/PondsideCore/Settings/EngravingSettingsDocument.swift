@@ -41,7 +41,7 @@ public struct EngravingSettingsDocument: Sendable {
     public func value(of setting: EngravingSetting) -> Found {
         let mine = rootStatements(for: setting)
         let elsewhere = elsewhereStatements(for: setting)
-        if !mine.isEmpty, let v = setting.parse(dictionary(mine)) {
+        if !mine.isEmpty, let v = setting.parse(dictionary(mine, extraKeys: setting.keys + setting.readKeys)) {
             return Found(value: v, inRoot: true, elsewhere: elsewhere)
         }
         // The last statement elsewhere is the one LilyPond would read last.
@@ -55,6 +55,32 @@ public struct EngravingSettingsDocument: Sendable {
 
     public var values: [String: Found] {
         Dictionary(uniqueKeysWithValues: EngravingSetting.all.map { ($0.id, value(of: $0)) })
+    }
+
+    // MARK: Header fields
+
+    /// A top-level `\header` field, such as the cover page reads.
+    public struct HeaderField: Sendable, Hashable {
+        public var value: String
+        /// A plain string Pondside can rewrite; false for `\markup` or Scheme.
+        public var editable: Bool
+        /// Where another file sets it, when the root does not.
+        public var elsewhere: Where?
+    }
+
+    public func headerField(_ key: String) -> HeaderField {
+        let setting = EngravingSetting.headerText(key)
+        let found = value(of: setting)
+        let raw = found.value.choice ?? ""
+        if raw.hasPrefix(EngravingSetting.rawMarker) {
+            return HeaderField(value: String(raw.dropFirst()), editable: false, elsewhere: found.inRoot ? nil : found.elsewhere.last)
+        }
+        return HeaderField(value: raw, editable: true, elsewhere: found.inRoot ? nil : found.elsewhere.last)
+    }
+
+    /// Sets a `\header` field to a string; an empty one removes it.
+    public func edits(headerField key: String, to value: String) -> [TextEdit] {
+        edits(setting: EngravingSetting.headerText(key), to: .choice(value))
     }
 
     // MARK: Writing
@@ -104,8 +130,10 @@ public struct EngravingSettingsDocument: Sendable {
         while suffix < old.count - prefix, suffix < new.count - prefix,
               old[old.count - 1 - suffix] == new[new.count - 1 - suffix] { suffix += 1 }
         // Keep the edit on character boundaries.
-        while prefix > 0, old[prefix] & 0xC0 == 0x80 { prefix -= 1 }
-        while suffix > 0, old[old.count - suffix] & 0xC0 == 0x80 { suffix -= 1 }
+        // (At the very end of either text there is no byte to look at.)
+        func continues(_ bytes: [UInt8], _ i: Int) -> Bool { i < bytes.count && bytes[i] & 0xC0 == 0x80 }
+        while prefix > 0, continues(old, prefix) || continues(new, prefix) { prefix -= 1 }
+        while suffix > 0, continues(old, old.count - suffix) || continues(new, new.count - suffix) { suffix -= 1 }
         let replacement = String(decoding: new[prefix..<(new.count - suffix)], as: UTF8.self)
         return [TextEdit(prefix..<(old.count - suffix), replacement)]
     }
@@ -125,6 +153,22 @@ public struct EngravingSettingsDocument: Sendable {
 
     private static let blockNames: Set<String> = ["paper", "header", "layout", "score", "context", "book", "bookpart",
                                                   "midi", "with"]
+
+    /// Whether `text` asks for MIDI itself: a `\midi` block inside a
+    /// `\score` (a top-level `\midi` only sets defaults).
+    public static func writesMIDI(_ text: String) -> Bool {
+        guard text.contains("\\midi") else { return false }
+        let blocks = findBlocks(in: SyntaxTree(text))
+        return blocks.contains { block in
+            guard block.name == "midi" else { return false }
+            var parent = block.parent
+            while let p = parent {
+                if blocks[p].name == "score" { return true }
+                parent = blocks[p].parent
+            }
+            return false
+        }
+    }
 
     static func findBlocks(in tree: SyntaxTree) -> [Block] {
         var leaves: [SyntaxNode] = []
@@ -261,10 +305,10 @@ public struct EngravingSettingsDocument: Sendable {
         return end
     }
 
-    private func dictionary(_ statements: [Statement]) -> [String: String] {
+    private func dictionary(_ statements: [Statement], extraKeys: [String] = []) -> [String: String] {
         var result: [String: String] = [:]
         for s in statements {
-            for key in EngravingSetting.all.flatMap({ $0.keys + $0.readKeys }) where Self.starts(s.text, with: key) {
+            for key in EngravingSetting.all.flatMap({ $0.keys + $0.readKeys }) + extraKeys where Self.starts(s.text, with: key) {
                 result[key] = s.text
             }
         }

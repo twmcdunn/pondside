@@ -8,9 +8,12 @@ is a disposable cache of each score's latest engraving
 shown on reopen while LilyPond engraves afresh.
 
 Read `docs/DESIGN.md` before planning work: §0 has the principles, §7–8
-the graphics kit and the agent workflow, §9 what remains. CLI, MCP,
+the graphics kit and the agent workflow, §9 what remains, §11 Score
+Setup (staves, and the cover/notes/legend in `front-matter.ily`). CLI, MCP,
 `cues.json`, `pondside.toml` and the RPC socket are documented in
-`docs/API.md`. Pondside also keeps checkpoints of a score's files in a git
+`docs/API.md`; test coverage, gaps and the planned agent smoke test in
+`docs/TESTING.md`; the SuperCollider patch, its offline render and patch
+migration in `docs/SUPERCOLLIDER.md`. Pondside also keeps checkpoints of a score's files in a git
 repository of its own under `~/Library/Application Support/Pondside/History`
 (never the user's repo).
 
@@ -18,7 +21,15 @@ Graphic notation is Lexicon entries on the graphics kit
 (`Sources/PondsideLexicon/Core/Lexicon/kit/pondside-graphics.ily`); the
 skills agents follow are in `Sources/PondsideLexicon/Core/Skills/` and are
 served by `pondside mcp`. A new graphic entry needs a compile check: render
-it (the lexicon engraving tests do) and look at it.
+it (the lexicon engraving tests do) and look at it. The SuperCollider
+Lexicon (effects and pattern parts for the patch agent) is
+`Sources/PondsideLexicon/Core/SCLexicon/entries/<id>/` (`entry.toml`,
+`impl.scd`, `README.md`); `SCLexiconTests` compiles every entry in sclang.
+The lens has two agents, the score's and the patch's, each with its own
+MCP role (`pondside mcp --role graphics|patch`, docs/API.md). Skills must describe the
+files Pondside writes (cue file, mockup, handlers, `lexicon.ily`), never a
+parallel pipeline: change both together (docs/API.md, "Skills and the files
+Pondside writes"; `SkillConsistencyTests`).
 
 ## Commands
 
@@ -30,6 +41,7 @@ swift test                       # engraving tests skip without LilyPond
 swift test --filter PondsideCoreTests/KeyboardAuditTests
 swift run pondside check score.ly
 scripts/make-app.sh debug        # .build/Pondside.app (macOS only)
+scripts/make-installer.sh        # .build/Pondside-<v>-<arch>.pkg; pins in scripts/installer/versions.env
 open .build/Pondside.app --args "$PWD/path/to/score.ly"   # open runs the app from /
 ```
 

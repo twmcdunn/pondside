@@ -9,6 +9,7 @@ public enum InstallOrigin: String, Sendable, Codable, CaseIterable {
     case macports
     case application   // a .app bundle in /Applications or ~/Applications
     case managed       // Pondside's own managed directory
+    case bundled       // installed by the Pondside installer (BundledToolchain)
     case other
 }
 
@@ -27,14 +28,38 @@ public struct LilyPondInstallation: Hashable, Sendable, Codable {
     }
 }
 
+/// Where the Pondside installer puts the tools it bundles: a pinned
+/// LilyPond tarball, a static fluidsynth and a General MIDI SoundFont. Kept
+/// outside Pondside.app so optional components never break its signature.
+public enum BundledToolchain {
+#if os(macOS)
+    public static let directory: String? = "/Library/Application Support/Pondside/Toolchain"
+#else
+    public static let directory: String? = nil
+#endif
+
+    public static func fluidSynth(in directory: String? = directory) -> String? {
+        directory.map { "\($0)/fluidsynth/bin/fluidsynth" }
+            .flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil }
+    }
+
+    public static func soundFont(in directory: String? = directory) -> URL? {
+        directory.map { URL(fileURLWithPath: "\($0)/soundfonts/GeneralUser-GS.sf2") }
+            .flatMap { FileManager.default.fileExists(atPath: $0.path) ? $0 : nil }
+    }
+}
+
 /// Finds LilyPond installations without installing anything.
 public struct ToolchainDetector: Sendable {
     public var environment: [String: String]
     public var managedDirectory: String?
+    public var bundledDirectory: String?
 
-    public init(environment: [String: String] = ProcessInfo.processInfo.environment, managedDirectory: String? = nil) {
+    public init(environment: [String: String] = ProcessInfo.processInfo.environment, managedDirectory: String? = nil,
+                bundledDirectory: String? = BundledToolchain.directory) {
         self.environment = environment
         self.managedDirectory = managedDirectory
+        self.bundledDirectory = bundledDirectory
     }
 
     /// Candidate executables in priority order, with their origin.
@@ -42,6 +67,12 @@ public struct ToolchainDetector: Sendable {
         var out: [(path: String, origin: InstallOrigin)] = []
         if let override = environment["PONDSIDE_LILYPOND"], !override.isEmpty {
             out.append((override, .other))
+        }
+        // The installer's copy is the version Pondside was tested with.
+        if let bundledDirectory {
+            for name in ((try? FileManager.default.contentsOfDirectory(atPath: bundledDirectory)) ?? []).sorted() where name.hasPrefix("lilypond-") {
+                out.append(("\(bundledDirectory)/\(name)/bin/lilypond", .bundled))
+            }
         }
         for dir in (environment["PATH"] ?? "").split(separator: ":") where !dir.isEmpty {
             out.append(("\(dir)/lilypond", .path))

@@ -2,6 +2,7 @@ import Foundation
 import PondsideCore
 import PondsideEngrave
 import PondsideLexicon
+import PondsideTiming
 
 /// Putting a graphic into a score, and what it needs to compile: the
 /// minimal edits an agent's `graphic_insert` makes (DESIGN.md §8).
@@ -31,6 +32,49 @@ public enum GraphicEdit {
             TextEdit.insert("\\startGraphic \"\(id)\" #\(quoted)", at: tree.events[s].range.upperBound),
             TextEdit.insert("\\stopGraphic", at: tree.events[e].range.upperBound),
         ]
+        return edits.apply(to: text)
+    }
+
+    /// The same, stopping at a moment (whole notes from the start of the
+    /// staff's music: a cue's `position.moment`) rather than on an event.
+    /// A skip the moment falls inside is split in two, `s1*a` and
+    /// `s1*b\stopGraphic`, its own post-events staying on the first part.
+    public static func insert(into text: String, id: String, params: String,
+                              start: (line: Int, character: Int), stopMoment: Rational) throws -> String {
+        let tree = SyntaxTree(text)
+        guard let s = event(tree, text, start) else { throw Failure("start must be on a note, rest or skip") }
+        guard let block = LensBlockFinder.block(in: tree, at: tree.events[s].range.lowerBound),
+              let moments = ScoreGraphic.moments(of: block, in: tree) else {
+            throw Failure("can't count moments in this staff's music (tuplets, repeats, grace notes or voices): give stop_line and stop_character")
+        }
+        guard let startMoment = moments[s], stopMoment > startMoment else {
+            throw Failure("the graphic must stop after it starts (it starts at moment \(moments[s]?.description ?? "?"))")
+        }
+        guard let e = block.events.sorted().first(where: { e in
+            let (n, d) = tree.events[e].effectiveDuration.wholeNotes
+            return moments[e]! <= stopMoment && stopMoment < moments[e]! + Rational(n, d)
+        }) else {
+            throw Failure("moment \(stopMoment) is past the end of this staff's music")
+        }
+        let alist = params.trimmingCharacters(in: .whitespaces).isEmpty ? "'()" : params.trimmingCharacters(in: .whitespaces)
+        let quoted = alist.hasPrefix("'") ? alist : "'" + alist
+        let startCommand = "\\startGraphic \"\(id)\" #\(quoted)"
+        let ev = tree.events[e]
+        if moments[e]! == stopMoment {
+            return [TextEdit.insert(startCommand, at: tree.events[s].range.upperBound),
+                    .insert("\\stopGraphic", at: ev.range.upperBound)].apply(to: text)
+        }
+        guard ev.kind == .spacer else {
+            throw Failure("moment \(stopMoment) falls inside \(tree.string(ev.range)); stop on an event instead")
+        }
+        let (n, d) = ev.effectiveDuration.wholeNotes
+        let before = stopMoment - moments[e]!, after = moments[e]! + Rational(n, d) - stopMoment
+        func skip(_ r: Rational) -> String { "s1*" + r.description }
+        let end = ev.postEvents.last?.upperBound ?? ev.range.upperBound
+        // Starting and stopping in one skip: the start goes on its first part.
+        let first = skip(before) + (e == s ? startCommand : "")
+        var edits = [TextEdit(ev.range, first), .insert(" \(skip(after))\\stopGraphic", at: end)]
+        if e != s { edits.append(.insert(startCommand, at: tree.events[s].range.upperBound)) }
         return edits.apply(to: text)
     }
 

@@ -19,8 +19,21 @@ public actor MCPServer {
     /// project folder (the working directory unless told otherwise).
     let project: URL
 
-    public init(project: URL) {
+    /// Which agent the server serves, when Pondside started it for one:
+    /// each sees only its own tools and instructions, and edits only its
+    /// own files (the score's, or the patch's), so the two never collide.
+    public enum Role: String, Sendable {
+        /// The lens's requests about the score (graphics, notation): `.ly`/`.ily` only.
+        case graphics
+        /// The patch agent: the SuperCollider patch and its doc only.
+        case patch
+    }
+
+    let role: Role?
+
+    public init(project: URL, role: Role? = nil) {
         self.project = project
+        self.role = role
     }
 
     // MARK: Transport
@@ -72,42 +85,50 @@ public actor MCPServer {
     func dispatch(_ method: String, _ params: JSONValue) async throws -> JSONValue {
         switch method {
         case "initialize":
+            if let run = AgentLog.inheritedRun() {
+                let client = params["clientInfo"]?["name"]?.string ?? "?"
+                run.log("mcp", "pondside mcp started for \(client) in \(project.lastPathComponent) (process \(ProcessInfo.processInfo.processIdentifier))",
+                        level: .debug)
+            }
             let asked = params["protocolVersion"]?.string ?? Self.supportedProtocols[0]
             let version = Self.supportedProtocols.contains(asked) ? asked : Self.supportedProtocols[0]
             return [
                 "protocolVersion": .string(version),
                 "capabilities": ["tools": [:], "resources": [:], "prompts": [:]],
                 "serverInfo": ["name": .string(Self.serverName), "version": .string(Self.serverVersion)],
-                "instructions": """
-                Pondside scores are plain LilyPond files: read and edit them directly. Use these tools to \
-                check that a score compiles (check), list its notes with exact positions (query), render it, \
-                time its electronics cues (cues), and validate \\lexicon uses. Browse the Lexicon through \
-                resources: lexicon://index first (one line per entry), then lexicon://entry/{id}, and \
-                lexicon://impl/{id} only when adapting an implementation. For graphic notation (textures, \
-                grains, ripples, wedges, swells, contours) read the skill lexicon://guide/graphics first and \
-                follow it: score_context to learn what "here" means, lexicon_search, graphic_preview, \
-                graphic_insert. Only if the user rejects every combination of existing entries, read \
-                lexicon://guide/entries and write a new entry with lexicon_propose (a draft the user accepts).
-                """,
+                "instructions": .string(role == .patch ? Self.patchInstructions : Self.instructions),
             ]
         case "ping", "notifications/initialized", "notifications/cancelled":
             return [:]
         case "tools/list":
-            return ["tools": .array(Self.tools.map(\.json))]
+            return ["tools": .array(Self.tools(for: role).map(\.json))]
         case "tools/call":
             guard let name = params["name"]?.string else { throw RPCError(code: -32602, message: "tools/call needs a name") }
             let args = params["arguments"] ?? [:]
+            // In a run Pondside started, each call goes into its log with its time.
+            let run = AgentLog.inheritedRun()
+            let started = Date()
+            func logged(_ text: String, failed: Bool) {
+                guard let run else { return }
+                let ms = Date().timeIntervalSince(started) * 1000
+                run.log("mcp", String(format: "%@ %@ in %.0f ms", name, failed ? "failed" : "answered", ms),
+                        level: failed ? .warning : .info,
+                        detail: "arguments: \(args.jsonString())\n\n" + text)
+            }
             do {
                 let text = try await callTool(name, args)
+                logged(text, failed: false)
                 return ["content": [["type": "text", "text": .string(text)]], "isError": false]
             } catch let e as RPCError {
+                logged(e.message, failed: true)
                 throw e
             } catch {
+                logged("\(error)", failed: true)
                 // Tool failures are results the model should see, not protocol errors.
                 return ["content": [["type": "text", "text": .string("\(error)")]], "isError": true]
             }
         case "prompts/list":
-            return ["prompts": .array(Self.skills.map { s in
+            return ["prompts": .array(Self.skills.map { s -> JSONValue in
                 ["name": .string(s.prompt), "description": .string(s.description)]
             })]
         case "prompts/get":
@@ -136,9 +157,11 @@ public actor MCPServer {
             return ["resourceTemplates": [
                 ["uriTemplate": "lexicon://entry/{id}", "name": "Lexicon entry (tier 1)", "mimeType": "text/markdown"],
                 ["uriTemplate": "lexicon://impl/{id}", "name": "Lexicon implementation (tier 2)", "mimeType": "text/x-lilypond"],
+                ["uriTemplate": "skill://{skill}/{path}", "name": "A file of a skill (library, reference, script)", "mimeType": "text/plain"],
             ]]
         case "resources/read":
             guard let uri = params["uri"]?.string else { throw RPCError(code: -32602, message: "resources/read needs a uri") }
+            AgentLog.inheritedRun()?.log("mcp", "read resource \(uri)", level: .debug)
             let (text, mime) = try readResource(uri)
             return ["contents": [["uri": .string(uri), "mimeType": .string(mime), "text": .string(text)]]]
         default:
@@ -156,6 +179,14 @@ public actor MCPServer {
         if let skill = Self.skills.first(where: { $0.uri == uri }), let text = Self.skillText(skill) {
             return (text, "text/markdown")
         }
+        if uri.hasPrefix("skill://") {
+            let parts = uri.dropFirst("skill://".count).split(separator: "/", maxSplits: 1).map(String.init)
+            if parts.count == 2, let skill = Self.skills.first(where: { $0.folder == parts[0] }),
+               let text = Self.skillFile(skill, parts[1]) {
+                return (text, parts[1].hasSuffix(".md") ? "text/markdown" : "text/plain")
+            }
+            throw RPCError(code: -32002, message: "no skill file \(uri)")
+        }
         for (prefix, tier) in [("lexicon://entry/", 1), ("lexicon://impl/", 2)] where uri.hasPrefix(prefix) {
             let id = String(uri.dropFirst(prefix.count))
             if let text = tier == 1 ? lex.tier1(id) : lex.tier2(id) {
@@ -166,11 +197,49 @@ public actor MCPServer {
         throw RPCError(code: -32002, message: "unknown resource \(uri)")
     }
 
+    /// What every client is told first. Short on purpose: the skills hold
+    /// the detail, and the user wants terse, fast turns.
+    static let instructions = """
+    Pondside scores are plain LilyPond files: read and edit them directly; the running app re-engraves on \
+    every save. Be terse: act, then reply in one short line saying what changed ("Swell taller: peak \
+    1.06 → 1.5."). No plans, recaps, options or offers; ask only when the score can't settle it.
+    "Here", "this", "till 7" and the like refer to the user's click: call score_context with no arguments \
+    first (a request from the lens already includes it). It returns the selected event or graphic, its staff's music, bar and moment, every cue (bar, \
+    moment, seconds), and for a graphic drawn by the score's own code its definition and drawing procedure.
+    For graphic notation follow lexicon://guide/graphics. Edit with the edit tool (exact text, or lines as the \
+    context numbers them; no need to read the file first): it returns the app's engraving of the change, so \
+    no separate check. Make the change big enough to see at a glance.
+    Cue times, the mockup and SuperCollider handlers are Pondside's (cues, `pondside mockup`, `pondside \
+    handlers`): never set up a second timing pipeline (skill://lilypond-supercollider). A patch with \
+    `// pondside:` marks, or a request to migrate one: skill://sc-patch-migration. When something goes wrong \
+    that the user must know, call warn_user; when you can't go on without their choice, ask_user (a dialog).
+    Other skills, read only when needed: skill://lilypond (writing, spacing, debugging LilyPond), \
+    skill://lilypond-contemporary-notation, skill://lilypond-electronics-staff; lexicon://guide/entries only \
+    when no existing entry or combination will do. Lexicon: lexicon://index, lexicon://entry/{id}, \
+    lexicon://impl/{id}; a skill's files are skill://<skill>/<path>.
+    """
+
+    /// The patch agent's: short, the skill holds the detail.
+    static let patchInstructions = """
+    You are Pondside's patch agent: you change the score's SuperCollider patch (patch/<score>.scd and the \
+    files it loads), never the .ly files. Be terse: act, then reply in one short line saying what changed \
+    and how it sounds now ("Cue 12: reverb on the flute, mix 0.4 → 0.7; electronics −18 dBFS.").
+    The request comes with patch_context: the cue at the user's point, its handler's code (numbered), what \
+    it touches, the collections there, the patch doc (outline + notes) and the SuperCollider Lexicon. Edit \
+    with the edit tool by line or exact text without reading the file; read other lines only by range. \
+    Effects and pattern parts: sc_lexicon_entry, sc_lexicon_add. Verify with patch_check (renders the mix, \
+    reports errors and the cue's levels). Then keep the doc current: patch_note on what you changed, with \
+    intent, not code. Follow skill://sc-patch-editing. warn_user when something fails; ask_user only when \
+    two readings really differ.
+    """
+
     // MARK: Skills
 
-    /// The two skills of DESIGN.md §7: the high-level one for working with
-    /// the Lexicon's graphic entries, and the low-level one for writing new
-    /// entries when those aren't enough.
+    /// The two skills of DESIGN.md §7, the high-level one for working with
+    /// the Lexicon's graphic entries and the low-level one for writing new
+    /// entries, then every other bundled skill (LilyPond itself,
+    /// contemporary notation, electronics staves, SuperCollider), found in
+    /// `Core/Skills` with its description from SKILL.md's front matter.
     struct Skill {
         var folder: String
         var uri: String
@@ -178,16 +247,46 @@ public actor MCPServer {
         var description: String
     }
 
-    static let skills = [
+    static let guides = [
         Skill(folder: "graphic-notation", uri: "lexicon://guide/graphics", prompt: "graphic-notation",
-              description: "Graphic notation with the Lexicon: find \"here\", choose and combine graphic entries, preview, insert"),
+              description: "Graphic notation, fast: score_context, one edit, check; terse requests (\"taller\", \"till 7\") on a clicked or new graphic"),
         Skill(folder: "lexicon-entries", uri: "lexicon://guide/entries", prompt: "lexicon-entries",
               description: "Writing new Lexicon entries: the graphics kit, the entry folder, LilyPond and Guile gotchas, checks"),
     ]
 
+    static let skills: [Skill] = {
+        guard let dir = Lexicon.coreDirectory?.appendingPathComponent("Skills"),
+              let folders = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return guides }
+        let others = folders.sorted().filter { f in !guides.contains { $0.folder == f } }.compactMap { folder -> Skill? in
+            guard let text = try? String(contentsOf: dir.appendingPathComponent("\(folder)/SKILL.md"), encoding: .utf8) else { return nil }
+            let description = text.split(separator: "\n").first { $0.hasPrefix("description:") }
+                .map { $0.dropFirst("description:".count).trimmingCharacters(in: .whitespaces) } ?? folder
+            return Skill(folder: folder, uri: "skill://\(folder)", prompt: folder, description: description)
+        }
+        return guides + others
+    }()
+
+    static func skillDirectory(_ s: Skill) -> URL? {
+        Lexicon.coreDirectory?.appendingPathComponent("Skills/\(s.folder)")
+    }
+
+    /// SKILL.md, followed by the URIs of the skill's other files: its paths
+    /// are relative to the skill, which an agent reaches only through us.
     static func skillText(_ s: Skill) -> String? {
-        guard let core = Lexicon.coreDirectory else { return nil }
-        return try? String(contentsOf: core.appendingPathComponent("Skills/\(s.folder)/SKILL.md"), encoding: .utf8)
+        guard let dir = skillDirectory(s),
+              let text = try? String(contentsOf: dir.appendingPathComponent("SKILL.md"), encoding: .utf8) else { return nil }
+        let files = (FileManager.default.subpaths(atPath: dir.path) ?? []).sorted().filter { path in
+            path != "SKILL.md" && !path.hasPrefix(".") && !path.contains("/.")
+                && !((try? dir.appendingPathComponent(path).resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? true)
+        }
+        guard !files.isEmpty else { return text }
+        return text + "\n\n---\nThis skill's files, read with resources/read (copy a library into the score's folder before including it):\n"
+            + files.map { "- skill://\(s.folder)/\($0)" }.joined(separator: "\n") + "\n"
+    }
+
+    static func skillFile(_ s: Skill, _ path: String) -> String? {
+        guard let dir = skillDirectory(s), !path.split(separator: "/").contains("..") else { return nil }
+        return try? String(contentsOf: dir.appendingPathComponent(path), encoding: .utf8)
     }
 
     // MARK: Tools
@@ -207,8 +306,33 @@ public actor MCPServer {
 
     static let file: JSONValue = ["type": "string", "description": "Path to a .ly file (absolute, or relative to the server's directory)"]
 
+    /// The tools a role sees (all of them for no role: the CLI, migration).
+    static func tools(for role: Role?) -> [Tool] {
+        guard let role else { return tools }
+        let patchOnly: Set<String> = ["patch_context", "patch_doc", "patch_note", "patch_check", "sc_lexicon_search",
+                                      "sc_lexicon_entry", "sc_lexicon_add"]
+        let graphicsOnly: Set<String> = ["graphic_preview", "graphic_insert", "lexicon_propose", "lexicon_check", "lexicon_search",
+                                         "lexicon_entry", "render", "query", "check"]
+        let migration: Set<String> = ["patch_migrate"]
+        switch role {
+        case .graphics: return tools.filter { !patchOnly.contains($0.name) && !migration.contains($0.name) }
+        case .patch: return tools.filter { !graphicsOnly.contains($0.name) && !migration.contains($0.name) }
+        }
+    }
+
     static let tools: [Tool] = [
-        Tool(name: "check", description: "Compile a score with LilyPond and return its diagnostics (file, line, column, message). Truth comes from LilyPond itself.",
+        Tool(name: "edit", description: "Edit a file without reading it first: each edit replaces old (exact text, unique in the file; the contexts' line-number prefixes are ignored) with new, or lines from_line…to_line (as score_context/patch_context number them) with new; give old with from_line to have the lines checked first (safe when an earlier edit may have moved them). All edits apply together or none. For a .ly/.ily file it then waits for the app's engraving and returns check's result, so don't call check after it.",
+             properties: ["file": ["type": "string", "description": "The file to edit (absolute, or relative to the server's directory)"],
+                          "edits": ["type": "array", "description": "The edits, against the file as it is now",
+                                    "items": ["type": "object", "properties": [
+                                        "old": ["type": "string", "description": "Exact text to replace"],
+                                        "new": ["type": "string", "description": "Its replacement (lines without number prefixes)"],
+                                        "from_line": ["type": "integer", "description": "First line to replace, instead of old"],
+                                        "to_line": ["type": "integer", "description": "Last line to replace (default from_line)"]],
+                                              "required": ["new"]]],
+                          "root": ["type": "string", "description": "The score's root .ly, when editing an .ily (for the check)"]],
+             required: ["file", "edits"]),
+        Tool(name: "check", description: "Diagnostics (file, line, column, message) from LilyPond itself. When the app has the score open, waits for its engraving of the files as they are now (about a second, warm); otherwise compiles.",
              properties: ["file": file], required: ["file"]),
         Tool(name: "query", description: "List a score's musical events in order: kind, absolute pitches (Dutch names, c' = middle C), duration, and source line:character, for precise edits.",
              properties: ["file": file,
@@ -222,9 +346,28 @@ public actor MCPServer {
         Tool(name: "cues", description: "Every electronics cue (\\ecue, and Lexicon entries with sounds) with moment, bar, beat, seconds and samples, timed exactly as the MIDI plays.",
              properties: ["file": file, "rate": ["type": "integer", "description": "Sample rate (default 48000)"]],
              required: ["file"]),
+        Tool(name: "patch_audit", description: "Check the score's SuperCollider patch (or, without one, the folder's likeliest .scd) against Pondside's patch layout: what patch_migrate fixes by itself (automatic) and what is left for you (skill sc-patch-migration).",
+             properties: ["file": file, "scd": ["type": "string", "description": "The patch, if not <score>.scd or pondside.toml's"]],
+             required: ["file"]),
+        Tool(name: "patch_migrate", description: "Make the patch a Pondside patch: wrap it in the mode, engine, cue and play sections, convert quark handlers, rename names the engine uses, feed SoundIn.ar(0) from ~live, add cue stubs, and mark each line left for you with a // pondside: comment. Writes <score>.scd (keeping an original it rewrites as .before-pondside.scd). Returns what it did and what is left, with lines.",
+             properties: ["file": file, "scd": ["type": "string", "description": "Where the patch goes, if not <score>.scd or pondside.toml's"],
+                          "from": ["type": "string", "description": "The file to migrate, if not the one patch_audit found"]],
+             required: ["file"]),
+        Tool(name: "mix", description: "Render the score's Pondside patch offline in mockup mode (as the app does after each engraving) into <score>.mix.wav. Returns whether it rendered, and the errors its setup or cues printed. A patch is done only when this renders cleanly.",
+             properties: ["file": file], required: ["file"]),
+        Tool(name: "warn_user", description: "Tell the user something went wrong (a render that fails, a file you couldn't fix, a request you couldn't carry out): an alert in the running app. Not for progress or summaries.",
+             properties: ["file": ["type": "string", "description": "The score (.ly) the work is for, so the alert shows on its window"],
+                          "title": ["type": "string", "description": "A few words, e.g. \"The mix didn't render\""],
+                          "message": ["type": "string", "description": "What went wrong and what the user can do, in one to three sentences"]],
+             required: ["message"]),
+        Tool(name: "ask_user", description: "Ask the user a clarifying question when you genuinely can't go on without their choice (two readings of a request; which cue an old timeline belongs to). A dialog in the running app; waits for the answer. Offer up to 4 short choices when you can.",
+             properties: ["file": ["type": "string", "description": "The score (.ly) the work is for"],
+                          "question": ["type": "string", "description": "One short question"],
+                          "choices": ["type": "array", "items": ["type": "string"], "description": "Up to 4 short answers to offer"]],
+             required: ["question"]),
         Tool(name: "lexicon_check", description: "Check a score's \\lexicon and \\startGraphic uses against the Lexicon: unknown entries, unknown params, values out of range.",
              properties: ["file": file], required: ["file"]),
-        Tool(name: "score_context", description: "What \"here\" means: the event at a point (or the user's click or selection in the running Pondside app), its staff's .ly, its bar, any graphic it is in (entry and params), and, from the app, the first and last events of its system and the first of the next system. Call this before placing anything.",
+        Tool(name: "score_context", description: "What \"here\" means: the user's click or selection in the running app (no arguments), or a point. The event, its staff's .ly, bar, moment (whole notes from the staff's start), the graphic selected or around it (a Lexicon entry's params; or a graphic drawn by the score's own code: its command, start/stop, definition, drawing procedure and what it uses), the clicked part when a large drawing was clicked (selection: x as a fraction of the piece, y in staff spaces, the broken piece, the nearest bar/moment and the range between), every cue (bar, beat, moment, seconds), and the system's first, last and next events. Call this first.",
              properties: ["file": file,
                           "line": ["type": "integer", "description": "1-based line (omit to use the app's selection)"],
                           "character": ["type": "integer", "description": "0-based character on the line"]],
@@ -240,12 +383,33 @@ public actor MCPServer {
                           "music": ["type": "string", "description": "Optional LilyPond for a staff above, e.g. the passage's music"],
                           "out": ["type": "string", "description": "Directory for the SVG (default: a temporary one)"]],
              required: ["id"]),
-        Tool(name: "graphic_insert", description: "Insert a graphic as a minimal edit: \\startGraphic on the event at start, \\stopGraphic on the event at stop (same staff), then write lexicon.ily and include it in the root.",
+        Tool(name: "graphic_insert", description: "Insert a Lexicon graphic as a minimal edit: \\startGraphic on the event at start, \\stopGraphic on the event at stop, or at a cue or moment (a skip it falls inside is split), on the same staff; then write lexicon.ily and include it in the root.",
              properties: ["file": file, "id": ["type": "string"], "params": ["type": "string", "description": "Scheme alist"],
                           "start_line": ["type": "integer"], "start_character": ["type": "integer"],
                           "stop_line": ["type": "integer"], "stop_character": ["type": "integer"],
+                          "stop_cue": ["type": "string", "description": "Stop at this cue (its name, e.g. \"7\") instead of an event"],
+                          "stop_moment": ["type": "string", "description": "Stop at this moment (whole notes, e.g. \"221/8\") instead of an event"],
                           "root": ["type": "string", "description": "The score's root file, if not `file`"]],
-             required: ["file", "id", "start_line", "start_character", "stop_line", "stop_character"]),
+             required: ["file", "id", "start_line", "start_character"]),
+        Tool(name: "patch_context", description: "What the patch agent needs at a point in the score: the cue there (or named), its handler's code with line numbers, its window (until the next cue), what the handler touches (SynthDefs, patterns, buses, with code), the pitch collections around it, the patch doc (outline + notes, stale ones flagged), every cue and the SuperCollider Lexicon. No arguments: the user's selection in the app. A request from the lens already includes it.",
+             properties: ["file": ["type": "string", "description": "The score (.ly)"],
+                          "line": ["type": "integer", "description": "1-based line in the score (omit for the app's selection)"],
+                          "character": ["type": "integer", "description": "0-based character on the line"],
+                          "cue": ["type": "string", "description": "A cue's name (\"12\") instead of a point"]],
+             required: []),
+        Tool(name: "patch_doc", description: "The patch's doc (patch/<name>.patch.md): its outline rebuilt from the code (every SynthDef, pattern, proxy, bus, buffer, function, cue handler and live block, with file:lines) and the notes on intent kept under each item, stale ones flagged. The patch agent's memory: read it before searching the patch.",
+             properties: ["file": file], required: ["file"]),
+        Tool(name: "patch_note", description: "Write the note on one item of the patch doc (its key as the outline gives it, e.g. \"cue cue-12\", \"synthdef \\\\grain\", \"pattern ~cloud\", or \"overview\"): what it is for and why, in a few lines, not the code. Replaces the old note; stamps it with the code's hash so it goes stale when the code changes. Empty note removes it.",
+             properties: ["file": file, "item": ["type": "string"], "note": ["type": "string"]], required: ["file", "item", "note"]),
+        Tool(name: "patch_check", description: "Verify the patch: render it offline against the mockup (as the app does), report setup and cue errors, and the levels in a cue's window (the mix, and the electronics alone: mix minus mockup) before and after. Also rebuilds the patch doc and lists notes the change made stale.",
+             properties: ["file": file, "cue": ["type": "string", "description": "The cue whose window to measure (its name)"]],
+             required: ["file"]),
+        Tool(name: "sc_lexicon_search", description: "Find SuperCollider Lexicon entries (effects, synths, pattern parts) for a description (\"echo\", \"grainy cloud\", \"getting denser\"): one line each, best first.",
+             properties: ["query": ["type": "string"], "limit": ["type": "integer"]], required: ["query"]),
+        Tool(name: "sc_lexicon_entry", description: "One SuperCollider Lexicon entry in full: how to call it, params with defaults, usage, README and code.",
+             properties: ["id": ["type": "string"]], required: ["id"]),
+        Tool(name: "sc_lexicon_add", description: "Make SuperCollider Lexicon entries available to the patch: (re)writes patch/dependencies/sc-lexicon.scd with them and what they require, and loads it after the engine. Then call them in a handler (\\lx_reverb_mono on ~live, ~lx[\\cloud], …).",
+             properties: ["file": file, "ids": ["type": "array", "items": ["type": "string"]]], required: ["file", "ids"]),
         Tool(name: "lexicon_propose", description: "Write a new entry as a draft in the project's Lexicon/drafts/ (validated; usable in the score at once). The user accepts or rejects it; never promote it yourself.",
              properties: ["id": ["type": "string"], "entry_toml": ["type": "string"], "impl": ["type": "string"],
                           "readme": ["type": "string"]],
@@ -268,7 +432,7 @@ public actor MCPServer {
         let installs = await ToolchainDetector().detectLilyPond()
         let declared = (try? String(contentsOf: source, encoding: .utf8)).flatMap(LilyPondVersion.declared(in:))
         guard let lily = ToolchainDetector.select(from: installs, for: declared) else {
-            throw ToolFailure("LilyPond is not installed (brew install lilypond)")
+            throw ToolFailure("LilyPond is not installed (run the Pondside installer, or brew install lilypond)")
         }
         return lily
     }
@@ -277,6 +441,7 @@ public actor MCPServer {
         switch name {
         case "check":
             let source = try path(args)
+            if let fromApp = await appCheck(source) { return fromApp }
             let scratch = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-mcp-\(UUID().uuidString)")
             defer { try? FileManager.default.removeItem(at: scratch) }
             let result = try await LilyPondEngraver(installation: try await lilypond(for: source))
@@ -324,6 +489,68 @@ public actor MCPServer {
             let sheet = CueSheet(log: log, score: source.lastPathComponent, sampleRate: args["rate"]?.int ?? 48000,
                                  soundParams: { lex.soundParams(entry: $0, params: $1, beatDur: $2, spanDur: $3, tempo: $4) })
             return String(decoding: try sheet.json(), as: UTF8.self)
+        case "patch_audit", "patch_migrate":
+            let source = try path(args)
+            let configured = try args["scd"]?.string.map { try path(["file": .string($0)]) }
+                ?? (try? ProjectConfig.find(from: source))?.handlers
+            let target = PatchMigration.patchURL(score: source, configured: configured)
+            let found: (source: URL, target: URL, findings: [PatchMigration.Finding])?
+            if let from = try args["from"]?.string.map({ try path(["file": .string($0)]) }) {
+                found = (from, target, PatchMigration.audit(try String(contentsOf: from, encoding: .utf8)))
+            } else {
+                found = PatchMigration.candidate(score: source, configured: configured)
+            }
+            let marked = PatchMigration.allMarks(patch: target)
+                .map { "- \($0.file):\($0.line): \($0.text)" }.joined(separator: "\n")
+            guard let c = found else {
+                guard FileManager.default.fileExists(atPath: target.path) else { return "There is no .scd beside the score." }
+                return marked.isEmpty ? "Nothing to do: \(target.lastPathComponent) is a Pondside patch with no findings and no marks."
+                    : "No new findings. Marked lines still to fix (fix each, then delete its mark):\n\(marked)"
+            }
+            func show(_ fs: [PatchMigration.Finding], _ file: URL) -> String {
+                fs.map { f in "- " + (f.line.map { "\(f.file ?? file.lastPathComponent):\($0): " } ?? "") + f.message }.joined(separator: "\n")
+            }
+            if name == "patch_audit" {
+                let auto = c.findings.filter(\.automatic), manual = c.findings.filter { !$0.automatic }
+                return "\(c.source.path) → \(c.target.path)\npatch_migrate does:\n\(show(auto, c.source))\nleft for you:\n\(show(manual, c.source))"
+                    + (marked.isEmpty ? "" : "\nMarked lines still to fix:\n\(marked)")
+            }
+            var sheet: CueSheet?
+            if let log = try? await TimingDump.run(try await lilypond(for: source), source: source) {
+                sheet = CueSheet(log: log, score: source.lastPathComponent)
+            }
+            let (result, backup, moved) = try PatchMigration.write(score: source, source: c.source, target: c.target, sheet: sheet)
+            return "Wrote \(c.target.path)" + (backup.map { " (original kept as patch/\($0.lastPathComponent))" } ?? "")
+                + (moved.isEmpty ? "" : ". Moved: " + moved.joined(separator: "; "))
+                + ".\nDone:\n\(show(result.applied, c.source))\nLeft for you, each line marked // pondside: (fix it, then remove the mark):\n"
+                + (result.manual.isEmpty ? "- nothing" : show(result.manual, c.target))
+        case "mix":
+            let source = try path(args)
+            let config = try? ProjectConfig.find(from: source)
+            guard let patch = PatchRender.patch(for: source, configured: config?.handlers) else {
+                return "No Pondside patch for \(source.lastPathComponent) (patch_migrate makes one)."
+            }
+            let wav = HandlerSync.Layout.mockup(score: source)
+            guard FileManager.default.fileExists(atPath: wav.path) else { return "No mockup yet (\(wav.lastPathComponent)): the app writes it after an engraving." }
+            guard let sclang = SuperColliderToolchain.findSclang(configured: config?.sclang?.path) else { return "SuperCollider isn't installed." }
+            let out = PatchRender.output(for: source)
+            do {
+                let problems = try await PatchRender.render(sclang: sclang, patch: patch, wav: wav, out: out)
+                return "Rendered \(out.lastPathComponent)." + (problems.isEmpty ? "" : " Errors in cues (each stopped that cue):\n" + problems.joined(separator: "\n"))
+            } catch {
+                return "Didn't render. \(error)"
+            }
+        case "warn_user", "ask_user":
+            var params: [String: JSONValue] = [:]
+            if let f = args["file"]?.string { params["path"] = .string(try path(["file": .string(f)]).path) }
+            for k in ["title", "message", "question", "choices"] { if let v = args[k] { params[k] = v } }
+            let method = name == "warn_user" ? "document.warn" : "document.ask"
+            guard let reply = try? RPCClient.call(method, .object(params)) else {
+                return "Pondside isn't running (or has no score open), so nobody saw this: say it in your final reply instead."
+            }
+            if name == "warn_user" { return "Shown to the user." }
+            return reply["answered"] == .bool(true) ? "The user answered: \(reply["answer"]?.string ?? "")"
+                : "The user skipped the question: make the conservative choice, and say what you assumed."
         case "lexicon_check":
             let source = try path(args)
             let problems = lexicon().check(try String(contentsOf: source, encoding: .utf8))
@@ -332,16 +559,15 @@ public actor MCPServer {
         case "score_context":
             if let f = args["file"]?.string, let line = args["line"]?.int {
                 let source = try path(["file": .string(f)])
-                let text = try String(contentsOf: source, encoding: .utf8)
-                var context = ScoreContext.describe(text: text, file: source.path, line: line, character: args["character"]?.int ?? 0)
-                // The app knows the system; ask it when it is running.
+                let character = args["character"]?.int ?? 0
+                // The app knows more (the system, the cues, unsaved text): ask it first.
                 if let app = try? RPCClient.call("document.context", ["path": .string(source.path), "line": .number(Double(line)),
-                                                                               "character": .number(Double(args["character"]?.int ?? 0))]),
-                   case .object(var o) = context, let system = app["system"] {
-                    o["system"] = system
-                    context = .object(o)
+                                                                      "character": .number(Double(character))]) {
+                    return app.jsonString(pretty: true)
                 }
-                return context.jsonString(pretty: true)
+                let text = try String(contentsOf: source, encoding: .utf8)
+                return ScoreContext.describe(text: text, file: source.path, line: line, character: character,
+                                             files: Self.neighbours(of: source)).jsonString(pretty: true)
             }
             do {
                 return try RPCClient.call("document.context", [:]).jsonString(pretty: true)
@@ -360,9 +586,17 @@ public actor MCPServer {
             let source = try path(args)
             guard let id = args["id"]?.string, lexicon().entries[id] != nil else { throw ToolFailure("no Lexicon entry \(args["id"]?.string ?? "")") }
             let text = try String(contentsOf: source, encoding: .utf8)
-            let new = try GraphicEdit.insert(into: text, id: id, params: args["params"]?.string ?? "()",
-                                             start: (args["start_line"]?.int ?? 0, args["start_character"]?.int ?? 0),
-                                             stop: (args["stop_line"]?.int ?? 0, args["stop_character"]?.int ?? 0))
+            let params = args["params"]?.string ?? "()"
+            let start = (args["start_line"]?.int ?? 0, args["start_character"]?.int ?? 0)
+            let new: String
+            if let line = args["stop_line"]?.int {
+                new = try GraphicEdit.insert(into: text, id: id, params: params, start: start,
+                                             stop: (line, args["stop_character"]?.int ?? 0))
+            } else if let moment = try await stopMoment(args, source: source) {
+                new = try GraphicEdit.insert(into: text, id: id, params: params, start: start, stopMoment: moment)
+            } else {
+                throw ToolFailure("give stop_line and stop_character, stop_cue or stop_moment")
+            }
             let problems = lexicon().check(new)
             guard problems.isEmpty else {
                 throw ToolFailure(problems.map { "line \($0.line): \($0.message)" }.joined(separator: "\n"))
@@ -370,7 +604,37 @@ public actor MCPServer {
             try Data(new.utf8).write(to: source, options: .atomic)
             let root = try args["root"]?.string.map { try path(["file": .string($0)]) } ?? source
             let include = try GraphicEdit.prepareLexiconInclude(root: root, lexicon: lexicon())
-            return "Inserted \(id) in \(source.lastPathComponent); wrote \(include.lastPathComponent). Compile with check to confirm."
+            return "Inserted \(id) in \(source.lastPathComponent); wrote \(include.lastPathComponent). Call check to see it engraved."
+        case "edit":
+            return try await edit(args)
+        case "patch_context":
+            return try await patchContext(args).jsonString(pretty: true)
+        case "patch_doc":
+            let patch = try patchFile(for: try path(args))
+            let doc = try PatchDoc.update(patch: patch)
+            return doc.text + (doc.stale.isEmpty ? "" : "\nStale notes (the code changed since): " + doc.stale.joined(separator: ", "))
+        case "patch_note":
+            let patch = try patchFile(for: try path(args))
+            let key = try PatchDoc.setNote(patch: patch, key: args["item"]?.string ?? "", text: args["note"]?.string ?? "")
+            return "Noted \(key) in \(PatchDoc.url(patch: patch).lastPathComponent)."
+        case "patch_check":
+            return try await patchCheck(args)
+        case "sc_lexicon_search":
+            let lines = SCLexicon.load(project: project).search(args["query"]?.string ?? "", limit: args["limit"]?.int ?? 8)
+            return lines.isEmpty ? "No entries match; the patch's own code may already do it (patch_doc)." : lines.joined(separator: "\n")
+        case "sc_lexicon_entry":
+            guard let id = args["id"]?.string, let text = SCLexicon.load(project: project).describe(id) else {
+                throw ToolFailure("no SuperCollider Lexicon entry \(args["id"]?.string ?? ""); sc_lexicon_search finds them")
+            }
+            return text
+        case "sc_lexicon_add":
+            let source = try path(args)
+            let patch = try patchFile(for: source)
+            let ids = (args["ids"]?.array ?? []).compactMap(\.string) + (args["ids"]?.string.map { [$0] } ?? [])
+            let (all, inserted) = try PatchContext.addLexiconReportingShift(ids, patch: patch, lexicon: SCLexicon.load(project: source.deletingLastPathComponent()))
+            return "dependencies/\(SCLexiconInclude.fileName) now has \(all.joined(separator: ", "))."
+                + (inserted.map { " The patch now loads it at line \($0): every line of \(patch.lastPathComponent) after it is one further down than your context says (add 1, or edit by old text)." }
+                   ?? " The patch already loads it.")
         case "lexicon_propose":
             guard let id = args["id"]?.string else { throw ToolFailure("missing id") }
             let dir = try Lexicon.propose(id: id, toml: args["entry_toml"]?.string ?? "", impl: args["impl"]?.string ?? "",
@@ -379,6 +643,217 @@ public actor MCPServer {
         default:
             throw RPCError(code: -32602, message: "unknown tool: \(name)")
         }
+    }
+
+    /// The moment `stop_moment` names, or `stop_cue`'s: from the app's
+    /// latest cue sheet when it has the score open, else from a compile.
+    func stopMoment(_ args: JSONValue, source: URL) async throws -> Rational? {
+        if let m = args["stop_moment"]?.string {
+            guard let r = Rational(parsing: m) else { throw ToolFailure("stop_moment is a fraction of whole notes, e.g. 221/8") }
+            return r
+        }
+        guard let cue = args["stop_cue"]?.string else { return nil }
+        var cues: [(name: String, moment: String)] = []
+        if let sheet = try? RPCClient.call("document.cues", ["path": .string(source.path)]), let list = sheet["cues"]?.array {
+            cues = list.compactMap { c in
+                guard let n = c["name"]?.string, let m = c["position"]?["moment"]?.string else { return nil }
+                return (n, m)
+            }
+        } else {
+            let log = try await TimingDump.run(try await lilypond(for: source), source: source)
+            cues = CueSheet(log: log, score: source.lastPathComponent).cues.map { ($0.name, $0.position.moment) }
+        }
+        guard let m = cues.first(where: { $0.name == cue }).flatMap({ Rational(parsing: $0.moment) }) else {
+            throw ToolFailure("no cue \(cue); the score's cues: \(cues.map(\.name).joined(separator: " "))")
+        }
+        return m
+    }
+
+    /// The score's diagnostics from the running app, once it has engraved
+    /// the files as they are now; nil when the app doesn't have the score
+    /// open or doesn't start a compile in time (then `check` compiles).
+    func appCheck(_ source: URL) async -> String? {
+        func document() -> JSONValue? {
+            guard let docs = (try? RPCClient.call("app.documents"))?.array else { return nil }
+            return docs.first { d in
+                d["files"]?.array?.contains { $0.string.map { URL(fileURLWithPath: $0).standardizedFileURL.path == source.path } ?? false } ?? false
+            }
+        }
+        guard let first = document() else { return nil }
+        let files = (first["files"]?.array ?? []).compactMap(\.string)
+        let written = files.compactMap { try? FileManager.default.attributesOfItem(atPath: $0)[.modificationDate] as? Date }.max() ?? .distantPast
+        let deadline = Date().addingTimeInterval(60)
+        var nudge = Date().addingTimeInterval(3)
+        var nudged = false
+        while Date() < deadline {
+            guard let doc = document() else { return nil }
+            let started = doc["started"]?.number.map { Date(timeIntervalSince1970: $0) } ?? .distantPast
+            let status = doc["status"]?.string ?? ""
+            if status == "noLilyPond" { return nil }
+            if started >= written, status != "compiling" {
+                let diagnostics = doc["diagnostics"]?.array ?? []
+                let ok = status.hasPrefix("clean")
+                return JSONValue.object(["ok": .bool(ok), "status": .string(status), "diagnostics": .array(diagnostics),
+                                         "from": "the running app"]).jsonString(pretty: true)
+            }
+            if started < written, status != "compiling", Date() > nudge {
+                // The app hasn't picked the change up: ask it once, then compile here.
+                if nudged { return nil }
+                _ = try? RPCClient.call("document.engrave", ["path": .string(source.path)])
+                nudged = true
+                nudge = Date().addingTimeInterval(5)
+            }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return nil
+    }
+
+    /// The .ly and .ily files beside `source`: where a graphic's definition
+    /// is looked for when the app isn't running.
+    static func neighbours(of source: URL) -> [ScoreGraphic.File] {
+        let dir = source.deletingLastPathComponent()
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return names.sorted().filter { $0.hasSuffix(".ly") || $0.hasSuffix(".ily") }.compactMap { name in
+            let url = dir.appendingPathComponent(name)
+            return (try? String(contentsOf: url, encoding: .utf8)).map { (url.path, $0) }
+        }
+    }
+
+    // MARK: Editing
+
+    /// The `edit` tool: applies the edits, then for a score file returns
+    /// the app's engraving of it (check), for a patch file a pointer to
+    /// patch_check.
+    func edit(_ args: JSONValue) async throws -> String {
+        let source = try path(args)
+        let ext = source.pathExtension.lowercased()
+        let isScore = ext == "ly" || ext == "ily"
+        let pondsideOwned = source.lastPathComponent == SCLexiconInclude.fileName
+            || (source.lastPathComponent == "pondside.scd" && source.deletingLastPathComponent().lastPathComponent == "dependencies")
+        switch role {
+        case .graphics?:
+            guard isScore else { throw ToolFailure("you edit the score's .ly/.ily files only; the patch agent changes the SuperCollider patch") }
+        case .patch?:
+            guard ext == "scd" else { throw ToolFailure("you edit the patch's .scd files only (the score agent changes .ly files; patch_note writes the doc)") }
+        case nil:
+            guard isScore || ext == "scd" else { throw ToolFailure("edit changes .ly, .ily and .scd files") }
+        }
+        guard !pondsideOwned else { throw ToolFailure("\(source.lastPathComponent) is Pondside's (rewritten by it): change the patch instead") }
+        let changes = (args["edits"]?.array ?? []).map { e in
+            FileEdit.Change(old: e["old"]?.string, new: e["new"]?.string ?? "", fromLine: e["from_line"]?.int, toLine: e["to_line"]?.int)
+        }
+        let text = try String(contentsOf: source, encoding: .utf8)
+        let (new, lines) = try FileEdit.apply(changes, to: text)
+        guard new != text else { return "Nothing changed: the new text is the same as the old." }
+        try Data(new.utf8).write(to: source, options: .atomic)
+        let range = lines.count > 1 ? "lines \(lines.lowerBound)–\(lines.upperBound)" : "line \(lines.lowerBound)"
+        let done = "Edited \(source.lastPathComponent), \(range)."
+        guard isScore else { return done + " Call patch_check to hear it (renders the mix)." }
+        let root = try args["root"]?.string.map { try path(["file": .string($0)]) }
+        if let fromApp = await appCheck(root ?? source) { return done + " check:\n" + fromApp }
+        guard let target = root ?? (ext == "ly" ? source : nil) else {
+            return done + " The app isn't open on this score: call check on the root .ly."
+        }
+        return done + " check:\n" + (try await callTool("check", ["file": .string(target.path)]))
+    }
+
+    // MARK: The patch agent
+
+    /// The score's Pondside patch, or a failure that says how to make one.
+    func patchFile(for score: URL) throws -> URL {
+        let config = try? ProjectConfig.find(from: score)
+        guard let patch = PatchRender.patch(for: score, configured: config?.handlers) else {
+            throw ToolFailure("\(score.lastPathComponent) has no Pondside patch (patch_audit, then patch_migrate, makes one)")
+        }
+        return patch
+    }
+
+    /// The score's cue sheet: the app's latest, else from a compile.
+    func cueSheet(_ source: URL) async -> CueSheet? {
+        if let sheet = try? RPCClient.call("document.cues", ["path": .string(source.path)]), sheet != .null,
+           let data = try? JSONEncoder().encode(sheet), let decoded = try? JSONDecoder().decode(CueSheet.self, from: data) {
+            return decoded
+        }
+        guard let lily = try? await lilypond(for: source), let log = try? await TimingDump.run(lily, source: source) else { return nil }
+        return CueSheet(log: log, score: source.lastPathComponent)
+    }
+
+    func patchContext(_ args: JSONValue) async throws -> JSONValue {
+        guard let f = args["file"]?.string else {
+            do {
+                return try RPCClient.call("document.patchContext", args["cue"].map { ["cue": $0] } ?? [:])
+            } catch {
+                throw ToolFailure("Pondside isn't running, so there is no selection: pass file (the score) and line, or cue")
+            }
+        }
+        let source = try path(["file": .string(f)])
+        var params: [String: JSONValue] = ["path": .string(source.path)]
+        for k in ["line", "character", "cue"] { if let v = args[k] { params[k] = v } }
+        if let app = try? RPCClient.call("document.patchContext", .object(params)) { return app }
+        let patch = try patchFile(for: source)
+        // The app isn't running: one compile gives the cues and the collections.
+        var sheet: CueSheet?, collections: [Collections.Collection] = [], tempo: TempoMap?
+        if let lily = try? await lilypond(for: source), let log = try? await TimingDump.run(lily, source: source) {
+            sheet = CueSheet(log: log, score: source.lastPathComponent)
+            collections = PatchContext.collections(in: log)
+            tempo = TempoMap(log)
+        }
+        var point = PatchContext.Point(cue: args["cue"]?.string)
+        var context: JSONValue?
+        if let line = args["line"]?.int {
+            let text = try String(contentsOf: source, encoding: .utf8)
+            context = ScoreContext.describe(text: text, file: source.path, line: line, character: args["character"]?.int ?? 0)
+            point.bar = context?["bar"]?.int
+            point.moment = context?["moment"]?.string.flatMap(Rational.init(parsing:))
+            point.seconds = point.moment.flatMap { m in tempo?.seconds(at: m) }
+        }
+        return PatchContext.describe(score: source, patch: patch, sheet: sheet, at: point, collections: collections, scoreContext: context,
+                                     lexicon: SCLexicon.load(project: source.deletingLastPathComponent()))
+    }
+
+    /// Renders the mix; reports errors, the cue window's levels before and
+    /// after, and the notes the change made stale.
+    func patchCheck(_ args: JSONValue) async throws -> String {
+        let source = try path(args)
+        let patch = try patchFile(for: source)
+        let config = try? ProjectConfig.find(from: source)
+        let wav = HandlerSync.Layout.mockup(score: source)
+        guard FileManager.default.fileExists(atPath: wav.path) else { return "No mockup yet (\(wav.lastPathComponent)): the app writes it after an engraving." }
+        guard let sclang = SuperColliderToolchain.findSclang(configured: config?.sclang?.path) else { return "SuperCollider isn't installed." }
+        let out = PatchRender.output(for: source)
+        var window: (name: String, from: Double, to: Double)?
+        if let cue = args["cue"]?.string, let sheet = await cueSheet(source) {
+            guard let i = sheet.cues.firstIndex(where: { $0.name == cue || $0.id == cue }) else {
+                throw ToolFailure("no cue \(cue); the score's cues: \(sheet.cues.map(\.name).joined(separator: " "))")
+            }
+            let end = i + 1 < sheet.cues.count ? sheet.cues[i + 1].seconds : sheet.cues[i].seconds + 30
+            window = (sheet.cues[i].name, sheet.cues[i].seconds, end)
+        }
+        func levels() -> (mix: AudioLevels.Level, electronics: AudioLevels.Level?)? {
+            guard let w = window, let mix = AudioLevels.level(out, from: w.from, to: w.to) else { return nil }
+            return (mix, AudioLevels.difference(out, wav, from: w.from, to: w.to))
+        }
+        let before = levels()
+        let problems: [String]
+        do {
+            problems = try await PatchRender.render(sclang: sclang, patch: patch, wav: wav, out: out)
+        } catch {
+            return "Didn't render (the last good mix is kept). \(error)"
+        }
+        var report = "Rendered \(out.lastPathComponent)."
+            + (problems.isEmpty ? " No errors." : " Errors in cues (each stopped that cue):\n" + problems.joined(separator: "\n"))
+        if let w = window, let after = levels() {
+            func line(_ l: (mix: AudioLevels.Level, electronics: AudioLevels.Level?)) -> String {
+                "mix \(l.mix.description)" + (l.electronics.map { "; electronics alone \($0.description)" } ?? "")
+            }
+            report += String(format: "\nCue %@ window %.2f–%.2f s: ", w.name, w.from, w.to) + line(after)
+            if let b = before { report += "\n  before this render: " + line(b) }
+            if let e = after.electronics, e.rmsDB < -70 { report += "\n  The electronics are silent in this window." }
+        }
+        if let doc = try? PatchDoc.update(patch: patch), !doc.stale.isEmpty {
+            report += "\nStale notes, rewrite them with patch_note: " + doc.stale.joined(separator: ", ")
+        }
+        return report
     }
 
     /// A graphic on its own staff over `bars` bars, engraved to SVG.

@@ -59,6 +59,20 @@ public struct Rect: Hashable, Sendable, Codable {
         Rect(x: x + d, y: y + d, width: width - 2 * d, height: height - 2 * d)
     }
 
+    /// 0 inside, else the distance to the nearest edge.
+    public func distance(to p: Point) -> Double {
+        let dx = max(minX - p.x, 0, p.x - maxX), dy = max(minY - p.y, 0, p.y - maxY)
+        return (dx * dx + dy * dy).squareRoot()
+    }
+
+    /// The overlap of two rectangles, or nil when they don't meet.
+    public func intersection(_ r: Rect) -> Rect? {
+        let nx = max(minX, r.minX), ny = max(minY, r.minY)
+        let mx = min(maxX, r.maxX), my = min(maxY, r.maxY)
+        guard mx >= nx, my >= ny else { return nil }
+        return Rect(x: nx, y: ny, width: mx - nx, height: my - ny)
+    }
+
     public func union(_ r: Rect) -> Rect {
         let nx = min(minX, r.minX), ny = min(minY, r.minY)
         return Rect(x: nx, y: ny, width: max(maxX, r.maxX) - nx, height: max(maxY, r.maxY) - ny)
