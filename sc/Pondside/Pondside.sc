@@ -1,14 +1,15 @@
 // Pondside — the score is the timing source; SuperCollider owns the clock.
 //
-//   p = Pondside("~/scores/piece/resources");   // reads piece.cues, loads piece.wav
+//   p = Pondside("~/scores/piece", "score");    // reads score.cues, loads score.wav
 //   p.on(\cue12, { |cue| ~swell.set(\amp, 0.5) });
 //   p.play(from: "42:1");                         // bar 42, or seconds: p.play(from: 133.3)
 //   p.stop;
 //
-// piece.cues (seconds<TAB>bar<TAB>cue N) is what `pondside cues --format cues`
-// and the lilypond-sc export write. Cue times come from the same MIDI the mockup
-// was rendered from, so the two cannot drift: the buffer and every cue are sent
-// as bundles timestamped from one logical start time.
+// <name>.wav and <name>.cues (seconds<TAB>bar<TAB>cue N) are what `pondside mockup`
+// writes beside the score, and the app runs it after every engraving: call p.load
+// to pick up new times. Cue times come from the same compile as the mockup's MIDI,
+// so the two cannot drift: the buffer and every cue are sent as bundles timestamped
+// from one logical start time. (`pondside cues --format cues` writes the same lines.)
 
 Pondside {
 	var <dir, <name, <server, <rate, <cues, <handlers, <buffer, <synth, <routine, <startedAt;
