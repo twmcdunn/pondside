@@ -121,6 +121,24 @@ final class LegendArrangementTests: XCTestCase {
         XCTAssertEqual(spaced.examples[0], sheet.rows[0].example, "the row above stays")
     }
 
+    /// A drag committed before the engraving is the baseline for the next:
+    /// its handles sit where the drop left them and its deltas add up.
+    func testACommittedDragIsTheNextDragsBaseline() {
+        let (legend, sheet) = sheet()
+        let move = legend.drag(.table, on: sheet, from: Point(40, 40), to: Point(45, 43), layout: .init(), examples: [],
+                               snap: false, threshold: 1)
+        let moved = sheet.applying(move)
+        XCTAssertEqual(moved.table.x, sheet.table.x + 5, accuracy: 0.01)
+        XCTAssertEqual(moved.table.y, sheet.table.y + 3, accuracy: 0.01)
+        // The open hand shows on the table where it now is, not where it was.
+        let row = moved.rows[0].frame
+        XCTAssertEqual(legend.handle(at: Point(row.midX, row.midY), on: moved, tolerance: 0.5), .table)
+        let again = legend.drag(.table, on: moved, from: Point(row.midX, row.midY),
+                                to: Point(row.midX + 3, row.midY),
+                                layout: move.layout, examples: [], snap: false, threshold: 1)
+        XCTAssertEqual(again.layout.x, move.layout.x + 3 / moved.unitsPerMM, accuracy: 0.01)
+    }
+
     /// The real definitions engrave: markers on the canvas, the example cropped.
     func testEngravedLegendCarriesMarkers() async throws {
         let installs = await ToolchainDetector().detectLilyPond()

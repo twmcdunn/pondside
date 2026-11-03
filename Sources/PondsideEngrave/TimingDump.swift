@@ -85,9 +85,17 @@ public enum TimingDump {
                        (if (or (string-prefix? "improv " s) (string=? s "end"))
                            (apply pondside-timing-row context "text" s where))))))))
          ((note-event engraver event)
-          (let ((p (ly:event-property event 'pitch #f)))
+          (let ((p (ly:event-property event 'pitch #f))
+                (loc (ly:event-property event 'origin #f)))
             (if (ly:pitch? p)
-                (pondside-timing-row context "note" (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p))))))
+                ; Also where the note was written: the playhead follows the
+                ; audio through the printed score by these positions.
+                (let ((where (if (ly:input-location? loc)
+                                 (let ((o (ly:input-file-line-char-column loc)))
+                                   (list (car o) (cadr o) (caddr o)))
+                                 '())))
+                  (apply pondside-timing-row context "note"
+                         (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p)) where)))))
          ((note-grouping-event engraver event)
           (pondside-timing-row context "group" (pondside-timing-staff context)
             (if (= (ly:event-property event 'span-direction) START) "start" "stop"))))))

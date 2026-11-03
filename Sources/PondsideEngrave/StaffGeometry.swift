@@ -16,6 +16,7 @@ public struct Staff: Hashable, Sendable {
     public var space: Double { (lineYs[lineYs.count - 1] - lineYs[0]) / Double(lineYs.count - 1) }
     public var top: Double { lineYs[0] }
     public var bottom: Double { lineYs[lineYs.count - 1] }
+    public var width: Double { maxX - minX }
 
     /// Half-spaces above the bottom line: 0 is the bottom line, 1 the first
     /// space, 8 the top line, negatives are below the staff.
@@ -179,13 +180,23 @@ extension MouseEntry {
 }
 
 extension EngravedPage {
+    /// The staves that set a page's systems: those as wide as the page's
+    /// widest. Short five-line symbols — the lines a graphic draws under a
+    /// collection when its staff is hidden — sit between systems, and
+    /// counting them would join two systems into one.
+    static func systemStaves(of staves: [Staff]) -> [Staff] {
+        guard let widest = staves.map(\.width).max(), widest > 0 else { return [] }
+        let full = staves.filter { $0.width >= widest * 0.35 }
+        return (full.isEmpty ? staves : full).sorted { $0.top < $1.top }
+    }
+
     /// The page's systems as vertical bands, top to bottom. LilyPond's SVG
     /// has no systems either, so staves are grouped by the gaps between
     /// them: a gap clearly wider than the narrowest starts a new system. A
     /// page of single-staff systems, where every gap is alike, is one
     /// system per staff.
     public static func systems(of staves: [Staff]) -> [ClosedRange<Double>] {
-        let sorted = staves.sorted { $0.top < $1.top }
+        let sorted = systemStaves(of: staves)
         guard let first = sorted.first else { return [] }
         let gaps = zip(sorted, sorted.dropFirst()).map { $1.top - $0.bottom }
         let narrowest = gaps.min() ?? 0

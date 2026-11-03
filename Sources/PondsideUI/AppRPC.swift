@@ -65,6 +65,11 @@ final class AppRPC {
             return ["path": .string(file.url.path), "text": .string(file.text)]
         case "document.selection":
             return try controller(params).rpcSelection
+        case "document.log":
+            let c = try controller(params)
+            let path = params["path"]?.string ?? c.score.root.url.path
+            guard c.score.file(for: path) != nil else { throw RPCSocketServer.MethodError("not in the score: \(path)") }
+            return ["path": .string(path), "log": .string(CompilerLog.tail(c.score.lastLog))]
         case "document.context":
             let c = try controller(params)
             if let path = params["path"]?.string, let line = params["line"]?.int {

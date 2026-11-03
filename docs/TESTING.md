@@ -29,7 +29,10 @@ check the skipped tests before claiming success.
   and legend, header fields, legend candidates found in the instrumental
   music: `LegendScanTests`).
 - **Engrave**: toolchain, daemon, SVG geometry and hit-testing, mockup and
-  mix rendering, playback, render cache, shadow history, timing dump.
+  mix rendering, playback, render cache, shadow history, timing dump; the
+  marked section's interpolated edge moments (`SectionTimeMapTests`), the
+  staff-line window recipe (`StaffLineWindowTests`) and the bounded raw
+  compiler log (`CompilerLogTests`).
 - **Timing**: cue timing, handler sync, patch migration, the patch outline
   and doc (`PatchOutlineTests`: items and their lines, what a handler
   touches, notes kept across rebuilds and flagged stale when their code
@@ -42,7 +45,8 @@ check the skipped tests before claiming success.
   include of all of them compiles in sclang and builds every SynthDef;
   skipped without SuperCollider).
 - **Bridge**: MCP protocol and tools, RPC socket, score context and
-  graphics, agent configs (`AgentSetup`), the agent log (`AgentLogTests`:
+  graphics (including the no-graphic `code` layout/index and the hybrid
+  empty-section prompt), agent configs (`AgentSetup`), the agent log (`AgentLogTests`:
   JSONL append and incremental read, both agents' event streams, the
   pane's presentation), opencode's models, inline config and log-read
   provider errors (`OpencodeTests`); the `edit` tool's edits, the patch

@@ -85,6 +85,9 @@ public struct LensScoreWindow: Sendable {
     /// What the lens can't show faithfully, for a badge.
     public var unsupported: [String]
     public var targetEvent: Int
+    /// Every selected event in the window, when the selection spans more
+    /// than the target (⇧←/→); the target is always one of them.
+    public var selected: [Int] = []
     /// Bar numbers shown, a pickup counting as 0.
     public var bars: ClosedRange<Int>
     /// Whether the last bar shown is the last of the music, so it may end
@@ -170,8 +173,16 @@ public enum LensScoreBuilder {
             return nil
         }
 
-        let first = max(0, targetMeasure - max(0, radius))
-        let last = min(timeline.starts.count - 1, targetMeasure + max(0, radius))
+        // A range selection (⇧←/→) keeps every event it covers in the
+        // window, so the lens can mark the same passage as the score.
+        var selected = tree.eventIndices(overlapping: selection).filter { tree.events[$0].kind != .lyric }
+        if !selected.contains(target) { selected.append(target) }
+        let selectedMeasures = selected.compactMap { event in
+            timeline.events.first { $0.sourceEvent == event }?.measureIndex
+        }
+        let first = max(0, min(targetMeasure - max(0, radius), selectedMeasures.min() ?? targetMeasure))
+        let last = min(timeline.starts.count - 1,
+                       max(targetMeasure + max(0, radius), selectedMeasures.max() ?? targetMeasure))
         let measures = (first...last).map { index in
             LensMeasure(
                 index: index - first,
@@ -233,6 +244,7 @@ public enum LensScoreBuilder {
         var window = LensScoreWindow(xml: xml, label: block.label, events: events, unsupported: context.badges,
                                      targetEvent: target, bars: measures[0].number...measures[measures.count - 1].number,
                                      reachesEnd: last == timeline.starts.count - 1)
+        window.selected = selected
         window.slurs = slurs
         window.tuplets = tuplets.sorted { $0.start < $1.start }
         window.tremolos = tremolos

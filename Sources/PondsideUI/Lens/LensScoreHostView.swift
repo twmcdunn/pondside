@@ -60,12 +60,13 @@ final class LensScoreHostView: NSView {
         self.document = document
 
         targetMeasure = lens.target?.measureIndex ?? 0
+        let selected = LensScoreAdapter.items(of: lens, in: score)
         let selection: ScoreSelection
         if let (id, item) = LensScoreAdapter.target(of: lens, in: score) {
-            selection = .single(item)
             target = id
+            selection = selected.count > 1 ? .multi(selected) : .single(item)
         } else {
-            selection = .none
+            selection = selected.isEmpty ? .none : .multi(selected)
             target = nil
         }
 

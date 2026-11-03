@@ -478,6 +478,18 @@ final class SkillConsistencyTests: XCTestCase {
         }
     }
 
+    /// The one graphic skill and the app's selection JSON name the same fields.
+    func testTheGraphicSkillDescribesTheMarkedRange() throws {
+        let text = try String(contentsOf: skills.appendingPathComponent("graphic-notation/SKILL.md"), encoding: .utf8)
+        for key in ["graphic-section", "from", "to", "page_x", "from.at.moment", "systems", "section-window",
+                    "A new graphic", "Envelopes", "The legend", "Not every marked range is a drawing",
+                    "skill://lilypond", "(pair? ms)", "(ly:grob? sys)", "(ly:grob-array? cols)"] {
+            XCTAssertTrue(text.contains(key), key)
+        }
+        XCTAssertFalse(text.contains("music_around"), "the clicked-part selection is gone")
+        XCTAssertFalse(text.contains("till 7"), "no cue/bar naming for graphics")
+    }
+
     /// The skills describe front-matter.ily as Score Setup writes it.
     func testTheSkillsDescribePondsidesFrontMatter() throws {
         let graphic = try String(contentsOf: skills.appendingPathComponent("graphic-notation/SKILL.md"), encoding: .utf8)

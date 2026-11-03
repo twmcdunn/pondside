@@ -13,9 +13,10 @@ public enum ScoreContext {
     ///
     /// `files` are the score's files (path and text), searched for the
     /// definition of a graphic drawn by the score's own code; `cues` the
-    /// latest cue sheet, listed so "till 7" can mean cue 7.
+    /// latest cue sheet, for requests that name a cue.
     public static func describe(text: String, file: String, line: Int, character: Int,
-                                files: [ScoreGraphic.File] = [], cues: CueSheet? = nil) -> JSONValue {
+                                files: [ScoreGraphic.File] = [], cues: CueSheet? = nil,
+                                root: ScoreGraphic.File? = nil) -> JSONValue {
         guard let offset = utf8Offset(in: text, line: line, character: character) else {
             return ["file": .string(file), "error": .string("no line \(line) in \(file)")]
         }
@@ -54,6 +55,10 @@ public enum ScoreContext {
             out["graphic"] = custom
         } else if let graphic = graphic(around: offset, in: text) {
             out["graphic"] = graphic
+        } else if let root {
+            // No drawing here: a notation/layout request needs the layout and
+            // a map of the score's definitions, not the whole graphics file.
+            out["code"] = codeContext(root: root, files: all)
         }
         if let cues, !cues.cues.isEmpty {
             out["cues"] = .array(cues.cues.map { c in
@@ -106,6 +111,75 @@ public enum ScoreContext {
             return ["entry": .string(use.id), "params": .object(params),
                     "start": ["line": .number(Double(sl)), "character": .number(Double(sc))],
                     "stop": ["line": .number(Double(el)), "character": .number(Double(ec))]]
+        }
+        return nil
+    }
+
+
+    /// Root layout blocks and a short index of top-level definitions. Enough
+    /// for a notation/layout request to see `measureBarType`, Staff/Score
+    /// overrides and the helper names it may need, without reading a 100 KB
+    /// graphics file.
+    static func codeContext(root: ScoreGraphic.File, files: [ScoreGraphic.File]) -> JSONValue {
+        let all = [root] + files.filter { $0.path != root.path }
+        let rootLines = root.text.split(separator: "\n", omittingEmptySubsequences: false)
+        var blocks: [JSONValue] = []
+        var i = 0
+        while i < rootLines.count {
+            let line = rootLines[i]
+            guard line.contains("\\layout") else { i += 1; continue }
+            guard line.firstIndex(of: "{") != nil else { i += 1; continue }
+            var depth = 0
+            var j = i
+            var found = false
+            while j < rootLines.count {
+                let s = rootLines[j]
+                for ch in s {
+                    if ch == "{" { depth += 1; found = true }
+                    if ch == "}" { depth -= 1 }
+                    if found, depth == 0 { break }
+                }
+                if found, depth == 0 { break }
+                j += 1
+            }
+            guard found else { i += 1; continue }
+            let from = i + 1, to = j + 1
+            let text = rootLines[i...j].joined(separator: "\n")
+            var block: [String: JSONValue] = ["file": .string(root.path), "from_line": .number(Double(from)),
+                                              "to_line": .number(Double(to))]
+            if to - from < 240 { block["text"] = .string(numbered(text, from: from)) }
+            blocks.append(.object(block))
+            i = max(j + 1, i + 1)
+        }
+        var defs: [JSONValue] = []
+        var seen = Set<String>()
+        for f in all {
+            let lines = f.text.split(separator: "\n", omittingEmptySubsequences: false)
+            for (index, raw) in lines.enumerated() {
+                let line = String(raw)
+                guard let name = definitionName(line), seen.insert("\(f.path):\(index + 1):\(name)").inserted else { continue }
+                defs.append(["name": .string(name), "file": .string(f.path), "line": .number(Double(index + 1)),
+                             "text": .string(String(line.trimmingCharacters(in: .whitespaces).prefix(120)))])
+                if defs.count >= 120 { break }
+            }
+            if defs.count >= 120 { break }
+        }
+        return .object(["layout": .array(blocks), "definitions": .array(defs)])
+    }
+
+    static func definitionName(_ line: String) -> String? {
+        let t = line.trimmingCharacters(in: .whitespaces)
+        for head in ["#(define (", "#(define* (", "#(define "] where t.hasPrefix(head) {
+            let rest = t.dropFirst(head.count)
+            let name = rest.prefix { $0.isLetter || $0.isNumber || "-*?!<>=/:+".contains($0) }
+            if name.count > 2 { return String(name) }
+        }
+        // A top-level Scheme variable: `foo = ...` (allow a leading #).
+        if !line.hasPrefix(" "), !line.hasPrefix("\t"), let eq = line.firstIndex(of: "=") {
+            let name = line[..<eq].trimmingCharacters(in: .whitespaces)
+            if name.first?.isLetter == true, name.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" }) {
+                return name
+            }
         }
         return nil
     }

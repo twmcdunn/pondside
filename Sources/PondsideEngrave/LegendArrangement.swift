@@ -30,6 +30,53 @@ public struct LegendArrangement: Sendable {
         public var unitsPerMM: Double
         /// All rows' frames.
         public var table: Rect { rows.dropFirst().reduce(rows[0].frame) { $0.union($1.frame) } }
+
+        /// The sheet as a committed drag leaves it, before the next engraving
+        /// replaces the page: the baseline for another drag made while that
+        /// engraving is still running.
+        public func applying(_ outcome: Outcome) -> Sheet {
+            /// A move applies to an element when it covers the element's
+            /// whole width: the table covers every row, a row-gap covers one
+            /// row's frame, a column drag covers the words, a scale the
+            /// example. Their midpoints alone would confuse them.
+            func transform(_ r: Rect) -> AffineTransform? {
+                outcome.moves.first {
+                    $0.region.contains(Point(r.minX, r.midY)) && $0.region.contains(Point(r.maxX, r.midY))
+                }?.transform
+            }
+            func moved(_ r: Rect) -> Rect {
+                transform(r).map { r.transformed(by: $0) } ?? r
+            }
+            var rows: [Row] = []
+            for row in self.rows {
+                var r = row
+                r.frame = moved(row.frame)
+                r.words = row.words.map(moved)
+                let shown = row.example.map(moved)
+                r.example = shown
+                if let full = row.full {
+                    // A cropped example is narrower than what the scale
+                    // transform names; its shown part still says how it moved.
+                    if let old = row.example, let t = transform(old) {
+                        r.full = full.transformed(by: t)
+                    } else {
+                        r.full = moved(full)
+                    }
+                }
+                if let e = shown {
+                    var lo = e.minX, hi = e.maxX
+                    for h in outcome.hidden where h.minY < e.maxY && h.maxY > e.minY {
+                        if h.minX <= lo + 0.01, h.maxX > lo { lo = min(hi, h.maxX) }
+                        if h.maxX >= hi - 0.01, h.minX < hi { hi = max(lo, h.minX) }
+                    }
+                    r.example = Rect(x: lo, y: e.y, width: hi - lo, height: e.height)
+                }
+                rows.append(r)
+            }
+            var sheet = self
+            sheet.rows = rows
+            return sheet
+        }
     }
 
     public var sheets: [Sheet]

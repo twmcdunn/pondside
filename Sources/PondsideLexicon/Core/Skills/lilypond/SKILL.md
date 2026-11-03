@@ -38,6 +38,13 @@ score/
 
 **In Pondside** the loop is shorter: write the file; the app re-engraves it at once and the user sees it. Call the MCP `check` tool for diagnostics (with the app running it answers from the app's engraving in about a second; don't run `lilypond` yourself). Render and look (`render` with `format: "png"`) only for a layout change the user can't judge at a glance, never for a parameter tweak.
 
+For a request from Pondside's lens over a marked range with no drawing (barlines,
+beams, clefs, spacing, noteheads, a Staff/Score override), edit the score's
+layout or helpers directly; do not create a Lexicon entry for a one-off change.
+The marked range is still the only range. Use `score_context`'s `from.at` and
+`to.at` as the edge times, and its `code` layout/definition index before reading
+a whole file.
+
 When a change does not show up: the PDF may not have been rewritten (compile error), or a callback ran too early and its result was cached (see references/scheme.md, "timing").
 
 ## Things that come up in every score
@@ -66,6 +73,13 @@ See references/spacing.md: tight staves within a system with all spare space bet
 ## Scheme
 
 Custom stencils, callbacks and music functions are where LilyPond is most powerful and most fragile. references/scheme.md has the patterns (spanner geometry, finding other grobs, registries, deferring a stencil until layout is final, music functions that build chords/events, custom event properties) and the gotchas that cost hours: Guile 3 has no `string-match`; music *types* are lowercase (`'note-event`) while music *names* are CamelCase (`'NoteEvent`); `ly:make-duration` takes the factor as two integers; `ly:skylines-for-stencil` takes (stencil axis); a system's `all-elements` has no spanners.
+
+- **Staff lines over a range** (curly staff, partial hiding): read
+  `references/staff-lines.md`. Do not use `StaffSymbol.transparent` or
+  `\stopStaff` for a partial system; they affect the whole staff segment.
+- **Official manual pages**: `references/manual-index.md` lists the small set
+  worth consulting. The manual is not bundled and the agent has no web
+  access; use the tested references instead of guessing.
 
 ## Checklist before saying a layout change is done
 

@@ -62,6 +62,22 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(garbage["error"]?["code"], .number(-32700))
     }
 
+    func testCheckReturnsTheRawLogWhenTheErrorHasNoUsefulDiagnostic() async throws {
+        let dir = try temp()
+        try "\\version \"2.26.0\"\n#(car '())\n{ c'1 }\n".write(to: dir.appendingPathComponent("bad.ly"),
+                                                        atomically: true, encoding: .utf8)
+        let server = MCPServer(project: dir)
+        let reply = try await call(server, #"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"check","arguments":{"file":"bad.ly"}}}"#)
+        guard case .array(let content)? = reply["result"]?["content"], let text = content.first?["text"]?.string else {
+            return XCTFail("\(reply)")
+        }
+        if text.contains("LilyPond is not installed") { throw XCTSkip("no LilyPond") }
+        let report = try JSONDecoder().decode(JSONValue.self, from: Data(text.utf8))
+        XCTAssertEqual(report["ok"], false)
+        XCTAssertFalse(report["log"]?.string?.isEmpty ?? true, "the raw compiler log is returned")
+        XCTAssertTrue(report["log"]?.string?.contains("Wrong type") ?? false, text)
+    }
+
     func testQueryGivesAbsolutePitchesAndPositions() async throws {
         let dir = try temp()
         try "\\relative c' {\n  c4 e8 <g c>\n}\n".write(to: dir.appendingPathComponent("s.ly"), atomically: true, encoding: .utf8)

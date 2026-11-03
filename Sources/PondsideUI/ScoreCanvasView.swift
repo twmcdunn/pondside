@@ -4,12 +4,17 @@ import PondsideEngrave
 
 @MainActor
 protocol ScoreCanvasDelegate: AnyObject {
-    /// The user clicked a linked glyph (or empty paper: nil).
-    func canvas(_ canvas: ScoreCanvasView, didClick link: PointAndClickLocation?, extending: Bool)
+    /// The user clicked a linked glyph (or empty paper: nil), at a page point.
+    func canvas(_ canvas: ScoreCanvasView, didClick link: PointAndClickLocation?,
+                at page: Int?, point: Point?, extending: Bool)
+    /// The user clicked a graphic with ⌥ held (no drag): show its source.
+    func canvas(_ canvas: ScoreCanvasView, didClickGraphic link: PointAndClickLocation)
+    /// Whether a link is a graphic's `\\start…` command (for ⌥ selection).
+    func canvas(_ canvas: ScoreCanvasView, isGraphicLink link: PointAndClickLocation) -> Bool
     /// The user dragged a selection rectangle over these links.
     func canvas(_ canvas: ScoreCanvasView, didSelect links: [PointAndClickLocation])
-    /// The user clicked music that carries no point-and-click link.
-    func canvasClickedUnlinkedMusic(_ canvas: ScoreCanvasView)
+    /// The user marked a graphic section (⌥-drag), or cleared it (nil).
+    func canvas(_ canvas: ScoreCanvasView, didSelectGraphicSection section: GraphicSection?)
     /// A key pressed while the score has focus. Return true if handled.
     func canvas(_ canvas: ScoreCanvasView, handleKey event: NSEvent) -> Bool
 }
@@ -68,6 +73,10 @@ final class ScoreCanvasView: NSView {
     /// Replaces the pages, cross-fading so a recompile never flickers.
     func setPages(_ newPages: [EngravedPage]) {
         lastInserted = nil
+        playhead = nil
+        graphicSectionSelection = nil
+        sectionDrag = nil
+        pendingLegend = [:]
         legend = legendArranging ? LegendArrangement(pages: newPages) : nil
         legendPages = Set(LegendArrangement(pages: newPages).sheets.map(\.page))
         let rendered = newPages.map(RenderedPage.init)
@@ -89,6 +98,150 @@ final class ScoreCanvasView: NSView {
         relayout()
     }
 
+    // MARK: Playback head
+
+    /// The audio's place in the score: one line over the system playing now,
+    /// in page coordinates. A display-only cursor; it never takes focus.
+    private(set) var playhead: PlayheadPosition? {
+        didSet {
+            guard playhead != oldValue else { return }
+            for (n, v) in pageViews.enumerated() { v.playhead = playhead?.page == n ? playhead : nil }
+        }
+    }
+
+    func setPlayhead(_ position: PlayheadPosition?) {
+        playhead = position
+    }
+
+    /// Brings a new system into view. Called when the head moves to another
+    /// system, not on every tick, so the page doesn't creep while it plays.
+    func revealPlayhead() {
+        guard let p = playhead, pageViews.indices.contains(p.page) else { return }
+        let v = pageViews[p.page]
+        let rect = convert(v.viewRect(for: Rect(x: p.x, y: p.top, width: 0, height: p.bottom - p.top)), from: v)
+        guard !visibleRect.insetBy(dx: -24, dy: -24).contains(rect) else { return }
+        scrollToVisible(rect.insetBy(dx: -80, dy: -40))
+    }
+
+    // MARK: Graphic section (⌥-drag)
+
+    /// The section marked with ⌥-drag; what a graphics request may change.
+    private(set) var graphicSectionSelection: GraphicSection?
+
+    /// The section's boxes in canvas coordinates, for the request popover.
+    var graphicSectionAnchor: NSRect? {
+        guard let section = graphicSectionSelection else { return nil }
+        var union: NSRect?
+        for s in section.systems where pageViews.indices.contains(s.page) {
+            let v = pageViews[s.page]
+            let r = convert(v.viewRect(for: Rect(x: s.pageX.lowerBound, y: s.staff.top,
+                                                 width: s.pageX.upperBound - s.pageX.lowerBound,
+                                                 height: s.staff.bottom - s.staff.top)), from: v)
+            union = union.map { $0.union(r) } ?? r
+        }
+        return union
+    }
+
+    private struct SectionDrag {
+        var startPage: Int
+        var start: Point
+        var link: PointAndClickLocation?
+    }
+    private var sectionDrag: SectionDrag?
+
+    fileprivate func beginGraphicSection(page: Int, point: Point, link: PointAndClickLocation?) {
+        guard !legendArranging else { return }
+        sectionDrag = SectionDrag(startPage: page, start: point, link: link)
+        graphicSectionSelection = nil
+        pageViews.forEach { $0.sectionBoxes = []; $0.highlights = [] }
+    }
+
+    fileprivate func updateGraphicSection(windowPoint: NSPoint) {
+        guard let drag = sectionDrag else { return }
+        let end = sectionEnd(windowPoint: windowPoint, startPage: drag.startPage)
+        guard let section = GraphicSection.make(pages: pages.map(\.page),
+                                               from: (drag.startPage, drag.start),
+                                               to: end, link: drag.link) else {
+            pageViews.forEach { $0.sectionBoxes = [] }
+            return
+        }
+        showGraphicSection(section)
+    }
+
+    fileprivate func endGraphicSection(windowPoint: NSPoint) {
+        guard let drag = sectionDrag else { return }
+        let end = sectionEnd(windowPoint: windowPoint, startPage: drag.startPage)
+        sectionDrag = nil
+        let section = GraphicSection.make(pages: pages.map(\.page),
+                                         from: (drag.startPage, drag.start),
+                                         to: end, link: drag.link)
+        graphicSectionSelection = section
+        if let section {
+            showGraphicSection(section)
+            delegate?.canvas(self, didSelectGraphicSection: section)
+        } else {
+            pageViews.forEach { $0.sectionBoxes = [] }
+            // An ⌥-click with no drag is the graphic's source navigation;
+            // a drag is the section request.
+            if let link = drag.link { delegate?.canvas(self, didClickGraphic: link) }
+            delegate?.canvas(self, didSelectGraphicSection: nil)
+        }
+    }
+
+    /// Clears the section; a normal click or ⎋ does this.
+    func clearGraphicSection(notify: Bool = true) {
+        guard graphicSectionSelection != nil || sectionDrag != nil else { return }
+        sectionDrag = nil
+        graphicSectionSelection = nil
+        pageViews.forEach { $0.sectionBoxes = [] }
+        if notify { delegate?.canvas(self, didSelectGraphicSection: nil) }
+    }
+
+    private func showGraphicSection(_ section: GraphicSection) {
+        pageViews.forEach { $0.sectionBoxes = [] }
+        for s in section.systems where pageViews.indices.contains(s.page) {
+            let r = Rect(x: s.pageX.lowerBound, y: s.staff.top,
+                         width: s.pageX.upperBound - s.pageX.lowerBound,
+                         height: s.staff.bottom - s.staff.top)
+            pageViews[s.page].sectionBoxes.append(r)
+        }
+    }
+
+    /// The release's page and page point. Over a page, its nearest system is
+    /// the end system; outside the sheets, the nearest system by vertical
+    /// distance over every page is used, so a drag off the paper still ends
+    /// on a system (and the x is taken on that page).
+    private func sectionEnd(windowPoint: NSPoint, startPage: Int) -> (page: Int, point: Point) {
+        let p = convert(windowPoint, from: nil)
+        if let page = pageViews.indices.first(where: { pageViews[$0].frame.contains(p) }) {
+            let v = pageViews[page]
+            return (page, v.pagePoint(v.convert(p, from: self)))
+        }
+        var best: (page: Int, distance: CGFloat, point: Point)?
+        for (i, v) in pageViews.enumerated() {
+            guard let rendered = v.rendered else { continue }
+            let pagePoint = v.pagePoint(v.convert(p, from: self))
+            for band in EngravedPage.systems(of: rendered.page.staves) {
+                let r = convert(v.viewRect(for: Rect(x: 0, y: band.lowerBound, width: 0,
+                                                     height: band.upperBound - band.lowerBound)), from: v)
+                let distance: CGFloat = p.y < r.minY ? r.minY - p.y : (p.y > r.maxY ? p.y - r.maxY : 0)
+                if best == nil || distance < best!.distance { best = (i, distance, pagePoint) }
+            }
+        }
+        if let best { return (best.page, best.point) }
+        let page = pageViews.indices.min {
+            pageDistance(pageViews[$0].frame, p) < pageDistance(pageViews[$1].frame, p)
+        } ?? startPage
+        let v = pageViews[page]
+        return (page, v.pagePoint(v.convert(p, from: self)))
+    }
+
+    private func pageDistance(_ rect: NSRect, _ p: NSPoint) -> CGFloat {
+        let dx = max(max(rect.minX - p.x, 0), p.x - rect.maxX)
+        let dy = max(max(rect.minY - p.y, 0), p.y - rect.maxY)
+        return (dx * dx + dy * dy).squareRoot()
+    }
+
     // MARK: Arranging the legend
 
     /// Arrange mode: the legend's handles show, and drags on a legend page
@@ -97,12 +250,19 @@ final class ScoreCanvasView: NSView {
         didSet {
             guard legendArranging != oldValue else { return }
             legend = legendArranging ? LegendArrangement(pages: pages.map(\.page)) : nil
+            pendingLegend = [:]
+            clearGraphicSection(notify: false)
             pageViews.forEach { $0.legendDrag = nil; $0.needsDisplay = true; $0.window?.invalidateCursorRects(for: $0) }
         }
     }
     private(set) var legend: LegendArrangement?
     /// The pages that hold the legend's table.
     private(set) var legendPages: Set<Int> = []
+
+    /// Drags committed since the pages were last engraved, by page. A drag
+    /// made before the next engraving lands starts from these, so the page
+    /// and the handles stay where the last drop left them.
+    private var pendingLegend: [Int: [LegendArrangement.Outcome]] = [:]
 
     /// A legend page fills most of what is on screen: the status bar then
     /// offers to arrange it.
@@ -134,8 +294,31 @@ final class ScoreCanvasView: NSView {
     }
 
     fileprivate func legendSheet(_ v: PageView) -> LegendArrangement.Sheet? {
-        guard legendArranging, let n = v.pageIndex else { return nil }
-        return legend?.sheet(page: n)
+        guard legendArranging, let n = v.pageIndex, var sheet = legend?.sheet(page: n) else { return nil }
+        for outcome in pendingLegend[n] ?? [] { sheet = sheet.applying(outcome) }
+        return sheet
+    }
+
+    /// A drag's starting point: the sheet and the file's values as the last
+    /// committed drag left them.
+    fileprivate func legendBaseline(_ v: PageView)
+        -> (sheet: LegendArrangement.Sheet, layout: FrontMatter.LegendLayout, examples: [FrontMatter.ExampleLayout])? {
+        guard let sheet = legendSheet(v) else { return nil }
+        let (layout, examples) = legendValues()
+        return (sheet, layout, examples)
+    }
+
+    /// Keeps a finished drag as the preview the next drag starts from, until
+    /// the engraving replaces the page, and writes it.
+    fileprivate func commitLegend(_ v: PageView, _ outcome: LegendArrangement.Outcome) {
+        guard let n = v.pageIndex else { return }
+        pendingLegend[n, default: []].append(outcome)
+        onLegendCommit(outcome)
+    }
+
+    fileprivate func pendingLegendOutcomes(for page: Int?) -> [LegendArrangement.Outcome] {
+        guard let page else { return [] }
+        return pendingLegend[page] ?? []
     }
 
     /// Handle tolerance: 5 points on screen, in page units.
@@ -146,9 +329,9 @@ final class ScoreCanvasView: NSView {
 
     fileprivate func legendDrag(_ v: PageView, handle: LegendArrangement.Handle, from start: Point, to p: Point,
                                 event: NSEvent) -> LegendArrangement.Outcome? {
-        guard let legend, let sheet = legendSheet(v) else { return nil }
-        let (layout, examples) = legendValues()
-        let outcome = legend.drag(handle, on: sheet, from: start, to: p, layout: layout, examples: examples,
+        guard let legend, let baseline = legendBaseline(v) else { return nil }
+        let outcome = legend.drag(handle, on: baseline.sheet, from: start, to: p,
+                                  layout: baseline.layout, examples: baseline.examples,
                                   snap: !event.modifierFlags.contains(.command), all: event.modifierFlags.contains(.option),
                                   threshold: 2 * legendTolerance(v))
         onLegendStatus(outcome.summary)
@@ -224,40 +407,13 @@ final class ScoreCanvasView: NSView {
         return []
     }
 
-    /// Where the last click landed, so a large drawing highlights the shape
-    /// under it rather than all of itself.
-    private var clickFocus: (view: PageView, point: Point, link: PointAndClickLocation)?
-
-    /// The shape a click selected inside a drawing of many parts, for the
-    /// agent: its bounds and the broken spanner piece it belongs to, in
-    /// page (staff-space) coordinates.
-    struct LinkAnchor {
-        var x: Double
-        var link: PointAndClickLocation
-    }
-    struct GraphicPartSelection {
-        var page: Int
-        var part: Rect
-        var piece: Rect
-        var staffMiddle: Double
-        var space: Double
-        /// Other linked glyphs on the clicked system, for the bar/moment
-        /// nearest the part.
-        var anchors: [LinkAnchor]
-    }
-    private(set) var graphicPartSelection: GraphicPartSelection?
-
     /// Highlights every graphic produced by the given source positions.
     /// The highlight is an overlay; the music itself is never recoloured.
     func highlight(_ positions: Set<SourcePosition>, path: String?, reveal: Bool) {
         var firstRect: NSRect?
         selectionAnchor = nil
-        graphicPartSelection = nil
         var sameFile: [String: Bool] = [:]
-        // A drawing of many parts (a 20-bar texture, a spanner of separate
-        // bursts) shows only the shape that was clicked, or its first one.
-        var shownLarge = Set<PointAndClickLocation>()
-        for (index, v) in pageViews.enumerated() {
+        for v in pageViews {
             guard let page = v.rendered?.page else { continue }
             let matches = page.graphics.filter { g in
                 guard !v.removed.contains(g) else { return false }
@@ -268,46 +424,8 @@ final class ScoreCanvasView: NSView {
                 sameFile[link.path] = same
                 return same
             }
-            // A drawing of many parts is outlined by shape, not part by part.
-            var parts: [PointAndClickLocation: [Graphic]] = [:]
-            for g in matches { parts[g.link!, default: []].append(g) }
-            let space = v.staves.first?.space ?? 1
-            var rects: [Rect] = []
-            for (link, group) in parts {
-                guard group.count > 8 else { rects += group.map(\.bounds); continue }
-                guard !shownLarge.contains(link) else { continue }
-                let shapes = EngravedPage.clusters(of: group, gap: EngravedPage.clusterGap * space)
-                // The shape on screen: the one clicked, else the first. Whichever
-                // it is, the agent's context describes exactly it.
-                let shown: Rect?
-                if let focus = clickFocus, focus.link == link {
-                    guard focus.view === v else { continue }
-                    shown = shapes.min { $0.distance(to: focus.point) < $1.distance(to: focus.point) }
-                } else {
-                    shown = shapes.first
-                }
-                guard let near = shown else { continue }
-                rects.append(near)
-                shownLarge.insert(link)
-                if graphicPartSelection == nil,
-                   let staff = page.staff(at: Point(near.midX, near.midY), among: v.staves) {
-                    let band = EngravedPage.systems(of: v.staves)
-                        .first { ($0.lowerBound - 6)...($0.upperBound + 6) ~= near.midY }
-                    let pieceParts = band.map { b in group.filter { b.contains($0.bounds.midY) } } ?? group
-                    if let piece = EngravedPage.bounds(of: pieceParts) {
-                        let middle = staff.lineYs.count > 2 ? staff.lineYs[staff.lineYs.count / 2] : staff.top
-                        let anchors = page.graphics.compactMap { g -> LinkAnchor? in
-                            guard let gl = g.link, gl != link, band.map({ $0.contains(g.bounds.midY) }) ?? true else { return nil }
-                            return LinkAnchor(x: g.bounds.midX, link: gl)
-                        }.sorted { abs($0.x - near.midX) < abs($1.x - near.midX) }.prefix(16)
-                        graphicPartSelection = GraphicPartSelection(page: index + 1, part: near, piece: piece,
-                                                                    staffMiddle: middle, space: staff.space,
-                                                                    anchors: Array(anchors))
-                    }
-                }
-            }
-            v.highlights = rects
-            let shown: Rect? = rects.dropFirst().reduce(rects.first) { acc, r in acc?.union(r) }
+            v.highlights = matches.map(\.bounds)
+            let shown = matches.dropFirst().reduce(matches.first?.bounds) { acc, g in acc?.union(g.bounds) }
             if firstRect == nil, let r = shown {
                 firstRect = convert(v.viewRect(for: r), from: v)
                 var band = r
@@ -336,7 +454,10 @@ final class ScoreCanvasView: NSView {
     /// staying readable every cycle. No spinner: the status bar says in
     /// words what the agent is doing.
     func beginWork(label: String) {
-        for v in pageViews { v.working = v.highlights }
+        // A graphics request's region is its marked section, not the note
+        // highlight: the request starts from the section's `\start…` link,
+        // where there is no event to highlight.
+        for v in pageViews { v.working = v.sectionBoxes.isEmpty ? v.highlights : v.sectionBoxes }
         guard pageViews.contains(where: { !$0.working.isEmpty }) else { return }
         workBadge?.removeFromSuperview()
         workBadge = nil
@@ -380,17 +501,10 @@ final class ScoreCanvasView: NSView {
     fileprivate func pageView(_ v: PageView, clickedAt p: Point, event: NSEvent) {
         window?.makeFirstResponder(self)
         let tolerance = 0.3 / max(zoom, 0.5)
-        // Between the parts of a drawing (a grain cloud's dots) still selects it.
         let link = v.rendered?.page.hitTest(p, tolerance: tolerance, excluding: v.removed)?.link
             ?? v.rendered?.page.regionHit(p, excluding: v.removed)?.link
-        clickFocus = link.map { (v, p, $0) }
-        if link == nil, let page = v.rendered?.page,
-           page.graphics.contains(where: { $0.bounds.insetBy(-tolerance).contains(p) && $0.bounds.width < page.viewBox.width * 0.5 }) {
-            // Something is there, but it can't lead back to the source.
-            delegate?.canvasClickedUnlinkedMusic(self)
-            return
-        }
-        delegate?.canvas(self, didClick: link, extending: event.modifierFlags.contains(.shift))
+        delegate?.canvas(self, didClick: link, at: pageViews.firstIndex { $0 === v }, point: p,
+                          extending: event.modifierFlags.contains(.shift))
     }
 
     /// Provisional rendering: ghost noteheads where the given notes are
@@ -523,7 +637,8 @@ final class ScoreCanvasView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        delegate?.canvas(self, didClick: nil, extending: false)
+        clearGraphicSection()
+        delegate?.canvas(self, didClick: nil, at: nil, point: nil, extending: false)
     }
 }
 
@@ -539,12 +654,17 @@ private final class PageView: NSView {
             highlights = []
             badges = []
             legendDrag = nil
-            legendCommitted = false
+            playhead = nil
+            sectionBoxes = []
             needsDisplay = true
             updateWork()
         }
     }
     private(set) var staves: [Staff] = []
+    /// The audio's place on this page, when it is the page playing.
+    var playhead: PlayheadPosition? { didSet { if playhead != oldValue { updatePlayhead() } } }
+    /// The ⌥-drag section's boxes on this page, in page coordinates.
+    var sectionBoxes: [Rect] = [] { didSet { if sectionBoxes != oldValue { needsDisplay = true } } }
     /// Engraved note glyphs moved to provisional (not yet engraved) positions.
     var provisional: [NoteGlyph] = [] { didSet { if provisional != oldValue { needsDisplay = true } } }
     /// Glyphs the provisional deletion has taken out of the page.
@@ -558,6 +678,13 @@ private final class PageView: NSView {
     private let workLayer = CAShapeLayer()
     /// A blurred copy of the music in the work region, faded in and out.
     private let blurLayer = CALayer()
+    /// Blurs the snapshot itself: a layer filter is not reliable on a
+    /// sublayer, and the copy must really be blurred to read as work.
+    private lazy var blurContext = CIContext(options: nil)
+    /// The playback head, on layers of its own so following the audio never
+    /// redraws the music.
+    private let playheadLine = CAShapeLayer()
+    private let playheadCap = CAShapeLayer()
     private var displayOptionsObserver: NSObjectProtocol?
 
     /// The work region in view coordinates, padded like the outline.
@@ -568,12 +695,20 @@ private final class PageView: NSView {
     private var dragStart: NSPoint?
     private var dragRect: NSRect? { didSet { needsDisplay = true } }
     var pageIndex: Int?
+    /// This page received the ⌥-mouse-down of a graphic-section drag; the
+    /// events go to the owner because the release may be on another page.
+    private var sectionDragging = false
     /// A legend drag: its handle, where it began, and what it makes so far
     /// (kept, drawn, until the next engraving replaces the page).
     var legendDrag: (handle: LegendArrangement.Handle, start: Point, outcome: LegendArrangement.Outcome?)? {
         didSet { needsDisplay = true }
     }
-    private var legendCommitted = false
+
+    /// The committed drags still waiting for an engraving, plus the one in
+    /// progress, in the order they applied.
+    private var legendOutcomes: [LegendArrangement.Outcome] {
+        (owner?.pendingLegendOutcomes(for: pageIndex) ?? []) + [legendDrag?.outcome].compactMap { $0 }
+    }
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
@@ -590,9 +725,17 @@ private final class PageView: NSView {
         blurLayer.zPosition = 0.5
         blurLayer.masksToBounds = true
         layer?.addSublayer(blurLayer)
+        for head in [playheadLine, playheadCap] {
+            head.isHidden = true
+            head.zPosition = 2
+            layer?.addSublayer(head)
+        }
+        playheadLine.fillColor = nil
+        playheadLine.lineCap = .round
+        playheadCap.fillColor = Theme.accent.cgColor
         displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateWork() }
+            MainActor.assumeIsolated { self?.updateWork(); self?.updatePlayhead() }
         }
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.55)
@@ -612,7 +755,37 @@ private final class PageView: NSView {
         if changed {
             needsDisplay = true
             updateWork()
+            updatePlayhead()
         }
+    }
+
+    /// Places the head on its own layers: following the audio never redraws
+    /// the music, and it stays above the page under Lights Out.
+    private func updatePlayhead() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let p = playhead, rendered != nil else {
+            playheadLine.isHidden = true
+            playheadCap.isHidden = true
+            return
+        }
+        let r = viewRect(for: Rect(x: p.x, y: p.top, width: 0, height: p.bottom - p.top))
+        let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        let line = CGMutablePath()
+        line.move(to: CGPoint(x: r.midX, y: r.minY))
+        line.addLine(to: CGPoint(x: r.midX, y: r.maxY))
+        playheadLine.frame = bounds
+        playheadLine.path = line
+        playheadLine.strokeColor = Theme.accent.withAlphaComponent(contrast ? 1 : 0.85).cgColor
+        playheadLine.lineWidth = contrast ? 2.5 : 1.75
+        playheadLine.isHidden = false
+        let radius: CGFloat = contrast ? 4.5 : 3.5
+        playheadCap.frame = bounds
+        playheadCap.path = CGPath(ellipseIn: CGRect(x: r.midX - radius, y: r.minY - radius,
+                                                     width: radius * 2, height: radius * 2), transform: nil)
+        playheadCap.fillColor = Theme.accent.cgColor
+        playheadCap.isHidden = false
     }
 
     /// The pulsing outline: the selection's own accent and shape, breathing
@@ -675,9 +848,18 @@ private final class PageView: NSView {
         guard region.width > 1, region.height > 1, let rep = bitmapImageRepForCachingDisplay(in: region) else { return }
         cacheDisplay(in: region, to: rep)
         blurLayer.frame = region
-        blurLayer.contents = rep.cgImage
+        let image = rep.cgImage
+        if let image {
+            let source = CIImage(cgImage: image)
+            let blurred = source.clampedToExtent()
+                .applyingGaussianBlur(sigma: 3.5)
+                .cropped(to: source.extent)
+            blurLayer.contents = blurContext.createCGImage(blurred, from: source.extent) ?? image
+        } else {
+            blurLayer.contents = nil
+        }
         blurLayer.contentsScale = window?.backingScaleFactor ?? 2
-        blurLayer.filters = [CIFilter(name: "CIGaussianBlur", parameters: [kCIInputRadiusKey: 3.5])].compactMap { $0 }
+        blurLayer.filters = []
         blurLayer.isHidden = false
         if blurLayer.animation(forKey: "pondside.blur") == nil {
             let fade = CABasicAnimation(keyPath: "opacity")
@@ -726,12 +908,18 @@ private final class PageView: NSView {
         ctx.translateBy(x: -vb.x, y: -vb.y)
         let visible = Rect(x: vb.x + dirtyRect.minX / s, y: vb.y + dirtyRect.minY / s,
                            width: dirtyRect.width / s, height: dirtyRect.height / s)
-        let moves = legendDrag?.outcome?.moves ?? []
+        let outcomes = legendOutcomes
         var moving: [(Graphic, PondsideEngrave.AffineTransform)] = []
-        if !moves.isEmpty {
+        if !outcomes.isEmpty {
             for g in rendered.page.graphics {
-                let c = Point(g.bounds.midX, g.bounds.midY)
-                if let m = moves.first(where: { $0.region.contains(c) }) { moving.append((g, m.transform)) }
+                var point = Point(g.bounds.midX, g.bounds.midY)
+                var transform = PondsideEngrave.AffineTransform.identity
+                for outcome in outcomes {
+                    guard let t = outcome.moves.first(where: { $0.region.contains(point) })?.transform else { continue }
+                    transform = transform.then(t)
+                    point = t.apply(point)
+                }
+                if !transform.isIdentity { moving.append((g, transform)) }
             }
         }
         rendered.draw(in: ctx, visible: visible, excluding: moving.isEmpty ? removed : removed.union(moving.map(\.0)))
@@ -796,6 +984,22 @@ private final class PageView: NSView {
             NSGraphicsContext.restoreGraphicsState()
         }
 
+        // The ⌥-drag section: one box per system, the whole staff tall.
+        if !sectionBoxes.isEmpty {
+            let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+            for r in sectionBoxes {
+                let rect = viewRect(for: r).insetBy(dx: -2, dy: -2)
+                let path = CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
+                ctx.addPath(path)
+                ctx.setFillColor(accent.withAlphaComponent(contrast ? 0.2 : 0.12).cgColor)
+                ctx.fillPath()
+                ctx.addPath(path)
+                ctx.setStrokeColor(accent.withAlphaComponent(contrast ? 1 : 0.85).cgColor)
+                ctx.setLineWidth(contrast ? 2.5 : 1.5)
+                ctx.strokePath()
+            }
+        }
+
         if let dragRect {
             ctx.setFillColor(accent.withAlphaComponent(0.08).cgColor)
             ctx.fill(dragRect)
@@ -835,9 +1039,19 @@ private final class PageView: NSView {
         ctx.saveGState()
         defer { ctx.restoreGState() }
         let outcome = legendDrag?.outcome
-        for r in outcome?.hidden ?? [] {
-            ctx.setFillColor(Theme.paper.withAlphaComponent(0.82).cgColor)
-            ctx.fill(viewRect(for: r))
+        // What a crop hides, carried along by drags that came after it.
+        let outcomes = legendOutcomes
+        for (i, dragged) in outcomes.enumerated() {
+            for hidden in dragged.hidden {
+                var r = hidden
+                for later in outcomes.dropFirst(i + 1) {
+                    if let t = later.moves.first(where: { $0.region.contains(Point(r.midX, r.midY)) })?.transform {
+                        r = r.transformed(by: t)
+                    }
+                }
+                ctx.setFillColor(Theme.paper.withAlphaComponent(0.82).cgColor)
+                ctx.fill(viewRect(for: r))
+            }
         }
         // The frames and handles travel with what is being dragged.
         let overlay = LegendArrangement.overlay(of: sheet, outcome: outcome)
@@ -896,6 +1110,10 @@ private final class PageView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        if event.modifierFlags.contains(.option), owner?.legendArranging != true {
+            NSCursor.crosshair.set()
+            return
+        }
         guard owner?.legendArranging == true else { return }
         let p = convert(event.locationInWindow, from: nil)
         switch legendHandle(at: p) {
@@ -909,15 +1127,52 @@ private final class PageView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        if !legendCommitted, let handle = legendHandle(at: p) {
+        let pageP = pagePoint(p)
+        if let owner, !owner.legendArranging, event.modifierFlags.contains(.option) {
+            owner.beginGraphicSection(page: pageIndex ?? 0, point: pageP, link: graphicLink(at: pageP))
+            sectionDragging = true
+            return
+        }
+        owner?.clearGraphicSection()
+        // A committed drag still previewing is not a drag in progress: this
+        // press may take another handle where the last drop left it.
+        legendDrag = nil
+        if let handle = legendHandle(at: p) {
             if case .table = handle { NSCursor.closedHand.set() }
-            legendDrag = (handle, pagePoint(p), nil)
+            legendDrag = (handle, pageP, nil)
             return
         }
         dragStart = p
     }
 
+    /// The graphic under the ⌥-press: directly, its region, or the one that
+    /// spans this staff at the same x (a drawing above the staff). A note
+    /// link is not a graphic, even when the press lands on one.
+    private func graphicLink(at p: Point) -> PointAndClickLocation? {
+        guard let page = rendered?.page, let owner else { return nil }
+        func graphic(_ link: PointAndClickLocation?) -> PointAndClickLocation? {
+            guard let link, owner.delegate?.canvas(owner, isGraphicLink: link) == true else { return nil }
+            return link
+        }
+        let tolerance = 0.3 / max(owner.zoom, 0.5)
+        if let link = graphic(page.hitTest(p, tolerance: tolerance, excluding: removed)?.link) { return link }
+        if let link = graphic(page.regionHit(p, excluding: removed)?.link) { return link }
+        let staffs = page.staves.sorted {
+            abs(($0.top + $0.bottom) / 2 - p.y) < abs(($1.top + $1.bottom) / 2 - p.y)
+        }
+        for staff in staffs where p.x >= staff.minX - 6 && p.x <= staff.maxX + 6 {
+            let mid = Point(p.x, (staff.top + staff.bottom) / 2)
+            if let link = graphic(page.regionHit(mid, excluding: removed)?.link) { return link }
+        }
+        return nil
+    }
+
     override func mouseDragged(with event: NSEvent) {
+        if sectionDragging, let owner {
+            owner.updateGraphicSection(windowPoint: event.locationInWindow)
+            autoscroll(with: event)
+            return
+        }
         if let drag = legendDrag, let owner {
             let p = pagePoint(convert(event.locationInWindow, from: nil))
             legendDrag = (drag.handle, drag.start, owner.legendDrag(self, handle: drag.handle, from: drag.start, to: p, event: event))
@@ -931,14 +1186,18 @@ private final class PageView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if sectionDragging, let owner {
+            sectionDragging = false
+            owner.endGraphicSection(windowPoint: event.locationInWindow)
+            return
+        }
         if let drag = legendDrag, let owner {
             if let outcome = drag.outcome {
-                // The preview stays until the engraving replaces the page.
-                legendCommitted = true
-                owner.onLegendCommit(outcome)
-            } else {
-                legendDrag = nil
+                // The preview stays until the engraving replaces the page,
+                // and the next drag starts from it.
+                owner.commitLegend(self, outcome)
             }
+            legendDrag = nil
             return
         }
         defer { dragStart = nil; dragRect = nil }

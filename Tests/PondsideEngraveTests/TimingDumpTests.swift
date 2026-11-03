@@ -34,6 +34,12 @@ final class TimingDumpTests: XCTestCase {
         try source.write(to: file, atomically: true, encoding: .utf8)
 
         let log = try await TimingDump.run(lily, source: file)
+        // Every note from the score says where it was written: the playback
+        // head needs that to find the glyph on the page.
+        let notes = log.rows.filter { if case .note = $0.kind { return true } else { return false } }
+        XCTAssertFalse(notes.isEmpty)
+        XCTAssertTrue(notes.allSatisfy { $0.origin != nil }, "\(notes)")
+        XCTAssertTrue(notes.allSatisfy { $0.origin?.file.hasSuffix("cues.ly") == true })
         let sheet = CueSheet(log: log, score: "cues.ly", sampleRate: 48000)
         XCTAssertEqual(sheet.cues.map(\.name), ["1", "2"])
         // Two quarters at 120 = 1 s; then bar 1's last beat (0.5 s) and
@@ -52,6 +58,8 @@ final class TimingDumpTests: XCTestCase {
         let dir2 = dir.appendingPathComponent("canvas")
         let canvas = try await LilyPondEngraver(installation: lily).engrave(file, purpose: .canvas, outputDirectory: dir2)
         XCTAssertEqual(CueSheet(log: canvas.timing, score: "cues.ly").cues.map(\.seconds), [1.0, 6.5])
+        let canvasNotes = canvas.timing.rows.filter { if case .note = $0.kind { return true } else { return false } }
+        XCTAssertTrue(canvasNotes.allSatisfy { $0.origin != nil }, "\(canvasNotes)")
         XCTAssertFalse(canvas.messages.contains("PONDSIDE-TIMING"))
     }
 }

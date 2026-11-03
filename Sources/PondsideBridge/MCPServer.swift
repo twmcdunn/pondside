@@ -203,12 +203,17 @@ public actor MCPServer {
     Pondside scores are plain LilyPond files: read and edit them directly; the running app re-engraves on \
     every save. Be terse: act, then reply in one short line saying what changed ("Swell taller: peak \
     1.06 → 1.5."). No plans, recaps, options or offers; ask only when the score can't settle it.
-    "Here", "this", "till 7" and the like refer to the user's click: call score_context with no arguments \
-    first (a request from the lens already includes it). It returns the selected event or graphic, its staff's music, bar and moment, every cue (bar, \
-    moment, seconds), and for a graphic drawn by the score's own code its definition and drawing procedure.
-    For graphic notation follow lexicon://guide/graphics. Edit with the edit tool (exact text, or lines as the \
-    context numbers them; no need to read the file first): it returns the app's engraving of the change, so \
-    no separate check. Make the change big enough to see at a glance.
+    "Here", "this" and the like refer to the user's selection: call score_context with no arguments \
+    first (a request from the lens already includes it). It returns the selected event or graphic, its staff's music, bar and moment, \
+    and for a graphic drawn by the score's own code its definition and drawing procedure. For a range \
+    with no drawing it also returns the root layout and a short definition index.
+    For graphic notation follow lexicon://guide/graphics. Graphics are always edited from the marked range \
+    (selection.kind "graphic-section", made by ⌥-drag in the score): window the drawing so only the marked \
+    box changes. A new graphic goes in the same marked range. If the marked range has no drawing and the \
+    request is notation or layout (barlines, beams, clefs, spacing, noteheads), follow skill://lilypond and \
+    edit the score's layout or helpers; do not force a Lexicon entry. Edit with the edit tool (exact text, or lines \
+    as the context numbers them; no need to read the file first): it returns the app's engraving of the change, \
+    so no separate check. Make the change big enough to see at a glance.
     Cue times, the mockup and SuperCollider handlers are Pondside's (cues, `pondside mockup`, `pondside \
     handlers`): never set up a second timing pipeline (skill://lilypond-supercollider). A patch with \
     `// pondside:` marks, or a request to migrate one: skill://sc-patch-migration. When something goes wrong \
@@ -249,7 +254,7 @@ public actor MCPServer {
 
     static let guides = [
         Skill(folder: "graphic-notation", uri: "lexicon://guide/graphics", prompt: "graphic-notation",
-              description: "Graphic notation, fast: score_context, one edit, check; terse requests (\"taller\", \"till 7\") on a clicked or new graphic"),
+              description: "Graphic notation from a marked range: score_context, one edit, check; window the drawing so only the box changes; terse requests (\"taller\", \"denser\") and new graphics in the same range"),
         Skill(folder: "lexicon-entries", uri: "lexicon://guide/entries", prompt: "lexicon-entries",
               description: "Writing new Lexicon entries: the graphics kit, the entry folder, LilyPond and Guile gotchas, checks"),
     ]
@@ -367,7 +372,7 @@ public actor MCPServer {
              required: ["question"]),
         Tool(name: "lexicon_check", description: "Check a score's \\lexicon and \\startGraphic uses against the Lexicon: unknown entries, unknown params, values out of range.",
              properties: ["file": file], required: ["file"]),
-        Tool(name: "score_context", description: "What \"here\" means: the user's click or selection in the running app (no arguments), or a point. The event, its staff's .ly, bar, moment (whole notes from the staff's start), the graphic selected or around it (a Lexicon entry's params; or a graphic drawn by the score's own code: its command, start/stop, definition, drawing procedure and what it uses), the clicked part when a large drawing was clicked (selection: x as a fraction of the piece, y in staff spaces, the broken piece, the nearest bar/moment and the range between), every cue (bar, beat, moment, seconds), and the system's first, last and next events. Call this first.",
+        Tool(name: "score_context", description: "What \"here\" means: the user's selection in the running app (no arguments), or a point. The event, its staff's .ly, bar, moment (whole notes from the staff's start), the graphic at or around it (a Lexicon entry's params; or a graphic drawn by the score's own code: its command, start/stop, definition, drawing procedure and what it uses), the marked graphics range when the user ⌥-dragged (selection.kind \"graphic-section\": from/to edges, their x fractions, page x, and the moment at each edge interpolated from the engraved notes, and the selected range on each system), every cue (bar, beat, moment, seconds), and the system's first, last and next events. With no drawing at the point, code gives the root layout and a short definition index; use skill://lilypond for a notation/layout change, lexicon://guide/graphics for a drawing. Call this first; the marked range is the only range.",
              properties: ["file": file,
                           "line": ["type": "integer", "description": "1-based line (omit to use the app's selection)"],
                           "character": ["type": "integer", "description": "0-based character on the line"]],
@@ -383,11 +388,10 @@ public actor MCPServer {
                           "music": ["type": "string", "description": "Optional LilyPond for a staff above, e.g. the passage's music"],
                           "out": ["type": "string", "description": "Directory for the SVG (default: a temporary one)"]],
              required: ["id"]),
-        Tool(name: "graphic_insert", description: "Insert a Lexicon graphic as a minimal edit: \\startGraphic on the event at start, \\stopGraphic on the event at stop, or at a cue or moment (a skip it falls inside is split), on the same staff; then write lexicon.ily and include it in the root.",
+        Tool(name: "graphic_insert", description: "Insert a Lexicon graphic as a minimal edit: \\startGraphic on the event at the range start, \\stopGraphic on the event at the range stop or at a moment (a skip it falls inside is split), on the same staff; then write lexicon.ily and include it in the root.",
              properties: ["file": file, "id": ["type": "string"], "params": ["type": "string", "description": "Scheme alist"],
                           "start_line": ["type": "integer"], "start_character": ["type": "integer"],
                           "stop_line": ["type": "integer"], "stop_character": ["type": "integer"],
-                          "stop_cue": ["type": "string", "description": "Stop at this cue (its name, e.g. \"7\") instead of an event"],
                           "stop_moment": ["type": "string", "description": "Stop at this moment (whole notes, e.g. \"221/8\") instead of an event"],
                           "root": ["type": "string", "description": "The score's root file, if not `file`"]],
              required: ["file", "id", "start_line", "start_character"]),
@@ -455,8 +459,10 @@ public actor MCPServer {
                         "message": .string(d.message)]
             }
             let ok = result.errors.isEmpty && result.succeeded
-            return JSONValue.object(["ok": .bool(ok), "pages": .number(Double(result.outputFiles.count)),
-                                     "diagnostics": .array(diagnostics)]).jsonString(pretty: true)
+            var report: [String: JSONValue] = ["ok": .bool(ok), "pages": .number(Double(result.outputFiles.count)),
+                                               "diagnostics": .array(diagnostics)]
+            if !ok { report["log"] = .string(CompilerLog.tail(result.messages)) }
+            return JSONValue.object(report).jsonString(pretty: true)
         case "query":
             let source = try path(args)
             let text = try String(contentsOf: source, encoding: .utf8)
@@ -566,8 +572,13 @@ public actor MCPServer {
                     return app.jsonString(pretty: true)
                 }
                 let text = try String(contentsOf: source, encoding: .utf8)
+                let files = Self.neighbours(of: source)
+                let root: ScoreGraphic.File? = source.pathExtension.lowercased() == "ly"
+                    ? (source.path, text)
+                    : files.first { $0.path.hasSuffix("/score.ly") || $0.path == "score.ly" }
+                        ?? files.first { $0.path.hasSuffix(".ly") }
                 return ScoreContext.describe(text: text, file: source.path, line: line, character: character,
-                                             files: Self.neighbours(of: source)).jsonString(pretty: true)
+                                             files: files, root: root).jsonString(pretty: true)
             }
             do {
                 return try RPCClient.call("document.context", [:]).jsonString(pretty: true)
@@ -592,10 +603,10 @@ public actor MCPServer {
             if let line = args["stop_line"]?.int {
                 new = try GraphicEdit.insert(into: text, id: id, params: params, start: start,
                                              stop: (line, args["stop_character"]?.int ?? 0))
-            } else if let moment = try await stopMoment(args, source: source) {
+            } else if let moment = stopMoment(args) {
                 new = try GraphicEdit.insert(into: text, id: id, params: params, start: start, stopMoment: moment)
             } else {
-                throw ToolFailure("give stop_line and stop_character, stop_cue or stop_moment")
+                throw ToolFailure("give stop_line and stop_character or stop_moment")
             }
             let problems = lexicon().check(new)
             guard problems.isEmpty else {
@@ -645,28 +656,11 @@ public actor MCPServer {
         }
     }
 
-    /// The moment `stop_moment` names, or `stop_cue`'s: from the app's
-    /// latest cue sheet when it has the score open, else from a compile.
-    func stopMoment(_ args: JSONValue, source: URL) async throws -> Rational? {
-        if let m = args["stop_moment"]?.string {
-            guard let r = Rational(parsing: m) else { throw ToolFailure("stop_moment is a fraction of whole notes, e.g. 221/8") }
-            return r
-        }
-        guard let cue = args["stop_cue"]?.string else { return nil }
-        var cues: [(name: String, moment: String)] = []
-        if let sheet = try? RPCClient.call("document.cues", ["path": .string(source.path)]), let list = sheet["cues"]?.array {
-            cues = list.compactMap { c in
-                guard let n = c["name"]?.string, let m = c["position"]?["moment"]?.string else { return nil }
-                return (n, m)
-            }
-        } else {
-            let log = try await TimingDump.run(try await lilypond(for: source), source: source)
-            cues = CueSheet(log: log, score: source.lastPathComponent).cues.map { ($0.name, $0.position.moment) }
-        }
-        guard let m = cues.first(where: { $0.name == cue }).flatMap({ Rational(parsing: $0.moment) }) else {
-            throw ToolFailure("no cue \(cue); the score's cues: \(cues.map(\.name).joined(separator: " "))")
-        }
-        return m
+    /// The moment `stop_moment` names (whole notes, e.g. 221/8); the marked
+    /// range's end edge is the only source of a stop.
+    func stopMoment(_ args: JSONValue) -> Rational? {
+        guard let m = args["stop_moment"]?.string else { return nil }
+        return Rational(parsing: m)
     }
 
     /// The score's diagnostics from the running app, once it has engraved
@@ -693,8 +687,13 @@ public actor MCPServer {
             if started >= written, status != "compiling" {
                 let diagnostics = doc["diagnostics"]?.array ?? []
                 let ok = status.hasPrefix("clean")
-                return JSONValue.object(["ok": .bool(ok), "status": .string(status), "diagnostics": .array(diagnostics),
-                                         "from": "the running app"]).jsonString(pretty: true)
+                var report: [String: JSONValue] = ["ok": .bool(ok), "status": .string(status), "diagnostics": .array(diagnostics),
+                                                   "from": "the running app"]
+                if !ok, let reply = try? RPCClient.call("document.log", ["path": .string(source.path)]),
+                   let log = reply["log"]?.string, !log.isEmpty {
+                    report["log"] = .string(log)
+                }
+                return JSONValue.object(report).jsonString(pretty: true)
             }
             if started < written, status != "compiling", Date() > nudge {
                 // The app hasn't picked the change up: ask it once, then compile here.

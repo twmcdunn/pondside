@@ -142,7 +142,7 @@ offered.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `edit` | `file`, `edits: [{ old?, new, from_line?, to_line? }]`, `root?` | applies every edit or none: `old` is exact text, unique in the file (the contexts' `412| ` prefixes are stripped if copied); `from_line`…`to_line` replaces whole lines as the contexts number them, and with `old` too checks they still say it (else says where `old` is now). No reading the file first. For `.ly`/`.ily` it then returns `check`'s result (the app's engraving; `root` for an `.ily` when the app isn't open); for `.scd`, a pointer to `patch_check`. Pondside's own `pondside.scd` and `sc-lexicon.scd` are refused |
-| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }] }`. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
+| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }], log? }`. On failure, `log` is the bounded tail of LilyPond's own log, including Guile backtraces the parser cannot locate. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
 | `query` | `file`, `from_line?`, `to_line?` | events in order: `{ kind, text, line, character, pitches, duration, explicitDuration }` |
 | `render` | `file`, `format?` (`pdf`·`svg`·`png`), `out?` | `{ files }` |
 | `cues` | `file`, `rate?` | cues.json (below) |
@@ -152,11 +152,11 @@ offered.
 | `warn_user` | `message`, `title?`, `file?` | an alert on the score's window in the running app: something went wrong that the user must know |
 | `ask_user` | `question`, `choices?` (up to 4), `file?` | a dialog asking the user; waits, and returns the answer (or that they skipped it) |
 | `patch_migrate` | `file`, `scd?`, `from?` | migrates it into `patch/score.scd`, moving what it uses into `patch/` (docs/SUPERCOLLIDER.md), and lists what it did and the lines it marked `// pondside:` |
-| `score_context` | `file?`, `line?`, `character?` | what "here" means: the event, its staff's `.ly`, bar, `moment` (whole notes from the staff's start, for a plain voice), the graphic (below), the clicked part when a large drawing was clicked (`selection`: `x` as a fraction of the broken piece's width, `y` in staff spaces, `spanner_x`, the nearest `at` bar/moment, `scope`: the Scheme test for "inside the highlight", and `music_around` when the music brackets it), every cue as `"7: bar 9 beat 2, moment 221/8, 75.5 s"`; from the running app also `system: { first, last, next }`. Without arguments, the app's selection (a clicked graphic selects its start command) |
+| `score_context` | `file?`, `line?`, `character?` | what "here" means: the event, its staff's `.ly`, bar, `moment` (whole notes from the staff's start, for a plain voice), the graphic at or around it (below), the marked graphics range when the user ⌥-dragged (`selection.kind: "graphic-section"`: `from`/`to` edges, `x`, `page_x`, `spanner_x` and `at` for each, and the selected range on every `systems` entry), every cue as `"7: bar 9 beat 2, moment 221/8, 75.5 s"`; from the running app also `system: { first, last, next }`. With no graphic at the point, `code` gives the root `layout` blocks and a short index of top-level definitions, so a notation/layout request does not need to read a whole file. Without arguments, the app's selection; a normal click selects or places notes, and graphics requests always come from a marked range |
 | `lexicon_search` | `query`, `limit?` | tier 0 lines, best first |
 | `lexicon_entry` | `id` | tier 1: params with types, ranges and docs; README |
 | `graphic_preview` | `id`, `params?`, `bars?`, `music?`, `out?` | `{ svg, source, diagnostics }`: the entry engraved on its own staff |
-| `graphic_insert` | `file`, `id`, `params?`, `start_line`, `start_character`, then `stop_line` + `stop_character`, or `stop_cue`, or `stop_moment`; `root?` | inserts `\startGraphic`…`\stopGraphic` (one staff); a stop at a cue or moment inside a skip splits it (`s1*a s1*b\stopGraphic`); writes `lexicon.ily` and includes it in the root |
+| `graphic_insert` | `file`, `id`, `params?`, `start_line`, `start_character`, then `stop_line` + `stop_character` or `stop_moment`; `root?` | inserts `\startGraphic`…`\stopGraphic` (one staff); a stop at a moment inside a skip splits it (`s1*a s1*b\stopGraphic`); writes `lexicon.ily` and includes it in the root |
 | `lexicon_propose` | `id`, `entry_toml`, `impl`, `readme` | writes a validated draft to `Lexicon/drafts/entries/<id>`; the user accepts or discards it |
 | `patch_context` | `file?` (the score), `line?`, `character?`, `cue?` | the patch agent's context at a point: the cue at or before it (`name`, `bar`, `beat`, `seconds`, `handler`, `window` until the next cue, `code`: the handler numbered, `touches`: the items it uses with their code when short), `next_cue`, the pitch `collections` around it (`pitch_classes`, `midi`), the patch `doc`, `stale_notes`, every cue, and `sc_lexicon` (one line per entry). No arguments: the app's selection |
 | `patch_doc` | `file` | the patch doc (below), rebuilt from the code; stale notes listed |
@@ -175,19 +175,27 @@ when under 150 lines), the helpers and constants that procedure uses with
 their definition lines, and the comments in the score's files that
 describe the command. Paths beside the clicked file are relative to it.
 
-For a large drawing, `graphic` describes the whole spanner and `selection`
-describes the shape the user clicked inside it: `{ kind: "graphic-part",
-page, x: [from, to], y: [low, high], spanner_x: [from, to], units, at? }`.
-`x` is a fraction of the broken piece's width (from its left edge, as the
-drawing's `x` runs from `(car (g-span grob))`), `y` is staff spaces above
-the middle line, `spanner_x` is that piece's page x (so the same fraction
-on another system is not changed), `at` is the bar/moment of the nearest
-linked music, `scope` is a ready Scheme condition for a point inside the
-highlight (`(let ((f (/ (- x x0) (- x1 x0)))) (and (>= f 0.412) …))`), and
-`music_around` (when present) is the linked music on either side, wider than
-the highlight. An agent changing a clicked part must change exactly the
-highlight, gated on `scope`, never a wider range such as `music_around` or
-the bar.
+When there is no graphic at the point, `code` is
+`{ layout: [{ file, from_line, to_line, text? }], definitions: [{ name, file, line, text }] }`:
+the root's layout blocks and a short index of top-level definitions. It is
+the no-drawing context for a notation/layout request; read only the lines
+it names.
+
+`selection` is the marked graphics range: `{ kind: "graphic-section", page,
+x: [from, to], y: [low, high], spanner_x: [[from], [to]], from, to, systems,
+units }`. `from` and `to` each carry `{ page, x, page_x, spanner_x, at }`;
+`x` is the edge as a fraction of that system's broken piece, `page_x` the
+same edge in page coordinates, and `at` the moment at that edge
+(`{ bar, moment, event?, source }`, `source` being file, line and character),
+interpolated from the engraved notes' x positions. `systems` lists every
+covered system with its selected `x`, `staff_x`, `page_x` and `spanner_x`
+range, and its 1-based `ordinal` (for a `StaffSymbol.stencil` window). The
+moments identify the start and end systems; the edges are the fractions.
+Follow `lexicon://guide/graphics` for drawings. A marked range with no
+drawing is either a new drawing (graphics) or a notation/layout change
+(`skill://lilypond`); a one-off notation change does not need a Lexicon
+entry. A normal click without ⌥ selects or places notes; it never creates a
+graphics selection.
 
 Code in `score_context` and `patch_context` (`definition`, `drawing`,
 `uses`, `music`, a cue's `code` and `touches`) is numbered as in its file,
@@ -240,9 +248,9 @@ its implementation only to adapt it.
 
 | URI / prompt | Use |
 |---|---|
-| `lexicon://guide/graphics` · `graphic-notation` | the default for graphic notation and for changing a clicked graphic: one `edit` from the numbered context (it returns the engraving); terse words to params ("taller", "till 7"), scaled to be visible at a glance; the core entries; envelopes |
+| `lexicon://guide/graphics` · `graphic-notation` | graphic notation from the marked range: one `edit` from the numbered context (it returns the engraving); the `section-window` so only the box changes; terse words to params ("taller", "denser"), scaled to be visible at a glance; new graphics in the same box; the core entries; envelopes; legend. It routes notation/layout requests to `skill://lilypond` |
 | `lexicon://guide/entries` · `lexicon-entries` | writing a new entry when no combination satisfies the user: the graphics kit's API, the entry folder, LilyPond and Guile gotchas, checks |
-| `skill://lilypond` · `lilypond` | writing, spacing and debugging LilyPond: project layout, the compile-and-look loop, Scheme and Guile gotchas |
+| `skill://lilypond` · `lilypond` | writing, spacing and debugging LilyPond: project layout, the compile-and-look loop, Scheme and Guile gotchas. The route for a marked range with no drawing and a notation/layout request; edit score code, not a forced Lexicon entry |
 | `skill://lilypond-contemporary-notation` | aleatoric boxes, links, timed improvisation, air/slap notation (library `contemporary.ily`) |
 | `skill://lilypond-electronics-staff` | an electronics staff: `\ecue`, `\edesc`, `\collection` (library `electronics.ily`) |
 | `skill://lilypond-supercollider` | the score-to-patch workflow: timing, holds, Muse Sounds renders |
@@ -404,7 +412,7 @@ Names follow the root file: `quartet.ly` gives `quartet.cues`,
 |---|---|---|
 | Cue times: `renders/score.cues` (`seconds<TAB>bar<TAB>cue N`) | `pondside mockup`, run by the app after every good engraving; `pondside cues --format cues` | lilypond-supercollider (the quark reads it), lilypond-electronics-staff (`\ecue` → `cue N`) |
 | Mockup: `renders/score.wav` | the same run | lilypond-supercollider |
-| cues.json | `pondside cues`, MCP `cues`, RPC `document.cues` | graphic-notation (via `score_context`'s `cues`) |
+| cues.json | `pondside cues`, MCP `cues`, RPC `document.cues` | lilypond-supercollider, sc-patch-editing |
 | Collections `~ec`, marks | `pondside cues --format ec` / `marks` | lilypond-supercollider, lilypond-electronics-staff |
 | The patch `patch/score.scd` (`// @pondside patch`), its engine `patch/dependencies/pondside.scd` | the SuperCollider pane when the score has no patch; `pondside handlers`; stubs for new cues and the current engine after each mockup | lilypond-supercollider, sc-patch-migration |
 | The mix `renders/score.mix.wav` | `pondside mix`, run by the app after each mockup | — (⌘⌥P plays it) |
@@ -446,6 +454,7 @@ calls a method from the shell.
 | `document.text` | `path?` | `{ path, text }`: the app's current text, including unsaved edits |
 | `document.selection` | `path?` | `{ path, start, end, text, events }`, with positions as `{ line, character }` |
 | `document.context` | `path?`, `line?`, `character?` | the selection's (or that point's) `score_context`, with `system: { first, last, next }` from the engraving |
+| `document.log` | `path?` | the bounded tail of the last LilyPond log for the score, for a failure whose diagnostic has no location |
 | `document.patchContext` | `path?`, `line?`, `character?`, `cue?` | the selection's (or that point's, or that cue's) `patch_context`; an error when the score has no Pondside patch |
 | `document.select` | `path, line, character` | puts the caret there (the score highlights it); returns the selection |
 | `document.engrave` | `path?` | starts a compile; the result arrives as `compile.finished` |

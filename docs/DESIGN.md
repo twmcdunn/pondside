@@ -201,9 +201,10 @@ tempo map is stepped:
 A model with ramps would disagree with the audio it is meant to sync. The
 timing listener (`TimingDump`, injected with `-dinclude-settings` into
 every canvas compile) writes the tempo, cue, mark, note and meter rows.
-`PondsideTiming` turns them into `CueSheet`. Two different tempos on one
-moment produce a warning (the "never put a `\playTempo` where a printed
-`\tempo` is" rule).
+Note rows also carry the note's source `file line character`, which the
+playback head uses to find the glyph on the page. `PondsideTiming` turns
+the rows into `CueSheet`. Two different tempos on one moment produce a
+warning (the "never put a `\playTempo` where a printed `\tempo` is" rule).
 
 The skills Pondside serves describe these outputs and tell agents not to
 build a second timing pipeline; docs/API.md ("Skills and the files Pondside
@@ -612,6 +613,15 @@ agent writing an original entry, or extending the kit, from scratch:
 The low-level skill is long and loaded only when needed. The high-level
 one stays short because the kit carries the complexity.
 
+The Lexicon is a **library of reusable notation**, not a required
+intermediate representation for every score change. Existing entries and new
+reusable visual effects belong there; a one-off notation/layout change
+(barlines, beams, clefs, spacing) is score code and uses `skill://lilypond`.
+A wavy-barline section, for example, is not a `graphic` entry: it overrides
+`BarLine.stencil` over a span. If it becomes reusable, it is a `layout` entry
+(`kind = "layout"`, `attaches = "span"`), not a graphic one. Forcing every
+request through the Lexicon was a distraction in the run that took 5½ minutes.
+
 ### Preview, validation, trust
 
 - **Preview.** `graphic_preview` compiles a snippet (the passage's staff,
@@ -656,24 +666,19 @@ before it joins the Lexicon. The best practices that make it work:
 
      "Until the next system" is then a moment the app supplies, not an
      inference.
-2. **Graphics are selectable** (built 2026-10-29). Kit graphics and
-   hand-written Scheme graphics that are spanners started by an event
-   (`\startGraphic`, `\startRipples`) are linked by LilyPond to that
-   command at its use site; every dot of a texture carries the link. A
-   click between the dots still finds the graphic:
-   `EngravedPage.regionHit` groups a link's parts into one region per
-   system (`EngravedPage.regions`). The click selects the start command's
-   word, and the canvas outlines the clicked shape as its cursor, not each
-   dot. `score_context` then returns a Lexicon graphic's entry and params,
-   or for the score's own code (`ScoreGraphic`) the command, its stop, its
-   definition, the stencil procedure's text, the helpers it uses and the
-   comments describing it, so "taller" is one edit with no search. For a
-   large drawing it also returns `selection`: the clicked part's `x`/`y`
-   and the broken piece it belongs to, in the drawing code's coordinates,
-   so a request about that part does not change every bar.
-   `score_context` also lists every cue (bar, moment, seconds) and the
-   event's moment, and `graphic_insert` stops at a cue or moment, splitting
-   a skip, so "till 7" is one call.
+2. **Graphics are edited from a marked range.** A normal click is always
+   note-oriented: it selects the note under it, or (on empty staff space)
+   chooses the event to insert after and the clicked octave, so typing a–g
+   inserts there. ⌥ is the graphics key: ⌥-drag marks a range from the
+   click's x on the starting system to the release's x on the nearest
+   system, the whole staff tall, and opens the request line on release;
+   ⌥-click on a graphic shows its source without an outline. There is no
+   clicked-part selection. `score_context` returns the Lexicon graphic's
+   entry and params, or for the score's own code (`ScoreGraphic`) the
+   command, its stop, definition, stencil procedure, helpers and comments,
+   plus the range's `from`/`to` edges and each system's selected x. The one
+   graphic skill windows the drawing so only the box changes; a new graphic
+   goes in the same box.
 3. **Few tools, compact answers.** The tools are:
    - `score_context`;
    - `lexicon_search` (tier 0 lines ranked by tags and gloss);
@@ -703,18 +708,56 @@ before it joins the Lexicon. The best practices that make it work:
    system, so drafts run only in previews and in the user's score, and stay
    in `drafts/` until the user accepts them (§7).
 
+**A marked section (2026-11-01).** A normal click is always note-oriented:
+it selects a note or, on empty staff space, sets the insertion point and
+octave. A graphics range is marked by holding ⌥ and dragging on the score.
+- **What the drag makes.** It starts on whichever staff the click is nearest
+  (a graphic's area or plain staff), at the click's x on that system. The box
+  is the whole staff tall. The release's y picks the end system (the nearest
+  system), and its x is the end edge. The start system runs from the click to
+  its end, the systems between are whole, and the end system runs from its
+  start to the release; a drag upwards is the same range, ordered top down.
+  A normal click, a new drag, or ⎋ clears it.
+- **Pattern** (HIG): an inline marquee over content, not a control. Each
+  covered system gets a solid accent box over the staff, drawn without
+  animation and without taking focus. On release the request popover opens
+  beside the box; its field takes the keyboard because the user just asked
+  to type a request. Increase Contrast is the ordinary accent line; there
+  is no material.
+- **What the agent gets.** `selection.kind` is `"graphic-section"`:
+  `from`/`to` each carry `page`, `x` (the edge as a fraction of that system's
+  broken piece), `page_x`, `spanner_x` and `at` (bar, moment, event and
+  source at the edge; the moment is interpolated from the engraved notes'
+  x positions by `SectionTimeMap`, before the agent runs); `systems` lists
+  each covered system's selected x range, its `staff_x` fractions and its
+  1-based `ordinal`. The moments identify the start and end systems; the
+  edges stay the fractions.
+- **The skill.** The MCP server bundles the graphic workflow at
+  `lexicon://guide/graphics` (`skill://graphic-notation`) and general
+  LilyPond at `skill://lilypond`. The graphic skill describes the marked
+  range, the `section-window` (1 inside, 0 outside, short ramps at the
+  edges), new graphics in the same range, the Lexicon entries, envelopes
+  and the legend. A marked range with no drawing is either a new drawing
+  (graphics) or a notation/layout change (`lilypond`); a one-off notation
+  change does not force a Lexicon entry. There is no second graphic skill
+  and no clicked-part selection; a normal click is a note selection or
+  insertion point.
+
 **Requests from the lens (in the app).** The same workflow runs without a
 terminal:
-- **Where you type.** ⌘L on a selected graphic opens the request line, a
+- **Where you type.** ⌥-drag marks a range and opens the request line, a
   popover beside it with one field ("Describe what you want… e.g. grainy
-  swell till m. 3"). On notes, ⇥ switches the Notation Lens to the request
-  line, and ⇥ switches back.
+  swell"). ⌘L reopens it for the marked range; a normal click never opens a
+  graphics request. On notes, ⇥ switches the Notation Lens to the request
+  line when a range is marked, and ⇥ switches back.
 - **What runs.** ↩ sends the request to the agent chosen in Settings
   (`AgentSession`: Claude Code or opencode, each kept running between
   requests). Its prompt holds the
-  selection's context (`score_context`), the request and the
-  graphic-notation skill. The agent edits the score's files and runs
-  `check` once.
+  selection's context (`score_context`) and the request. For an existing
+  drawing it holds the graphic skill; for a range with no drawing it holds
+  both the graphic skill and LilyPond, and routes between a new drawing and
+  a notation/layout change. The agent edits the score's files and the edit
+  tool returns the engraving.
 - **While it works.** The status bar's one pulsing dot lists it ("Claude
   Code: “grainy swell…” · editing..."). When the agent changed the score,
   the dot and the badge on the selection stay ("Engraving the change...")
@@ -751,18 +794,6 @@ terminal:
   "Avoid changing focus without people's interaction"); ⎋ returns focus to
   the score. A click on a graphic flashes the hint "⌘L: describe a
   change".
-
-**Selecting a large drawing.** A click on a drawing of many parts (a grain
-cloud, a 20-bar texture, one spanner made of separate bursts) highlights
-only the shape under the click: the parts within 3 staff spaces of each
-other in both directions (`EngravedPage.clusters`). That shape is what the
-request is about. The whole spanner is still the source selection, so
-`score_context` gives both: the graphic's command (with its whole start and
-stop) and a `selection` with the clicked part's `x` (a fraction of the
-broken piece's width), `y` (staff spaces), the piece, the nearest
-bar/moment and, when the music brackets it, the range `between`. The agent
-confines a change meant for that part to them instead of changing every bar
-of the spanner.
 
 **Settings (⌘,).** Pondside ▸ Settings… holds only what belongs to the app,
 not to a score: the agent (Automatic, Claude Code, opencode or Off, with
@@ -815,6 +846,18 @@ tools insist on a read first. Now:
 - the prompt and skill ask for a change visible at a glance (about 2× per
   word, not 1.4×): the slow run's edit "succeeded" by thinning a dense
   cloud by half, which looked like nothing.
+- a failed `edit`/`check` returns the bounded tail of LilyPond's own log,
+  including Guile backtraces the diagnostic parser cannot locate, and a
+  diagnostic that names no open file is kept on the root instead of dropped.
+  A run that failed 13 checks with `errors:1` and no message now has the
+  actual error on the first failure;
+- a marked range with no drawing gets the root's `\layout` blocks and a
+  short index of top-level definitions, so a notation/layout request does
+  not read the 100 KB graphics file. `from.at`/`to.at` are computed from
+  LilyPond's timing and the engraved note x, not inferred by the model;
+- the graphic skill's `system-moments` guards `ly:grob?`: a BarLine's
+  `ly:grob-system` can be `()`, which used to reach `ly:grob-object` and
+  fail without a diagnostic.
 
 **The patch agent.** A request at a point in the score about the
 electronics ("more reverb here", "a grain cloud on this chord") goes to a
@@ -889,8 +932,8 @@ in-app audition, the shadow history and the CLI installer (§10).
 - Vim/Emacs presets: dropped as planned. The chords are remappable
   (`keymap.txt`), but the source pane isn't a modal editor, so a preset
   would only rename chords. Revisit with M5's editor.
-- Inserting before a staff's first note and tab or percussion staves were
-  mouse-entry limits; mouse entry is gone.
+- Inserting before a staff's first note is still unsupported; a click on
+  empty staff after a note selects the insertion anchor and octave.
 
 **M5: editor and toolchains**
 
@@ -950,6 +993,9 @@ Source colouring of `.ly` comes from the CST, not tree-sitter.
   dump at the layout score, or keep one `\score` with both.
 
 **M9: graphic notation**
+- **Graphics voices (phase 2).** Tab through the graphics voices of a marked
+  section, see each layer in isolation, and target, delete or add one. The
+  section context can carry a `voice`/`layer` field when that starts.
 - Microtonal accidental entries and annotation layers.
 - The full aleatoric-box system with links and arrows lives in the
   `lilypond-contemporary-notation` library; `aleatoric-box` is the drawn,
@@ -994,7 +1040,9 @@ second score file.
   - **Showing it:** it appears without animation, and fades out once the
     render has landed and it has been up 1.5 s since it last changed.
   - **Keys:** `⌘L` keeps it open until `⎋`, and ←→ step through the
-    target's voice.
+    target's voice. ⇧←/→ widen the score's selection; the lens marks the
+    same events (all the notes of each selected chord) and widens its
+    window to keep them in view.
   - **Reduce Motion:** turns the motion into jumps.
 - **Speed.** Building the window takes under 1 ms; parse plus layout
   takes 14–16 ms warm.
@@ -1087,6 +1135,32 @@ replace the same command already standing before the note.
 - **View › Play from Here** (⌘⇧P) plays the mockup from the selected bar,
   timed by the score's own tempo map; again to stop.
 - **Pondside › Install Command-Line Tool…** (Appendix A.11).
+
+### Playback head (2026-11-01)
+
+Auditioning the mockup (⌘⇧P) or the mix (⌘⌥P) draws a playback head on the
+score.
+
+- **Pattern.** An inline cursor over content, not a control: a thin accent
+  line with a round cap at the system top. It never takes focus, is not in
+  the key loop, and disappears when the audio stops.
+- **Where it is.** The timing dump now writes every note's source
+  `file line character`. `PlayheadTrack` (`PondsideEngrave`, portable)
+  matches those to the page's point-and-click glyphs, so repeats walk back
+  through the printed bars, and the mockup and the mix use the same track.
+  Notes generated by the playback (trills, tremolos) have no origin; the
+  head stays on the last printed note until the next one.
+- **Motion.** Between two notes on one system the line glides; crossing a
+  system or page it jumps. The canvas reveals a new system only when the
+  system changes, with `scrollToVisible` (an instant scroll, so Reduce
+  Motion needs no special case).
+- **Appearance.** Solid `Theme.accent`, with a filled round cap: colour and
+  shape together. No material, so Reduce Transparency changes nothing;
+  Increase Contrast thickens the line and cap. It is drawn after Lights Out
+  so it stays readable.
+- **Edits.** An engraving during playback rebuilds the track around the
+  player's current time; the head is cleared while the new pages land and
+  reappears on the next tick.
 
 ---
 
@@ -1252,6 +1326,10 @@ handles on the legend's pages; ⎋ ends it.
 - **While dragging** the affected music is drawn moved or scaled, and what a
   crop hides is veiled. On release it is one undoable edit, and the preview
   stays until the engraving replaces it.
+- **Dragging again before the engraving lands** starts from the preview,
+  not the old page: `LegendArrangement.Sheet.applying` applies the committed
+  moves to the rows, so the handles sit where the last drop left them and a
+  second drag adds to it instead of repeating or losing the first.
 
 ### Panel (HIG)
 

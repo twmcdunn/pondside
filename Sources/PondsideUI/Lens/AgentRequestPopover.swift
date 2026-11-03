@@ -1,7 +1,7 @@
 import AppKit
 
 /// The lens's request line: a popover beside the selection with one line to
-/// describe a change ("grainy swell till m. 3"), which the agent carries
+/// describe a change ("grainy swell"), which the agent carries
 /// out in the background. For a graphic it is the lens (⌘L); for notes ⇥
 /// switches to it from the lens and back. Opened explicitly, so its field
 /// takes the keyboard; ↩ sends, ⎋ closes and returns focus to the score.
@@ -46,7 +46,7 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
         card.wantsLayer = true
         card.layer?.backgroundColor = Theme.chrome.withAlphaComponent(0.72).cgColor
 
-        field.placeholderString = placeholder ?? "Describe what you want… e.g. grainy swell till m. 3"
+        field.placeholderString = placeholder ?? "Describe what you want… e.g. grainy swell"
         field.font = Theme.bodyFont
         field.stringValue = ""
         field.delegate = self

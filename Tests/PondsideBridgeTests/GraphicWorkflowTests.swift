@@ -29,6 +29,28 @@ final class GraphicWorkflowTests: XCTestCase {
         XCTAssertNil(context["graphic"])
     }
 
+    func testANoGraphicSectionGetsTheLayoutAndDefinitionIndex() {
+        let root = #"""
+        \version "2.26.0"
+        #(define (grob-when g) g)
+        score = {
+          \layout {
+            \context { \Score measureBarType = #"'" }
+            \context { \Staff \override BarLine.stencil = #grob-when }
+          }
+          { c'1 }
+        }
+        """#
+        let files: [ScoreGraphic.File] = [("/score.ly", root), ("/defs.ily", "#(define (span-x g d) 0)\n")]
+        let context = ScoreContext.describe(text: root, file: "/score.ly", line: 3, character: 1,
+                                            files: files, root: ("/score.ly", root))
+        XCTAssertNil(context["graphic"])
+        let code = context["code"]
+        XCTAssertTrue(code?["layout"]?.array?.first?["text"]?.string?.contains("measureBarType") ?? false)
+        XCTAssertTrue(code?["definitions"]?.array?.contains { $0["name"]?.string == "grob-when" } ?? false)
+        XCTAssertTrue(code?["definitions"]?.array?.contains { $0["name"]?.string == "span-x" } ?? false)
+    }
+
     func testInsertIsMinimalAndTheContextThenSeesIt() throws {
         let new = try GraphicEdit.insert(into: score, id: "grain-cloud", params: "((height . (swell 2 0.5 2)))",
                                          start: (3, 13), stop: (3, 24))

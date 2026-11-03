@@ -412,10 +412,14 @@ private struct LegendPage: View {
                     Text("No special symbols in the instrumental parts: the score uses only LilyPond’s own notation.")
                         .foregroundStyle(.secondary)
                 }
-                ForEach(printed) { CandidateRow(candidate: $0, included: inLegend.contains($0.id), model: model) }
+                ForEach(printed) { CandidateRow(candidate: $0, included: inLegend.contains($0.id), model: model)
+                    .id("candidate:\($0.id)")
+                }
                 if !unprinted.isEmpty {
                     DisclosureGroup("Probably not printed (\(unprinted.count))", isExpanded: $showUnprinted) {
-                        ForEach(unprinted) { CandidateRow(candidate: $0, included: inLegend.contains($0.id), model: model) }
+                        ForEach(unprinted) { CandidateRow(candidate: $0, included: inLegend.contains($0.id), model: model)
+                            .id("candidate:\($0.id)")
+                        }
                     }
                     .help("Commands for playback or layout: their definitions hide what they make")
                 }
@@ -448,6 +452,7 @@ private struct LegendPage: View {
                     }
                     ForEach(model.legendItems) { item in
                         LegendRow(item: item, model: model)
+                            .id("legend:\(item.id)")
                     }
                 } header: {
                     Text("In the Legend")

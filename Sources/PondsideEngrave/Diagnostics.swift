@@ -105,3 +105,15 @@ public enum DiagnosticParser {
         progressPrefixes.contains { line.hasPrefix($0) }
     }
 }
+
+
+/// The tail of LilyPond's log, for failures the parser cannot turn into a
+/// located diagnostic (a Guile backtrace, an internal error). Bounded so an
+/// agent sees the cause without a whole build log.
+public enum CompilerLog {
+    public static func tail(_ log: String, lines: Int = 120, characters: Int = 12_000) -> String {
+        let all = log.split(separator: "\n", omittingEmptySubsequences: false)
+        let kept = all.suffix(lines).joined(separator: "\n")
+        return kept.count <= characters ? kept : String(kept.suffix(characters))
+    }
+}

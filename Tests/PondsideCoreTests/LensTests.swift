@@ -260,6 +260,17 @@ final class LensTests: XCTestCase {
         XCTAssertNil(try lens(text, at: "a4").neighbor(-1))
     }
 
+    func testRangeSelectionKeepsEveryEvent() throws {
+        let text = "m = \\relative c'' { c4 d4 e4 f4 }\n"
+        let start = try range(of: "c4", in: text).lowerBound
+        let end = try range(of: "e4", in: text).upperBound
+        let window = try XCTUnwrap(LensScoreBuilder.build(tree: SyntaxTree(text), selection: start..<end))
+        let marked = window.events.filter { window.selected.contains($0.sourceEvent) }
+        XCTAssertEqual(marked.count, 3)
+        XCTAssertEqual(window.selected.count, 3)
+        XCTAssertEqual(window.target?.sourceEvent, marked.first?.sourceEvent)
+    }
+
     func testCaretOutsideMusicHasNoLens() {
         let text = "\\header { title = \"x\" }\nm = { c'4 }\n"
         XCTAssertNil(LensScoreBuilder.build(tree: SyntaxTree(text), selection: 3..<3))

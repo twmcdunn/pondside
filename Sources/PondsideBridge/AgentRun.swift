@@ -418,40 +418,88 @@ public struct AgentRun: Sendable {
     they gave numbers. Too small to notice counts as not done.
     """
 
-    public static func graphicsPrompt(request: String, context: String, score: URL, followUp: Bool = false) -> String {
+    /// What a marked range is: an existing drawing, or only a range (a new
+    /// drawing or a notation/layout change).
+    public enum RequestTarget: String, Sendable {
+        case existingGraphic
+        case emptySection
+    }
+
+    static let graphicRules = """
+    The context's selection has kind "graphic-section": `from` and `to` are the two edges.
+    `from.x` and `to.x` are their fractions of each endpoint's broken piece; `from.page_x` and
+    `to.page_x` are the same edges in page coordinates; `from.at` and `to.at` are the moment at
+    each edge (interpolated from the engraved notes; the moments identify systems, not the
+    boundary); `systems` lists the selected page-x range on every covered system. Follow
+    skill://graphic-notation: build its `section-window` from `from.at.moment`, `to.at.moment`,
+    `from.x` and `to.x`; change only inside it. Never use the moments as musical boundaries, and
+    never change a shared constant, seed or table.
+    """
+
+    static let emptySectionRules = """
+    The marked range starts where there is no drawing. The range is still the only range: change
+    only inside it. Decide what the request asks for before editing:
+    - a drawing, texture, shape or gesture: add a new graphic in the marked range with
+      graphic_insert, or write the score's own drawing code; follow skill://graphic-notation;
+    - notation or layout (barlines, beams, clefs, staff lines, spacing, noteheads, hidden meters,
+      dynamics): follow skill://lilypond and edit the score's layout or helpers. Do not create a
+      Lexicon entry unless the user asks for a reusable entry.
+    Do not force a Lexicon entry for a one-off notation/layout change. The context's `from.at` and
+    `to.at` are the moment at each edge, interpolated from the engraved notes; use them for timing,
+    and use `from.x`/`to.x` for the visual boundary.
+    """
+
+    public static func graphicsPrompt(request: String, context: String, score: URL,
+                                      followUp: Bool = false,
+                                      target: RequestTarget = .existingGraphic) -> String {
+        let rules = target == .emptySection ? Self.emptySectionRules : Self.graphicRules
+        let skill = MCPServer.skills.first { $0.folder == "graphic-notation" }.flatMap(MCPServer.skillText) ?? ""
+        let lilypond = target == .emptySection
+            ? MCPServer.skills.first { $0.folder == "lilypond" }.flatMap(MCPServer.skillText) ?? ""
+            : ""
+        let targetLine = target == .emptySection
+            ? "The marked range has no drawing at its start. A drawing is a new graphic; a notation/layout change is score code."
+            : "The marked range starts on an existing drawing; change that drawing, not the music around it."
         if followUp {
             return """
             Next request: "\(request)". The user's selection now (score_context):
             \(context)
-            Code in it is numbered as in its file (`412| ` is not part of the line), fresh as of now: edit \
-            with the edit tool by from_line/to_line or exact text, without reading the file; it returns the \
-            engraving. If the context has a "selection", change exactly the highlighted part (gate on \
-            selection.scope), never wider. \
-            \(atAGlance) Same rules as before (no renders, images or shell); reply in one short line with the \
-            numbers (old → new).
+            \(targetLine)
+            Code in it is numbered as in its file (`412| ` is not part of the line), fresh as of now: \
+            edit with the edit tool by from_line/to_line or exact text, without reading the file; it \
+            returns the engraving.
+            \(rules)
+            \(atAGlance) Same rules as before (no renders, images or shell); reply in one short line \
+            with the numbers (old → new).
             """
         }
-        let skill = MCPServer.skills.first { $0.folder == "graphic-notation" }.flatMap(MCPServer.skillText) ?? ""
+        let quick = target == .emptySection
+            ? """
+            Be quick: the context has the marked range, the root `\\layout`, and an index of the \
+            score's definitions. Read only the lines you need, never the whole graphics file. Edit \
+            with the edit tool (from_line/to_line, or exact old text; root: \(score.path) for an .ily); \
+            it returns the app's engraving, so no separate check. Fix only what it reports. Don't \
+            render pages, look at images or run shell commands: the user sees the app re-engrave.
+            """
+            : """
+            Be quick: the context has the graphic's definition, its drawing code and the helpers it \
+            calls, in full, numbered as in their files (`412| ` is a prefix, not part of the line). \
+            Change them with the edit tool (from_line/to_line, or exact old text; root: \(score.path) \
+            for an .ily) without reading the files: one edit call, which returns the app's engraving, \
+            so no separate check. Fix only what it reports. For a new graphic use graphic_insert over \
+            the marked range. Don't render pages, look at images or run shell commands: the user sees \
+            the app re-engrave.
+            """
         return """
-        The user selected a graphic in Pondside's score of \(score.path) and asked: "\(request)".
+        The user marked a section in Pondside's score of \(score.path) and asked: "\(request)".
         Its context (what score_context returns) is below; call score_context again only for another point.
-        Follow the skill below. You run in the background: take the most plausible reading; only if two readings \
-        really differ, ask with ask_user (offer choices). If you can't carry it out, call warn_user.
+        \(targetLine)
+        Follow the skill(s) below. You run in the background: take the most plausible reading; only if \
+        two readings really differ, ask with ask_user (offer choices). If you can't carry it out, call \
+        warn_user.
         \(atAGlance)
-        Be quick: the context has the graphic's definition, its drawing code and the helpers it calls, in full, \
-        numbered as in their files (`412| ` is a prefix, not part of the line). Change them with the edit tool \
-        (from_line/to_line, or exact old text; root: \(score.path) for an .ily) without reading the files: one \
-        edit call, which returns the app's engraving, so no separate check. Fix only what it reports. For a new \
-        graphic use graphic_insert. Don't render pages, look at images or run shell commands: the user sees the \
-        app re-engrave.
-        If the context has a "selection", the user highlighted only that part of a larger drawing, and the \
-        change must cover exactly it: what draws inside the highlight changes, nothing outside does. Its x is \
-        a fraction of that piece's width, y is staff spaces above the middle line, spanner_x identifies the \
-        system, at is the nearest bar/moment. selection.scope is the exact test for "inside" (paste it into \
-        the drawing loop as the condition for the change); never widen it, to a bar, a moment range or the \
-        whole stencil; if anything, stay a little inside it. music_around is the music on either side, wider \
-        than the highlight: don't scope to it. Still make the change obvious within the part. Ask only if the \
-        code cannot be gated on x and y.
+        \(quick)
+        \(rules)
         Final reply: one short line saying what changed, with the numbers, e.g. "Swell taller: peak 1.06 → 2.1."
         More requests may follow in this conversation, each with the selection at that moment; \
         "it", "that" and "again" refer to earlier ones.
@@ -460,6 +508,8 @@ public struct AgentRun: Sendable {
         \(context)
 
         \(skill)
+
+        \(lilypond)
         """
     }
 

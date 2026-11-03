@@ -11,7 +11,8 @@ import Foundation
 ///                                                          in the bar each row is
 ///
 /// Kinds: `tempo <quarters per minute>`, `text <label>` (cues are
-/// `text cue N`), `note <staff> <midi>`, `group <staff> start|stop`,
+/// `text cue N`), `note <staff> <midi>` (Pondside adds the note's source
+/// `file line character`, for the playhead), `group <staff> start|stop`,
 /// `meter <n>/<d>`.
 public struct TimingLog: Sendable, Hashable {
     public struct Row: Sendable, Hashable {
@@ -33,6 +34,12 @@ public struct TimingLog: Sendable, Hashable {
             public var line: Int
             /// 0-based Unicode-scalar offset in the line, as point-and-click.
             public var character: Int
+
+            public init(file: String, line: Int, character: Int) {
+                self.file = file
+                self.line = line
+                self.character = character
+            }
         }
 
         public var moment: Rational
@@ -91,6 +98,11 @@ public struct TimingLog: Sendable, Hashable {
             case "note":
                 guard values.count >= 2, let midi = Int(values[1]) else { continue }
                 kind = .note(staff: values[0], midi: midi)
+                // Pondside's dump adds where the note was written; timing.ily
+                // rows (and generated notes) end after the pitch.
+                if values.count >= 5, let line = Int(values[3]), let ch = Int(values[4]) {
+                    origin = Row.Origin(file: values[2], line: line, character: ch)
+                }
             case "group":
                 guard values.count >= 2 else { continue }
                 kind = .group(staff: values[0], start: values[1] == "start")

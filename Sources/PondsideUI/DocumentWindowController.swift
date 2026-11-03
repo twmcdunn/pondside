@@ -20,6 +20,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private var settingsPanel: EngravingSettingsPanel?
     var scoreSetupPanel: ScoreSetupPanel?
     private var player: AVAudioPlayer?
+    /// The playback head: the audio's place in the score, ticked while the
+    /// mockup or mix plays.
+    private var playheadTimer: Timer?
+    private var playheadTrack: PlayheadTrack?
+    private var playheadStart: Double = 0
+    private var playheadSystem: (page: Int, top: Double, bottom: Double)?
     private let editorPane = NSView()
     private let compilerOutput = CompilerOutputView(frame: .zero)
     private let cueInspector = CueInspectorView(frame: .zero)
@@ -76,6 +82,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private let statusBar = StatusBarView(frame: .zero)
 
     private var noteInput = NoteInput()
+    /// A click on empty staff space: the event to insert after, and the
+    /// octave of the clicked staff position, until the next note is typed.
+    private struct MouseInsertion { var event: Int; var octave: Int }
+    private var mouseInsertion: MouseInsertion?
     private var lens: (any NotationLensSession)?
     private var lensClosesOnRender = false
     private var lensAwaitingGeneration = 0
@@ -333,12 +343,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             lensLog.debug("no lens for selection \(selection.lowerBound)..<\(selection.upperBound)")
             if closesOnRender {
                 if !lensWasExplicit { closeLens() }
-            } else if let r = ScoreGraphic.commandRange(at: selectionUTF8().lowerBound, in: editor.text),
-                      String(decoding: Array(editor.text.utf8)[r], as: UTF8.self).hasPrefix("\\start") {
-                // a graphic (its start command is the selection): its lens is the request line
-                showRequest(fromLens: false)
             } else {
-                statusBar.flash("Put the caret in a note or a graphic to open the Notation Lens")
+                statusBar.flash("Put the caret in a note, or ⌥drag to mark a graphics range")
             }
             return
         }
@@ -395,6 +401,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// first opening with neither points at the top of the score pane.
     private func lensAnchor() -> LensAnchor? {
         let visible = canvas.visibleRect
+        if let rect = canvas.graphicSectionAnchor, visible.intersects(rect) {
+            return LensAnchor(rect: rect, view: canvas)
+        }
         if let rect = canvas.selectionAnchor ?? lastPageAnchor, visible.intersects(rect) {
             return LensAnchor(rect: rect, view: canvas)
         }
@@ -535,6 +544,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshHighlight(reveal: Bool) {
+        mouseInsertion = nil
         guard let map = engraving else { return }
         let text = editor.text
         var r = selectionUTF8()
@@ -543,6 +553,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             if let e = tree.eventIndex(at: r.lowerBound), tree.events[e].range.upperBound > r.lowerBound {
                 r = tree.events[e].range
             }
+        }
+        // A graphic's command is navigation, not a shape selection: no
+        // outline on the page (the source pane shows the command).
+        if isGraphicCommandSelection(r, in: text) {
+            hasSelection = false
+            highlighted = []
+            canvas.highlight([], path: activeFile.url.path, reveal: false)
+            updateHints()
+            return
         }
         var positions = Set<SourcePosition>()
         if !r.isEmpty {
@@ -561,9 +580,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// The engraved positions currently highlighted (the selection's glyphs).
     private var highlighted = Set<SourcePosition>()
 
+    /// Whether this source selection is a graphic's `\start…` command (the
+    /// cursor for source navigation), which never draws a shape outline.
+    private func isGraphicCommandSelection(_ range: Range<Int>, in text: String) -> Bool {
+        guard let command = ScoreGraphic.commandRange(at: range.lowerBound, in: text),
+              range.lowerBound >= command.lowerBound, range.upperBound <= command.upperBound else { return false }
+        return String(decoding: Array(text.utf8)[command], as: UTF8.self).hasPrefix("\\start")
+    }
+
     /// The current-text UTF-8 offset of a point-and-click link.
     private func currentOffset(of link: PointAndClickLocation) -> Int? {
-        guard let map = engraving, let engraved = map.engravedOffset(of: link.position) else { return nil }
+        currentOffset(ofPosition: link.position)
+    }
+
+    private func currentOffset(ofPosition position: SourcePosition) -> Int? {
+        guard let map = engraving, let engraved = map.engravedOffset(of: position) else { return nil }
         let current16 = map.currentOffset(forEngraved: engraved)
         return OffsetConversion.utf8(fromUTF16: current16, in: editor.text)
     }
@@ -657,16 +688,35 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         case .setDuration(let d):
-            if !events.isEmpty { applyShowingDuration(scoreEditor.setDuration(events: events, to: d)) }
+            // At a clicked insertion point the duration is for the note to
+            // come, not the anchor already selected.
+            if mouseInsertion != nil {
+                noteInput.arm(d)
+                updateInputStatus()
+            } else if !events.isEmpty {
+                applyShowingDuration(scoreEditor.setDuration(events: events, to: d))
+            }
             updateInputStatus()
         case .toggleDot:
-            if !events.isEmpty { applyShowingDuration(scoreEditor.toggleDot(events: events)) }
+            if mouseInsertion != nil {
+                updateInputStatus()
+            } else if !events.isEmpty {
+                applyShowingDuration(scoreEditor.toggleDot(events: events))
+            }
             updateInputStatus()
         case .insertNote(let step):
             insert(step: step)
         case .insertRest:
             insert(step: nil)
         case .delete:
+            // At a clicked insertion point, Backspace cancels the point; it
+            // does not delete the anchor the user did not choose.
+            if mouseInsertion != nil {
+                mouseInsertion = nil
+                updateInputStatus()
+                statusBar.flash("Insertion point cleared")
+                return
+            }
             let gone = events.allSatisfy { isEngraved($0) } ? highlighted : []
             let edit = scoreEditor.delete(events: events)
             apply(edit)
@@ -680,6 +730,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         case .select(let step, let extend):
             moveSelection(by: step, extend: extend)
         case .clearSelection:
+            if mouseInsertion != nil {
+                mouseInsertion = nil
+                noteInput.arm(nil)
+                updateInputStatus()
+                statusBar.flash("Insertion point cleared")
+                return
+            }
             // ⎋ with nothing selected disarms (ends mouse entry).
             if !hasSelection, noteInput.armedDuration != nil {
                 noteInput.arm(nil)
@@ -698,11 +755,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     private func insert(step: Int?) {
         let r = selectionUTF8()
-        // After the selected event, or after the event just before the caret.
-        let anchor = targets().events.max()
+        let mouse = mouseInsertion.flatMap { tree.events.indices.contains($0.event) ? $0 : nil }
+        // After the clicked insertion point or the selected event, or after
+        // the event just before the caret.
+        let anchor = mouse?.event
+            ?? targets().events.max()
             ?? tree.events.lastIndex { $0.range.upperBound <= r.lowerBound && $0.acceptsNoteEntry }
         guard let anchor, tree.events[anchor].acceptsNoteEntry else {
-            statusBar.flash("Select a note to insert after (or type it in the source)")
+            statusBar.flash("Select a note or click empty staff space to insert after (or type it in the source)")
             NSSound.beep()
             return
         }
@@ -711,7 +771,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let engraved = isEngraved(anchor)
         let anchorPositions = engraved ? highlighted : []
         let anchorDiatonic = engraved ? tree.events[anchor].notes.first.map { tree.notes[$0].absolute.diatonicIndex } : nil
-        let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: noteInput.armedDuration)
+        let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: noteInput.armedDuration,
+                                            octave: step != nil ? mouse?.octave : nil)
+        mouseInsertion = nil
         apply(edit)
         guard edit != nil else { return }
         // Instant feedback while LilyPond engraves: a ghost of the new note.
@@ -764,6 +826,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         } else {
             selectEvents([next])
         }
+        // ⇧←/→ widens the selection the score shows; the open lens shows
+        // the same passage, not the note it was opened on.
+        if lens?.isOpen == true, LensScoreBuilder.build(tree: tree, selection: selectionUTF8()) != nil {
+            showLens(closesOnRender: false, navigating: true)
+        }
     }
 
     private func updateInputStatus() {
@@ -799,10 +866,16 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     private func updateHints() {
         var hints: [String]
-        if hasSelection {
-            hints = ["↑↓ pitch  ⇧↑↓ octave  ⌥↑↓ sharp/flat", "1 2 4 8 16 duration  . dot", "a–g insert  ⌫ delete  ⌘L lens"]
+        if canvas.graphicSectionSelection != nil {
+            hints = ["⌘L describe the marked section", "⌥drag another range · ⎋ clears", "←→ walk the score"]
+        } else if mouseInsertion != nil {
+            hints = ["Type a–g to insert after the selected note", "4 8 16 arm the duration · ⎋ cancels",
+                     "⌥drag marks a graphics range"]
+        } else if hasSelection {
+            hints = ["↑↓ pitch  ⇧↑↓ octave  ⌥↑↓ sharp/flat", "a–g insert  ⌫ delete  ⌘L lens",
+                     "⌥drag marks a graphics range"]
         } else {
-            hints = ["Click a note to select it", "←→ walk the score", "⌘J switch pane"]
+            hints = ["Click a note or empty staff space", "⌥drag marks a graphics range", "←→ walk the score"]
         }
         if noteInput.armedDuration != nil { hints.insert("Type a–g to insert · ⎋ to disarm", at: 0) }
         if hasSelection, window?.firstResponder !== canvas {
@@ -880,6 +953,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        player?.stop()
+        player = nil
+        stopPlayhead()
         agentHandle?.stop()
         requestIdle?.cancel()
         requestSession?.close()
@@ -926,47 +1002,148 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 }
 
 extension DocumentWindowController: ScoreCanvasDelegate {
-    func canvas(_ canvas: ScoreCanvasView, didClick link: PointAndClickLocation?, extending: Bool) {
-        guard let link else {
+    func canvas(_ canvas: ScoreCanvasView, didClick link: PointAndClickLocation?,
+                at page: Int?, point: Point?, extending: Bool) {
+        // A normal click is always note-oriented. A graphic's command link is
+        // ignored here; the note under the click (or the nearest one) wins.
+        if let link, !isGraphicLink(link) {
+            guard let file = score.file(for: link.path) else {
+                statusBar.flash("That object comes from \((link.path as NSString).lastPathComponent), outside this score's files")
+                return
+            }
+            if file !== activeFile {
+                showFile(file)
+                statusBar.flash("Editing \(file.displayName)")
+            }
+            guard let offset = currentOffset(of: link) else { return }
+            // A chord member selects just that note, so ↑↓ move it alone.
+            var range: Range<Int>
+            if let n = tree.noteIndex(startingAt: offset), let e = tree.notes[n].event, tree.events[e].kind == .chord {
+                range = tree.notes[n].spelledRange
+            } else if let e = tree.eventIndex(at: offset) {
+                range = tree.events[e].range
+            } else {
+                return
+            }
+            if extending {
+                let current = selectionUTF8()
+                range = min(current.lowerBound, range.lowerBound)..<max(current.upperBound, range.upperBound)
+            }
+            setSelection(utf8: range)
+            window?.makeFirstResponder(canvas)
+            return
+        }
+        guard let page, let point, canvas.pages.indices.contains(page) else {
             perform(.clearSelection)
             return
         }
+        noteClick(at: point, page: page)
+    }
+
+    func canvas(_ canvas: ScoreCanvasView, isGraphicLink link: PointAndClickLocation) -> Bool {
+        isGraphicLink(link)
+    }
+
+    func canvas(_ canvas: ScoreCanvasView, didClickGraphic link: PointAndClickLocation) {
+        guard isGraphicLink(link) else { return }
         guard let file = score.file(for: link.path) else {
             statusBar.flash("That object comes from \((link.path as NSString).lastPathComponent), outside this score's files")
             return
         }
-        if file !== activeFile {
-            showFile(file)
-            statusBar.flash("Editing \(file.displayName)")
-        }
-        guard let offset = currentOffset(of: link) else { return }
-        // A chord member selects just that note, so ↑↓ move it alone.
-        var range: Range<Int>
-        if let n = tree.noteIndex(startingAt: offset), let e = tree.notes[n].event, tree.events[e].kind == .chord {
-            range = tree.notes[n].spelledRange
-        } else if let command = ScoreGraphic.commandRange(at: offset, in: editor.text) {
-            // A graphic links to the command that starts it (`\startGrains`,
-            // `\startGraphic`): selecting that word is the graphic's cursor.
-            range = command
-            statusBar.flash("⌘L: describe a change to this graphic")
-        } else if let e = tree.eventIndex(at: offset) {
-            range = tree.events[e].range
-        } else {
-            return
-        }
-        if extending {
-            let current = selectionUTF8()
-            range = min(current.lowerBound, range.lowerBound)..<max(current.upperBound, range.upperBound)
-        }
-        setSelection(utf8: range)
-        // A click in the score means the next keys are score keys (a–g, 8,
-        // ↑…), never text: make sure nothing on the way took the keyboard.
-        window?.makeFirstResponder(canvas)
+        if file !== activeFile { showFile(file) }
+        guard let offset = currentOffset(of: link),
+              let command = ScoreGraphic.commandRange(at: offset, in: editor.text) else { return }
+        setSelection(utf8: command)
+        window?.makeFirstResponder(editor.textView)
+        statusBar.flash("Source for this graphic — ⌥drag across the staff to mark a range to change")
     }
 
-    func canvasClickedUnlinkedMusic(_ canvas: ScoreCanvasView) {
-        // DESIGN.md M2.1 B: explain, don't silently deselect.
-        statusBar.flash("That object has no source link — it may come from Scheme, a music function, or LilyPond itself")
+    /// A click on a graphic or empty staff space: choose the event to insert
+    /// after and the octave of the clicked staff position. Typing a–g then
+    /// inserts at that point.
+    private func noteClick(at point: Point, page index: Int) {
+        guard canvas.pages.indices.contains(index) else { return }
+        let page = canvas.pages[index].page
+        guard let staff = nearestStaff(to: point, in: page) else {
+            statusBar.flash("Click on or near a staff to place notes")
+            return
+        }
+        // Find the file that owns this staff's notes: the active one first,
+        // then the score's other files (a staff can be in another file).
+        var chosen: (file: SourceFile, anchors: [MouseEntry.Anchor])?
+        for file in [activeFile] + score.files.filter({ $0 !== activeFile }) {
+            let text = file.text
+            let map: EngravingMap
+            if file === activeFile, let current = engraving {
+                map = current
+            } else if let engraved = file.engravedText {
+                map = EngravingMap(engraved: engraved, current: text)
+            } else {
+                continue
+            }
+            let fileTree = file === activeFile ? tree : SyntaxTree(text)
+            let anchors = MouseEntry.anchors(on: staff, page: page, tree: fileTree,
+                                             linkedFrom: { PathMatching.same($0, file.url.path) },
+                                             offset: { position in
+                guard let engraved = map.engravedOffset(of: position) else { return nil }
+                return OffsetConversion.utf8(fromUTF16: map.currentOffset(forEngraved: engraved), in: text)
+            })
+            if !anchors.isEmpty { chosen = (file, anchors); break }
+        }
+        guard let chosen else {
+            statusBar.flash("This staff has no notes to take a pitch from")
+            return
+        }
+        if chosen.file !== activeFile { showFile(chosen.file) }
+        let anchors = chosen.anchors
+        switch MouseEntry.target(click: point, staff: staff, anchors: anchors) {
+        case .success(let target):
+            selectEvents([target.after])
+            mouseInsertion = MouseInsertion(event: target.after, octave: target.octave)
+            window?.makeFirstResponder(canvas)
+            updateHints()
+            statusBar.flash("Type a–g to insert after the selected note · octave from the click · ⎋ cancels")
+        case .failure(.nothingBefore):
+            mouseInsertion = nil
+            statusBar.flash("Click after a note on this staff to insert here")
+        case .failure(.uncalibrated):
+            // Rests or a rhythmic staff give a position but no pitch to
+            // calibrate from: still insert after the event before the click.
+            if let before = anchors.filter({ $0.bounds.minX <= point.x })
+                .max(by: { $0.bounds.minX < $1.bounds.minX }) {
+                selectEvents([before.ref])
+                mouseInsertion = MouseInsertion(event: before.ref, octave: 0)
+                window?.makeFirstResponder(canvas)
+                updateHints()
+                statusBar.flash("Type a–g to insert after the selected event · ⎋ cancels")
+            } else {
+                mouseInsertion = nil
+                statusBar.flash("Click after a note or rest on this staff to insert here")
+            }
+        }
+    }
+
+    private func nearestStaff(to point: Point, in page: EngravedPage) -> Staff? {
+        if let staff = page.staff(at: point) { return staff }
+        let systems = EngravedPage.systems(of: page.staves)
+        func distance(_ band: ClosedRange<Double>) -> Double {
+            band.contains(point.y) ? 0 : min(abs(point.y - band.lowerBound), abs(point.y - band.upperBound))
+        }
+        guard let band = systems.min(by: { distance($0) < distance($1) }) else { return nil }
+        let inBand = page.staves.filter { $0.top <= band.upperBound + 0.5 && $0.bottom >= band.lowerBound - 0.5 }
+        let staffs = inBand.isEmpty ? page.staves : inBand
+        guard let staff = staffs.min(by: {
+            abs(($0.top + $0.bottom) / 2 - point.y) < abs(($1.top + $1.bottom) / 2 - point.y)
+        }) else { return nil }
+        return staff.band(ledgerSpaces: 8).contains(point) ? staff : nil
+    }
+
+    private func isGraphicLink(_ link: PointAndClickLocation) -> Bool {
+        guard let point = linkPoint(link),
+              let index = SourceText(point.text).index(of: point.position) else { return false }
+        let offset = point.text.utf8.distance(from: point.text.startIndex, to: index)
+        guard let command = ScoreGraphic.commandRange(at: offset, in: point.text) else { return false }
+        return String(decoding: Array(point.text.utf8)[command], as: UTF8.self).hasPrefix("\\start")
     }
 
     func canvas(_ canvas: ScoreCanvasView, didSelect links: [PointAndClickLocation]) {
@@ -984,6 +1161,37 @@ extension DocumentWindowController: ScoreCanvasDelegate {
         // A rectangle selects the contiguous source span it covers.
         selectEvents(Array(events))
         window?.makeFirstResponder(canvas)
+    }
+
+    func canvas(_ canvas: ScoreCanvasView, didSelectGraphicSection section: GraphicSection?) {
+        guard let section else {
+            updateHints()
+            return
+        }
+        // Put the caret on the music at the section's leading edge, so the
+        // request's score_context describes that staff and graphic; the
+        // section itself carries the range the agent may change.
+        let start = section.link ?? sectionAnchor(section.from)?.link
+        if let start {
+            if let file = score.file(for: start.path), file !== activeFile { showFile(file) }
+            if let offset = currentOffset(of: start) { setSelection(utf8: offset..<offset) }
+        }
+        updateHints()
+        showRequest(fromLens: false)
+    }
+
+    /// The linked music nearest one end of a marked section, on its system.
+    private func sectionAnchor(_ end: GraphicSection.Endpoint)
+        -> (x: Double, link: PointAndClickLocation)? {
+        guard canvas.pages.indices.contains(end.page) else { return nil }
+        let page = canvas.pages[end.page].page
+        let space = end.staff.space
+        let reach = (end.system.lowerBound - 4 * space)...(end.system.upperBound + 4 * space)
+        let anchors = page.graphics.compactMap { g -> (x: Double, link: PointAndClickLocation)? in
+            guard let link = g.link, reach.contains(g.bounds.midY) else { return nil }
+            return (g.bounds.midX, link)
+        }
+        return anchors.min { abs($0.x - end.pageX) < abs($1.x - end.pageX) }
     }
 
     func canvas(_ canvas: ScoreCanvasView, handleKey event: NSEvent) -> Bool {
@@ -1044,6 +1252,11 @@ extension DocumentWindowController: ScoreDocumentDelegate {
 
     func documentDidUpdatePlayback(_ document: ScoreDocument) {
         cueInspector.show(score.cueSheet, scoreFolder: score.url.deletingLastPathComponent())
+        // Cue times (and the notes the head follows) are this compile's now.
+        if player?.isPlaying == true {
+            rebuildPlayheadTrack()
+            tickPlayhead()
+        }
     }
 
     func documentDidLoadCachedRender(_ document: ScoreDocument) {
@@ -1069,6 +1282,11 @@ extension DocumentWindowController: ScoreDocumentDelegate {
         closeLensIfRendered()
         refreshEngravingSettings()
         refreshScoreSetup()
+        // A new engraving has new pages: keep the playing head on them.
+        if player?.isPlaying == true {
+            rebuildPlayheadTrack()
+            tickPlayhead()
+        }
     }
 }
 
@@ -1172,7 +1390,9 @@ extension DocumentWindowController: CommandResponder {
         case "file.lilypond": showLilyPondPicker()
         case "view.play": togglePlayback()
         case "view.playMix": togglePlayback(electronics: true)
-        case "view.lens": showLens(closesOnRender: false)
+        case "view.lens":
+            if canvas.graphicSectionSelection != nil { showRequest(fromLens: false) }
+            else { showLens(closesOnRender: false) }
         case "view.zoomIn": zoomIn(nil)
         case "view.zoomOut": zoomOut(nil)
         case "view.actualSize": actualSize(nil)
@@ -1266,6 +1486,11 @@ extension DocumentWindowController: CommandResponder {
         help.optionChanged(isDown: false)
         if event.keyCode == 53, lens?.isOpen == true {
             closeLens()
+            return true
+        }
+        if event.keyCode == 53, canvas.graphicSectionSelection != nil, !canvas.legendArranging {
+            canvas.clearGraphicSection()
+            statusBar.flash("Section cleared")
             return true
         }
         // ⇥ in the lens: the request line for this passage.
@@ -1422,80 +1647,135 @@ extension DocumentWindowController: CommandResponder {
     /// selection is on: its first and last events in this staff's music,
     /// and the first event of the next system.
     var rpcContext: JSONValue {
-        let text = editor.text
         let r = selectionUTF8()
-        let start = SourceText(text).position(of: text.utf8.index(text.utf8.startIndex, offsetBy: min(r.lowerBound, text.utf8.count)))
-        let files = score.files.map { (path: $0.url.path, text: $0 === activeFile ? text : $0.text) }
-        var context = ScoreContext.describe(text: text, file: activeFile.url.path, line: start.line, character: start.character,
-                                            files: files, cues: score.cueSheet)
+        let section = canvas.graphicSectionSelection
+        // A marked section starts at its own edge, wherever the caret is now.
+        // The clicked graphic is the context when there is one; else the
+        // music nearest the leading edge.
+        let base = section.flatMap { s in (s.link ?? sectionAnchor(s.from)?.link).flatMap { linkPoint($0) } }
+        let text = base?.text ?? editor.text
+        let baseFile = base?.file ?? activeFile
+        let start = base?.position
+            ?? SourceText(text).position(of: text.utf8.index(text.utf8.startIndex, offsetBy: min(r.lowerBound, text.utf8.count)))
+        let files = score.files.map { (path: $0.url.path, text: $0 === baseFile ? text : $0.text) }
+        var context = ScoreContext.describe(text: text, file: baseFile.url.path, line: start.line, character: start.character,
+                                            files: files, cues: score.cueSheet,
+                                            root: (path: score.root.url.path, text: score.root.text))
         guard case var .object(o) = context else { return context }
-        if let part = canvas.graphicPartSelection, o["graphic"] != nil {
-            let scale = part.space > 0 ? part.space : 1
-            let width = max(part.piece.width, 0.001)
-            func y(_ pageY: Double) -> Double { (part.staffMiddle - pageY) / scale }
-            var selection: [String: JSONValue] = [
-                "kind": .string("graphic-part"),
-                "page": .number(Double(part.page)),
-                // Fractions of the broken piece's width, so they do not depend on the
-                // system's page offset. The drawing code's x runs from (car (g-span grob)).
-                "x": .array([.number((part.part.minX - part.piece.minX) / width),
-                             .number((part.part.maxX - part.piece.minX) / width)]),
-                // Staff spaces above the middle line, as the drawing code's y.
-                "y": .array([.number(y(part.part.maxY)), .number(y(part.part.minY))]),
-                // The clicked system's piece, so the same x on another system is not changed too.
-                "spanner_x": .array([.number(part.piece.minX), .number(part.piece.maxX)]),
-                "units": .string("x is a fraction of the piece's width (from (car (g-span grob)) to its right edge); y is in staff spaces above the middle line; spanner_x is that piece's page x"),
-            ]
-            // The exact test for "inside the highlight", ready to paste into the
-            // drawing loop: the agent changes this and no wider.
-            let f0 = (part.part.minX - part.piece.minX) / width, f1 = (part.part.maxX - part.piece.minX) / width
-            let y0 = y(part.part.maxY), y1 = y(part.part.minY)
-            func r(_ v: Double) -> String { String(format: "%.3f", v) }
-            selection["scope"] = .string("(let ((f (/ (- x x0) (- x1 x0)))) (and (>= f \(r(f0))) (<= f \(r(f1))) (>= y \(r(y0))) (<= y \(r(y1)))))"
-                + "   ; x0 x1 = (car/cdr (g-span grob)); only on the piece at page x \(r(part.piece.minX))–\(r(part.piece.maxX))")
-            if let musical = clickedMusicalContext(for: part) {
-                for (key, value) in musical { selection[key] = value }
+        if let section {
+            let timing = score.timingLog.map {
+                SectionTimeMap(log: $0, pages: canvas.pages.map(\.page))
             }
-            o["selection"] = .object(selection)
+            o["selection"] = sectionSelection(section, timing: timing, staffName: o["staff"]?.string)
         }
-        if let system = systemOfSelection(text: text) { o["system"] = system }
+        if section == nil, let system = systemOfSelection(text: text) { o["system"] = system }
         context = .object(o)
         return context
     }
 
-    /// The bar/moment nearest the click and, when the system's other
-    /// linked glyphs bracket it, the musical range of the clicked part
-    /// (the graphic itself only links to the spanner's start).
-    private func clickedMusicalContext(for part: ScoreCanvasView.GraphicPartSelection) -> [String: JSONValue]? {
-        struct Hit { var x: Double; var bar: Int; var moment: String; var event: String? }
-        var hits: [Hit] = []
-        for anchor in part.anchors {
-            guard let file = score.file(for: anchor.link.path), let engraved = file.engravedText else { continue }
-            let text = file.text
-            let map = EngravingMap(engraved: engraved, current: text)
-            guard let engravedOffset = map.engravedOffset(of: anchor.link.position) else { continue }
-            let source = SourceText(text)
-            let p = source.position(of: source.index(utf16Offset: map.currentOffset(forEngraved: engravedOffset)))
-            let files = score.files.map { (path: $0.url.path, text: $0 === file ? text : $0.text) }
-            let context = ScoreContext.describe(text: text, file: file.url.path, line: p.line, character: p.character,
-                                                files: files, cues: score.cueSheet)
-            guard let bar = context["bar"]?.int, let moment = context["moment"]?.string else { continue }
-            hits.append(Hit(x: anchor.x, bar: bar, moment: moment, event: context["event"]?["text"]?.string))
+    /// Where a point-and-click link is in the current text, and which file.
+    private struct LinkPoint {
+        var file: SourceFile
+        var text: String
+        var position: SourcePosition
+    }
+
+    private func linkPoint(_ link: PointAndClickLocation) -> LinkPoint? {
+        guard let file = score.file(for: link.path), let engraved = file.engravedText else { return nil }
+        let text = file.text
+        let map = EngravingMap(engraved: engraved, current: text)
+        guard let engravedOffset = map.engravedOffset(of: link.position) else { return nil }
+        let source = SourceText(text)
+        let position = source.position(of: source.index(utf16Offset: map.currentOffset(forEngraved: engravedOffset)))
+        return LinkPoint(file: file, text: text, position: position)
+    }
+
+    private struct MusicalHit {
+        var bar: Int
+        var moment: String
+        var event: String?
+        var source: JSONValue
+    }
+
+    private func musicalHit(for link: PointAndClickLocation) -> MusicalHit? {
+        guard let point = linkPoint(link) else { return nil }
+        let files = score.files.map { (path: $0.url.path, text: $0 === point.file ? point.text : $0.text) }
+        let context = ScoreContext.describe(text: point.text, file: point.file.url.path,
+                                            line: point.position.line, character: point.position.character,
+                                            files: files, cues: score.cueSheet)
+        guard let bar = context["bar"]?.int, let moment = context["moment"]?.string else { return nil }
+        return MusicalHit(bar: bar, moment: moment, event: context["event"]?["text"]?.string,
+                          source: ["file": .string(point.file.url.path),
+                                   "line": .number(Double(point.position.line)),
+                                   "character": .number(Double(point.position.character))])
+    }
+
+    private func musicalJSON(_ hit: MusicalHit) -> JSONValue {
+        var out: [String: JSONValue] = ["bar": .number(Double(hit.bar)), "moment": .string(hit.moment),
+                                        "source": hit.source]
+        if let event = hit.event { out["event"] = .string(event) }
+        return .object(out)
+    }
+
+    /// The selection a graphics request gets for a marked section: the two
+    /// edges (`from`/`to`), what each edge is in the music, the fraction of
+    /// each broken piece, and every system's selected x range.
+    private func sectionSelection(_ section: GraphicSection, timing: SectionTimeMap?,
+                                  staffName: String?) -> JSONValue {
+        let from = sectionEndpoint(section.from, timing: timing, staffName: staffName)
+        let to = sectionEndpoint(section.to, timing: timing, staffName: staffName)
+        let systems = section.systems.map { s -> JSONValue in
+            let staffX = staffLineFraction(s.pageX, of: s.staff)
+            return .object(["page": .number(Double(s.page + 1)),
+                            "ordinal": .number(Double(s.ordinal + 1)),
+                            "x": .array([.number(s.fraction.lowerBound), .number(s.fraction.upperBound)]),
+                            "staff_x": .array([.number(staffX.lowerBound), .number(staffX.upperBound)]),
+                            "page_x": .array([.number(s.pageX.lowerBound), .number(s.pageX.upperBound)]),
+                            "spanner_x": .array([.number(s.piece.minX), .number(s.piece.maxX)])])
         }
-        guard !hits.isEmpty else { return nil }
-        func json(_ hit: Hit) -> JSONValue {
-            var out: [String: JSONValue] = ["bar": .number(Double(hit.bar)), "moment": .string(hit.moment)]
-            if let event = hit.event { out["event"] = .string(event) }
-            return .object(out)
-        }
-        let target = part.part.midX
-        let nearest = hits.min { abs($0.x - target) < abs($1.x - target) }!
-        var out: [String: JSONValue] = ["at": json(nearest)]
-        let left = hits.filter { $0.x <= part.part.minX }.max { $0.x < $1.x }
-        let right = hits.filter { $0.x >= part.part.maxX }.min { $0.x < $1.x }
-        if let left, let right, left.bar != right.bar || left.moment != right.moment {
-            // The music on either side: wider than the highlight, for "from here", never for scoping.
-            out["music_around"] = .object(["from": json(left), "to": json(right)])
+        let y = section.staffSpaceRange
+        var out: [String: JSONValue] = [
+            "kind": .string("graphic-section"),
+            "page": .number(Double(section.from.page + 1)),
+            "x": .array([.number(section.from.fraction), .number(section.to.fraction)]),
+            "y": .array([.number(y.lowerBound), .number(y.upperBound)]),
+            "spanner_x": .array([.array([.number(section.from.piece.minX), .number(section.from.piece.maxX)]),
+                                 .array([.number(section.to.piece.minX), .number(section.to.piece.maxX)])]),
+            "from": .object(from),
+            "to": .object(to),
+            "systems": .array(systems),
+            "units": .string("x is [from, to]: fractions of the broken piece's width at the start and end edges; page_x is the same edge in page coordinates; y is staff spaces above the middle line; from.at/to.at are the moment at each edge, interpolated from the engraved notes' x positions; systems lists each covered system's selected x range."),
+        ]
+        if let at = from["at"] { out["at"] = at }
+        return .object(out)
+    }
+
+    /// The same page x range as fractions of the staff line, which is the
+    /// coordinate a StaffSymbol.stencil uses.
+    private func staffLineFraction(_ range: ClosedRange<Double>, of staff: Staff) -> ClosedRange<Double> {
+        let width = staff.maxX - staff.minX
+        guard width > 0 else { return 0...1 }
+        let f = { (x: Double) in min(1, max(0, (x - staff.minX) / width)) }
+        return f(range.lowerBound)...f(range.upperBound)
+    }
+
+    private func sectionEndpoint(_ end: GraphicSection.Endpoint, timing: SectionTimeMap?,
+                                 staffName: String?) -> [String: JSONValue] {
+        var out: [String: JSONValue] = [
+            "page": .number(Double(end.page + 1)),
+            "x": .number(end.fraction),
+            "page_x": .number(end.pageX),
+            "spanner_x": .array([.number(end.piece.minX), .number(end.piece.maxX)]),
+        ]
+        if let edge = timing?.edge(at: end, staffName: staffName) {
+            var at: [String: JSONValue] = ["bar": .number(Double(edge.bar)), "moment": .string(edge.moment.description)]
+            if let source = edge.source {
+                at["source"] = ["file": .string(source.file), "line": .number(Double(source.line)),
+                                "character": .number(Double(source.character))]
+            }
+            out["at"] = .object(at)
+        } else if let anchor = sectionAnchor(end), let hit = musicalHit(for: anchor.link) {
+            out["at"] = musicalJSON(hit)
         }
         return out
     }
@@ -1571,6 +1851,7 @@ extension DocumentWindowController: CommandResponder {
         if let player, player.isPlaying {
             player.stop()
             self.player = nil
+            stopPlayhead()
             statusBar.flash("Stopped")
             return
         }
@@ -1599,12 +1880,77 @@ extension DocumentWindowController: CommandResponder {
         do {
             let p = try AVAudioPlayer(contentsOf: url)
             p.currentTime = min(start, max(0, p.duration - 0.1))
-            p.play()
+            guard p.play() else {
+                statusBar.flash("Can't play \(url.lastPathComponent)")
+                NSSound.beep()
+                return
+            }
             player = p
-            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", start)) s — \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
+            startPlayhead(from: p.currentTime)
+            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", p.currentTime)) s — \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
         } catch {
             statusBar.flash("Can't play \(url.lastPathComponent): \(error.localizedDescription)")
         }
+    }
+
+    // MARK: Playback head
+
+    /// The head follows the audio through the engraving on screen. `start`
+    /// is where the player began (a bar the user picked): before that bar's
+    /// first note the head waits on it rather than on the previous bar.
+    private func startPlayhead(from start: Double) {
+        stopPlayhead()
+        playheadStart = start
+        rebuildPlayheadTrack()
+        guard playheadTrack?.stops.isEmpty == false else { return }
+        let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickPlayhead() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        playheadTimer = timer
+        tickPlayhead()
+    }
+
+    private func rebuildPlayheadTrack() {
+        guard let log = score.timingLog else {
+            playheadTrack = nil
+            return
+        }
+        playheadTrack = PlayheadTrack(log: log, pages: canvas.pages.map(\.page))
+    }
+
+    private func tickPlayhead() {
+        guard let player, let track = playheadTrack else {
+            stopPlayhead()
+            return
+        }
+        guard player.isPlaying else {
+            stopPlayhead()
+            return
+        }
+        guard let position = track.position(at: player.currentTime, from: playheadStart) else {
+            canvas.setPlayhead(nil)
+            return
+        }
+        canvas.setPlayhead(position)
+        // A new system: bring it into view. Between systems the head moves
+        // on its own, so the page never creeps under the user.
+        let system = (page: position.page, top: position.top, bottom: position.bottom)
+        let changed = playheadSystem.map {
+            $0.page != system.page || abs($0.top - system.top) > 0.5
+        } ?? true
+        if changed {
+            playheadSystem = system
+            canvas.revealPlayhead()
+        }
+    }
+
+    private func stopPlayhead() {
+        playheadTimer?.invalidate()
+        playheadTimer = nil
+        playheadTrack = nil
+        playheadSystem = nil
+        canvas.setPlayhead(nil)
     }
 
     // MARK: Engraving settings
@@ -1938,32 +2284,37 @@ extension DocumentWindowController: CommandResponder {
     /// The request line for the selection: a graphic's own lens, or the
     /// notation lens's other side (⇥ from the lens, ⇥ back).
     private func showRequest(fromLens: Bool) {
+        guard canvas.graphicSectionSelection != nil else {
+            statusBar.flash("⌥drag across the staff to mark a graphics range")
+            return
+        }
+        closeLens()
         guard let anchor = lensAnchor() else { return }
-        // Shown at once: the title is the selected command word, the agent the
-        // one found in the background; the full context is built on ↩.
-        let text = editor.text
-        let sel = selectionUTF8()
-        let word = sel.upperBound <= text.utf8.count
-            ? String(decoding: Array(text.utf8)[sel.lowerBound..<min(sel.upperBound, sel.lowerBound + 40)], as: UTF8.self) : ""
-        let title = word.hasPrefix("\\") ? word : "the selection"
+        let context = rpcContext
+        let section = canvas.graphicSectionSelection
+        let anchored = section.flatMap { $0.link ?? sectionAnchor($0.from)?.link }
+        let target: AgentRun.RequestTarget = (anchored != nil && context["graphic"] != nil)
+            ? .existingGraphic : .emptySection
         let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
         requestPopover.placeholder = nil
         requestPopover.mode = .graphics
         configureLensModes(requestPopover)
-        let part = canvas.graphicPartSelection.map { _ in " Only the highlighted part changes." } ?? ""
-        requestPopover.detail = "The score's agent changes the music and graphics here." + part
-            + "\nTry: taller · denser till 7 · thin out the bottom · a grainy swell over these bars"
+        requestPopover.detail = target == .emptySection
+            ? "No drawing starts here. Ask for a new drawing, or for a notation change (barlines, spacing, clefs)."
+                + "\nTry: a grainy swell over this bar · make the barlines wavy · wider spacing"
+            : "The score's agent changes only the marked section."
+                + "\nTry: taller · denser · thin out the bottom · a grainy swell over it"
         requestPopover.onSubmit = { [weak self] request in
             guard let self else { return }
             guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
                 self.statusBar.flash("No agent: choose one in Settings (⌘,)")
                 return
             }
-            self.runRequest(request, agent: agent, context: self.rpcContext)
+            self.runRequest(request, agent: agent, context: self.rpcContext, target: target)
         }
         let turns = requestSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
         let who = agent.map { $0.harness.title + (turns > 0 ? " (continuing, ␣ e n new)" : "") } ?? "the agent"
-        requestPopover.present(title: title, agent: who, anchor: anchor.rect, in: anchor.view)
+        requestPopover.present(title: "the marked section", agent: who, anchor: anchor.rect, in: anchor.view)
     }
 
     /// The request line for the patch agent: a change to the SuperCollider
@@ -2001,8 +2352,10 @@ extension DocumentWindowController: CommandResponder {
     /// The lenses the selection offers: the Notation Lens when it is in
     /// notes, the patch agent when there is a patch, the score's agent always.
     private var lensModes: (available: Set<LensMode>, unavailable: [LensMode: String]) {
-        var available: Set<LensMode> = [.graphics]
+        var available: Set<LensMode> = []
         var unavailable: [LensMode: String] = [:]
+        if canvas.graphicSectionSelection != nil { available.insert(.graphics) }
+        else { unavailable[.graphics] = "⌥drag across the staff to mark a graphics range" }
         if LensScoreBuilder.build(tree: tree, selection: selectionUTF8()) != nil { available.insert(.notation) }
         else { unavailable[.notation] = "No notes here to show (a graphic, or a part the lens can't draw)" }
         if score.patchURL != nil { available.insert(.patch) }
@@ -2163,12 +2516,13 @@ extension DocumentWindowController: CommandResponder {
     /// The agent carries out a request about the selection in the
     /// background; the status bar shows what it is doing, and ␣ e z undoes
     /// its change.
-    private func runRequest(_ request: String, agent: AgentRun, context: JSONValue) {
+    private func runRequest(_ request: String, agent: AgentRun, context: JSONValue,
+                            target: AgentRun.RequestTarget) {
         var agent = agent
         agent.model = agent.harness == .opencode ? Self.opencodeModel : nil
         let log = AgentLog.Run(kind: .graphics)
         log.log("request", "“\(request)” · \(agent.harness.title)\(agent.model.map { " (\($0))" } ?? "") · \(score.url.lastPathComponent)",
-                detail: "score \(score.url.path)\nagent \(agent.executable)")
+                detail: "score \(score.url.path)\nagent \(agent.executable)\ntarget \(target.rawValue)")
         guard agentHandle == nil, !requestRunning else {
             log.log("refused", "Another agent is still working", level: .warning)
             statusBar.flash("An agent is still working (␣ e k stops it)")
@@ -2200,15 +2554,20 @@ extension DocumentWindowController: CommandResponder {
         showAgentProgress()
         let contextText = context.jsonString(pretty: true)
         let prompt = AgentRun.graphicsPrompt(request: request, context: contextText, score: score.url,
-                                             followUp: session.turns > 0)
+                                             followUp: session.turns > 0, target: target)
         let graphic = context["graphic"]
-        log.log("context", graphic == nil ? "No graphic at the selection: the agent gets the event and staff only"
-                    : "Selection: \(graphic?["command"]?.string ?? graphic?["entry"]?.string ?? "a graphic")"
-                      + (graphic?["drawing"] == nil ? "" : " with its drawing code")
-                      + (context["selection"]?["x"]?.array.map { x in
-                          " · highlighted part x " + x.compactMap(\.number).map { String(format: "%.2f", $0) }.joined(separator: "–") }
-                         ?? " · the whole graphic (no part highlighted)"),
-                level: graphic == nil ? .warning : .info, detail: contextText)
+        let selection = context["selection"]
+        if let selection {
+            log.log("selection", "Marked graphics section", detail: selection.jsonString(pretty: true))
+        }
+        let contextNote = graphic == nil
+            ? "Section marked; no drawing at its start: the agent gets the range and staff"
+            : "Section: " + (graphic?["command"]?.string ?? graphic?["entry"]?.string ?? "a graphic")
+              + (graphic?["drawing"] == nil ? "" : " with its drawing code")
+              + (selection?["x"]?.array.map { x in
+                  " · selection x " + x.compactMap(\.number).map { String(format: "%.2f", $0) }.joined(separator: "–") }
+                 ?? "")
+        log.log("context", contextNote, level: .info, detail: contextText, limit: AgentLog.promptLimit)
         log.log("prompt", "\(session.turns > 0 ? "Follow-up" : "First") request, \(prompt.count) characters"
                     + (session.turns > 0 ? " (turn \(session.turns + 1))" : ""), detail: prompt, limit: AgentLog.promptLimit)
         Task { [weak self] in

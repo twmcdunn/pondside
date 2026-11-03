@@ -62,8 +62,7 @@ enum LensScoreAdapter {
 
     /// The parsed score's address for the lens target.
     static func target(of lens: LensScoreWindow, in score: Score) -> (VoiceElementID, ScoreItemID)? {
-        guard let event = lens.target, let (slot, index) = element(of: event, in: lens, score: score),
-              case let .chord(chord) = score[staff]?.measures[event.measureIndex].voices[slot].elements[index]
+        guard let event = lens.target, let (slot, index, chord) = chord(of: event, in: lens, score: score)
         else { return nil }
         if chord.notes.isEmpty {
             let rest = RestID(staff: staff, measureIndex: event.measureIndex, voiceIndex: slot, elementIndex: index)
@@ -72,6 +71,36 @@ enum LensScoreAdapter {
         let note = NoteID(staff: staff, measureIndex: event.measureIndex, voiceIndex: slot, elementIndex: index,
                           noteIndexInChord: 0)
         return (VoiceElementID(note), .note(note))
+    }
+
+    /// Every item the lens selection covers: all the notes of a selected
+    /// chord, or its rest. The score and the lens mark the same passage.
+    static func items(of lens: LensScoreWindow, in score: Score) -> Set<ScoreItemID> {
+        var out = Set<ScoreItemID>()
+        for event in lens.events where lens.selected.contains(event.sourceEvent) {
+            guard let (slot, index, chord) = chord(of: event, in: lens, score: score) else { continue }
+            if chord.notes.isEmpty {
+                out.insert(.rest(RestID(staff: staff, measureIndex: event.measureIndex,
+                                        voiceIndex: slot, elementIndex: index)))
+            } else {
+                for n in chord.notes.indices {
+                    out.insert(.note(NoteID(staff: staff, measureIndex: event.measureIndex, voiceIndex: slot,
+                                            elementIndex: index, noteIndexInChord: n)))
+                }
+            }
+        }
+        return out
+    }
+
+    /// The parsed chord `event` landed on, with its voice slot and element.
+    private static func chord(of event: LensEvent, in lens: LensScoreWindow, score: Score)
+        -> (slot: Int, index: Int, chord: SheetMusicCore.Chord)? {
+        guard let (slot, index) = element(of: event, in: lens, score: score),
+              let measures = score[staff]?.measures, measures.indices.contains(event.measureIndex),
+              measures[event.measureIndex].voices.indices.contains(slot),
+              case let .chord(chord) = measures[event.measureIndex].voices[slot].elements[index]
+        else { return nil }
+        return (slot, index, chord)
     }
 
     /// Slurs hang on their start chord with the distance to their end, in

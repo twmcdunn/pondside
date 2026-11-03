@@ -5,7 +5,7 @@ import PondsideTiming
 
 /// A click on a graphic drawn by the score's own code (Tests/Scores/
 /// large-graphic: `\startGrains` in electronics.ly, drawn by graphics.ily)
-/// gives an agent what it needs to change it, and laconic stops ("till 7")
+/// gives an agent what it needs to change it, and stop positions.
 /// land on the right moment.
 final class ScoreGraphicTests: XCTestCase {
     private var folder: URL {

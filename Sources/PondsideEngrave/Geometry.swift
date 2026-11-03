@@ -77,6 +77,12 @@ public struct Rect: Hashable, Sendable, Codable {
         let nx = min(minX, r.minX), ny = min(minY, r.minY)
         return Rect(x: nx, y: ny, width: max(maxX, r.maxX) - nx, height: max(maxY, r.maxY) - ny)
     }
+
+    /// The smallest rectangle containing the transformed corners.
+    public func transformed(by t: AffineTransform) -> Rect {
+        let pts = [Point(minX, minY), Point(maxX, minY), Point(minX, maxY), Point(maxX, maxY)].map(t.apply)
+        return Rect(enclosing: pts) ?? self
+    }
 }
 
 /// An affine transform with SVG matrix semantics:

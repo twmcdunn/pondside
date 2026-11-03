@@ -216,13 +216,21 @@ func check(_ args: Arguments) async throws -> Int32 {
             var pages: Int
             var milliseconds: Int
             var diagnostics: [DiagnosticJSON]
+            var log: String?
         }
         let ms = Int(result.duration.components.seconds * 1000 + result.duration.components.attoseconds / 1_000_000_000_000_000)
-        try printJSON(Report(ok: result.errors.isEmpty && result.succeeded, pages: result.outputFiles.count,
-                             milliseconds: ms, diagnostics: result.diagnostics.map(DiagnosticJSON.init)))
+        let ok = result.errors.isEmpty && result.succeeded
+        try printJSON(Report(ok: ok, pages: result.outputFiles.count,
+                             milliseconds: ms, diagnostics: result.diagnostics.map(DiagnosticJSON.init),
+                             log: ok ? nil : CompilerLog.tail(result.messages)))
     } else {
         for d in result.diagnostics { print(DiagnosticFormatter.line(d)) }
-        print(result.errors.isEmpty && result.succeeded ? "clean" : "\(result.errors.count) error(s)")
+        let ok = result.errors.isEmpty && result.succeeded
+        if !ok {
+            let tail = CompilerLog.tail(result.messages)
+            if !tail.isEmpty { print(tail) }
+        }
+        print(ok ? "clean" : "\(result.errors.count) error(s)")
     }
     return result.errors.isEmpty && result.succeeded ? 0 : 1
 }

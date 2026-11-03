@@ -133,6 +133,20 @@ final class PatchAgentTests: XCTestCase {
         XCTAssertTrue(p.contains("without reading the files") && p.contains("edit tool"))
         let follow = AgentRun.graphicsPrompt(request: "again", context: "{}", score: URL(fileURLWithPath: "/s.ly"), followUp: true)
         XCTAssertTrue(follow.contains("glance"))
+        let section = AgentRun.graphicsPrompt(request: "denser", context: "{}", score: URL(fileURLWithPath: "/s.ly"))
+        XCTAssertTrue(section.contains("# Graphic notation in Pondside"), "the graphic skill is in the first prompt")
+        XCTAssertTrue(section.contains("from.at.moment") && section.contains("section-window"))
+        let followSection = AgentRun.graphicsPrompt(request: "more", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
+                                                    followUp: true)
+        XCTAssertTrue(followSection.contains("graphic-section") && followSection.contains("from.x"))
+        let empty = AgentRun.graphicsPrompt(request: "make barlines wavy", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
+                                            target: .emptySection)
+        XCTAssertTrue(empty.contains("skill://lilypond"), "the notation route is offered")
+        XCTAssertTrue(empty.contains("# LilyPond"), "the bundled LilyPond skill is in the prompt")
+        XCTAssertTrue(empty.contains("Do not force a Lexicon entry"))
+        let emptyFollow = AgentRun.graphicsPrompt(request: "again", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
+                                                  followUp: true, target: .emptySection)
+        XCTAssertTrue(emptyFollow.contains("no drawing") && emptyFollow.contains("skill://lilypond"))
         let patch = AgentRun.patchPrompt(request: "more reverb", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
                                          patch: URL(fileURLWithPath: "/patch/s.scd"))
         XCTAssertTrue(patch.contains("patch_check") && patch.contains("patch_note") && patch.contains("never .ly"))

@@ -626,6 +626,16 @@ final class ScoreDocument {
                     return f.matches(path: file) || (file == f.displayName && !file.contains("/"))
                 }
             }
+            // A diagnostic can name a path no SourceFile claims (a generated
+            // file, a relative path). It still is why the compile failed:
+            // keep it on the root instead of dropping it, or check answers
+            // "errors:1" with an empty diagnostics list.
+            root.diagnostics += result.diagnostics.filter { d in
+                guard let file = d.file, !file.isEmpty else { return false }
+                return !files.contains { f in
+                    f.matches(path: file) || (file == f.displayName && !file.contains("/"))
+                }
+            }
             // Keep showing the last good engraving while the source has errors,
             // so the score never blanks out mid-thought.
             if !outcome.pages.isEmpty {
