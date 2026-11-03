@@ -8,6 +8,7 @@ import PondsideCore
 @available(macOS 15.0, *)
 @MainActor
 final class NotationLensOverlayView: NSView {
+    private let meterIcon = NSImageView()
     private let host: LensScoreHostView
     private let footer = NSTextField(labelWithString: "")
     private let badge = NSTextField(labelWithString: "")
@@ -52,6 +53,14 @@ final class NotationLensOverlayView: NSView {
         addSubview(badge)
         modes.translatesAutoresizingMaskIntoConstraints = false
         addSubview(modes)
+        meterIcon.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(meterIcon)
+        NSLayoutConstraint.activate([
+            meterIcon.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            meterIcon.centerYAnchor.constraint(equalTo: modes.centerYAnchor),
+            meterIcon.widthAnchor.constraint(equalToConstant: 20),
+            meterIcon.heightAnchor.constraint(equalToConstant: 20),
+        ])
 
         NSLayoutConstraint.activate([
             paper.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
@@ -75,6 +84,12 @@ final class NotationLensOverlayView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    func setUnmetered(_ enabled: Bool) {
+        meterIcon.image = NSImage(systemSymbolName: enabled ? "infinity" : "metronome", accessibilityDescription: enabled ? "Unmetered entry" : "Metered entry")
+        meterIcon.contentTintColor = enabled ? Theme.warning : Theme.glassSecondaryText
+        meterIcon.toolTip = enabled ? "Unmetered entry · ⌥U · | finishes the bar" : "Metered entry · ⌥U"
+    }
 
     func update(lens: LensScoreWindow, fileLabel: String, explicit: Bool) {
         let staff = lens.label.map { " · \($0)" } ?? ""

@@ -78,7 +78,7 @@ public enum LensBlockFinder {
             for sibling in children[(i + 1)...] {
                 if sibling.kind == .assignment { break }
                 end = sibling.range.upperBound
-                if sibling.kind == .sequential || sibling.kind == .simultaneous { break }
+                if sibling.kind == .sequential || sibling.kind == .simultaneous || sibling.kind == .scheme || sibling.kind == .string || sibling.kind == .number { break }
             }
             let value = node.range.upperBound..<end
             if value.contains(offset), let name = node.children.first {

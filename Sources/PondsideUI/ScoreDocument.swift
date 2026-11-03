@@ -137,6 +137,7 @@ final class ScoreDocument {
     private var compilingGeneration: Int?
     private let workDirectory: URL
     private var opened = false
+    private var engravingSuspended = false
     /// Pages from the render cache are showing, not yet replaced by this
     /// session's own engraving.
     private(set) var showingCachedRender = false
@@ -243,6 +244,7 @@ final class ScoreDocument {
     }
 
     func close() {
+        opened = false
         flushPendingSaves()
         scheduleCheckpoint(after: .zero)
         renderTask?.cancel()
@@ -324,6 +326,36 @@ final class ScoreDocument {
         }
     }
 
+    /// A coordinated structural edit: validate every buffer and disk revision
+    /// before writing, then publish the complete project and engrave once.
+    func replaceProjectSources(expected: [URL: String], replacements: [URL: String]) throws {
+        var revisions: [URL: ContentHash] = [:]
+        for (url, text) in expected {
+            guard let file = file(for: url.path), file.text == text else {
+                throw StructuralEditing.Failure("The score changed while this edit was being prepared. Try again.")
+            }
+            let disk = try Data(contentsOf: url)
+            let diskText = String(decoding: disk, as: UTF8.self)
+            guard ContentHash(diskText) == file.sync.lastSyncedHash || diskText == text else {
+                throw StructuralEditing.Failure("\(file.displayName) changed on disk. Resolve that change before editing structure.")
+            }
+            revisions[url] = ContentHash(bytes: disk)
+        }
+        try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements, willWrite: { url, text in
+            self.file(for: url.path)?.watcher?.noteOwnWrite(text)
+        })
+        for (url, text) in replacements {
+            guard let file = file(for: url.path) else { continue }
+            file.saveTask?.cancel()
+            file.saveTask = nil
+            file.text = text
+            file.sync.noteSynced(text)
+        }
+        refreshGraph()
+        scheduleCheckpoint(after: .seconds(30))
+        engrave()
+    }
+
     func flushPendingSaves() {
         for f in files where f.saveTask != nil {
             f.saveTask?.cancel()
@@ -397,8 +429,26 @@ final class ScoreDocument {
     /// Compiles the root on disk. Only the newest request may finish: a
     /// request cancels any render still in flight, and its result is thrown
     /// away even if LilyPond had already answered.
+    func suspendForStructuralWork() {
+        engravingSuspended = true
+        renderGeneration += 1
+        renderTask?.cancel()
+        renderTask = nil
+        setStatus(.idle)
+    }
+
+    func resumeAfterStructuralWork(render: Bool) {
+        engravingSuspended = false
+        if render { engrave() }
+    }
+
+    func structuralWorkFailed(_ message: String) {
+        lastLog = message
+        setStatus(.failed("Score migration failed"))
+    }
+
     func engrave() {
-        guard let installation else { return }
+        guard opened, !engravingSuspended, let installation else { return }
         let prior = renderTask
         let needsStop = compilingGeneration != nil
         renderGeneration += 1

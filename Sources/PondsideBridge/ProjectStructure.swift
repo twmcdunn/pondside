@@ -13,7 +13,7 @@ import PondsideLexicon
 ///     <root>/patch/dependencies/pondside.scd   its engine (generated)
 ///     <root>/patch/resources/            the patch's sounds (pondside.toml's [supercollider] resources, if set)
 ///     <root>/renders/                    mockup, cue times, mix
-///     <root>/.mcp.json, opencode.json    `pondside mcp` for agents started here
+///     <root>/.mcp.json, opencode.json, .codex/config.toml    `pondside mcp` for agents started here
 ///
 /// `ensure` only adds what is missing and rewrites generated files whose
 /// content changed; it never touches the composer's own files.

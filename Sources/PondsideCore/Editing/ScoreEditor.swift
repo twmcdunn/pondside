@@ -270,7 +270,7 @@ public struct ScoreEditor: Sendable {
     /// `\tempo "Allegro" 4 = 120`) just before `event`. The same command
     /// already standing there (with nothing but other commands between it
     /// and the note) is replaced instead, so choosing again changes it.
-    public func insertCommand(_ command: String, before eventIndex: Int, name: String) -> ScoreEdit? {
+    public func insertCommand(_ command: String, before eventIndex: Int, name: String, toggle: Bool = false) -> ScoreEdit? {
         guard events.indices.contains(eventIndex), let keyword = command.split(separator: " ").first else { return nil }
         let start = events[eventIndex].range.lowerBound
         // The run of commands right before the event: back to the previous
@@ -285,6 +285,12 @@ public struct ScoreEditor: Sendable {
         }
         let commands = leaves.indices.filter { leaves[$0].kind == .command }
         if let i = commands.last(where: { tree.string(leaves[$0].range) == keyword }) {
+            if toggle {
+                var end = leaves[i].range.upperBound
+                if end < start, tree.bytes[end] == 0x20 { end += 1 }
+                let edit = TextEdit(leaves[i].range.lowerBound..<end, "")
+                return ScoreEdit(name: name, edits: [edit], selectionAnchors: [mapOld(start, through: [edit])])
+            }
             // It runs to the next command or the note, trimmed.
             let next = commands.first { $0 > i }.map { leaves[$0].range.lowerBound } ?? start
             var end = next
@@ -303,17 +309,22 @@ public struct ScoreEditor: Sendable {
     /// `duration` is the armed duration; nil means "inherit". An explicit
     /// `octave` (mouse entry: the clicked staff position) overrides the
     /// nearest-octave choice.
-    public func insert(step: Int?, after eventIndex: Int, duration: DurationValue?, octave explicitOctave: Int? = nil) -> ScoreEdit? {
+    /// `insertionAt` advances into a following measure while retaining this
+    /// event's pitch reference and restoring downstream relative pitches.
+    public func insert(step: Int?, after eventIndex: Int, duration: DurationValue?, octave explicitOctave: Int? = nil, accidental: Int? = nil,
+                       insertionAt offset: Int? = nil) -> ScoreEdit? {
         let ev = events[eventIndex]
+        let at = offset ?? ev.range.upperBound
+        guard at >= ev.range.upperBound, at <= tree.bytes.count else { return nil }
         var edits: [TextEdit] = []
         let inheritedHere = ev.effectiveDuration
-        let durationText = (duration == nil || duration == inheritedHere) ? "" : duration!.text
-        let newEffective = durationText.isEmpty ? inheritedHere : duration!
+        let durationText = offset != nil ? (duration ?? inheritedHere).text : ((duration == nil || duration == inheritedHere) ? "" : duration!.text)
+        let newEffective = durationText.isEmpty ? inheritedHere : (duration ?? inheritedHere)
 
         var noteText: String
         var inserted: Pitch?
         if let step {
-            let alteration = ev.key.alteration(for: step)
+            let alteration = accidental ?? ev.key.alteration(for: step)
             let previous = ev.notes.first.map { notes[$0].absolute } ?? lastPitch(before: ev.range.upperBound)
             let reference = ev.chainRefAfter.map { notes[$0].absolute }
             let octave: Int
@@ -332,7 +343,6 @@ public struct ScoreEditor: Sendable {
             noteText = "r"
         }
         noteText += durationText
-        let at = ev.range.upperBound
         // `e(d` → `e( g d`, never `e( gd`.
         let trailing = isWordByte(at: at) || tree.bytes[safe: at] == UInt8(ascii: "<") ? " " : ""
         edits.append(.insert(" " + noteText + trailing, at: at))

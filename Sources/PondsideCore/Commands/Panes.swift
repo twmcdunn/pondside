@@ -122,6 +122,17 @@ public struct PaneLayout: Codable, Hashable, Sendable {
         if let other = contents.firstIndex(of: content) { contents[other] = current }
         contents[focused] = content
     }
+
+    /// Navigation reuses a visible pane without moving its contents. If
+    /// absent, open a new pane alongside the existing ones.
+    public mutating func reveal(_ content: PaneContent, share: Double = 0.42) {
+        if let existing = contents.firstIndex(of: content) {
+            focused = existing
+        } else {
+            toggle(content, share: share)
+            focused = contents.count - 1
+        }
+    }
 }
 
 /// Named arrangements saved by the user (`⌘⇧S`). Encoded as JSON by the UI.

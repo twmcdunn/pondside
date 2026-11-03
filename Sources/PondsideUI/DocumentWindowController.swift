@@ -17,6 +17,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private let canvas = ScoreCanvasView(frame: .zero)
     private let canvasScroll = NSScrollView()
     private let firstEngraving = EngravingPlaceholderView()
+    private var editFeedback: EditRejectionFeedback?
     private var settingsPanel: EngravingSettingsPanel?
     var scoreSetupPanel: ScoreSetupPanel?
     private var player: AVAudioPlayer?
@@ -70,6 +71,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// their own undo step (the whole request is one ⌘Z).
     private var agentChanged: Set<URL> = []
     private var agentWritesInFlight: Set<URL> = []
+    /// The request's original engraving, marked range and diagnostics. Every
+    /// MCP edit's check compares against this same baseline, so a multi-edit
+    /// request cannot mistake an earlier partial edit for a clean result.
+    private struct AgentBaseline {
+        var pages: [EngravedPage]
+        var section: GraphicSection
+        var diagnostics: Set<String>
+    }
+    private var agentBaseline: AgentBaseline?
     /// The single undo action that puts the agent's change back; it follows
     /// the active file so ⌘Z works from whichever file is showing.
     private final class AgentUndoCookie: @unchecked Sendable {
@@ -82,6 +92,62 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private let statusBar = StatusBarView(frame: .zero)
 
     private var noteInput = NoteInput()
+    private var unmeteredStart: Int?
+    private var unmeteredOriginal = LensTime.common
+    private var structureTask: Task<Void, Never>?
+    private var structureSheet: StructuralMigrationSheet?
+
+    private func finishUnmeteredBar() {
+        guard unmeteredStart != nil, let last = targets().events.max(),
+              let measure = StructuralEditing.measure(in: tree, at: tree.events[last].range.lowerBound),
+              let block = LensBlockFinder.block(in: tree, at: tree.events[last].range.lowerBound) else { return }
+        let oldEnd = measure.invocation.upperBound
+        var next = StructuralEditing.measures(in: tree).first {
+            $0.invocation.lowerBound >= oldEnd && block.range.contains($0.invocation.lowerBound)
+        }
+        if next == nil {
+            do {
+                guard applyStructural(try StructuralEditing.appendMeasure(after: measure.name, time: unmeteredOriginal, files: structuralFiles, root: score.root.url.path), name: "Finish Unmetered Bar") else { return }
+                // The structural definitions may have shifted the active root.
+                if let current = StructuralEditing.measures(in: tree).first(where: { $0.name == measure.name }) {
+                    next = StructuralEditing.measures(in: tree).first { $0.invocation.lowerBound >= current.invocation.upperBound }
+                }
+            } catch { structuralError(error); return }
+        }
+        guard let next, let first = tree.events.indices.first(where: { next.body.contains(tree.events[$0].range.lowerBound) }) else { return }
+        unmeteredStart = first
+        selectEvents([first])
+        statusBar.flash("Unmetered entry · next measure")
+    }
+
+    private func toggleUnmetered() {
+        if unmeteredStart != nil {
+            if let last = targets().events.max() {
+                apply(ScoreEdit(name: "End Unmetered Entry", edits: [.insert(" \\undo \\omit Staff.TimeSignature ", at: tree.events[last].range.upperBound)], selectionAnchors: [tree.events[last].range.lowerBound]))
+            }
+            unmeteredStart = nil
+            statusBar.flash("Metered entry")
+        } else {
+            guard StructuralEditing.isManaged(score.root.tree), let event = targets().events.first,
+                  let measure = StructuralEditing.measure(in: tree, at: tree.events[event].range.lowerBound),
+                  let meter = StructuralEditing.time(in: score.root.tree, name: measure.name),
+                  let first = tree.events.indices.first(where: { measure.body.contains(tree.events[$0].range.lowerBound) }) else {
+                structuralError(StructuralEditing.Failure("Enable shared measures in File → Make Score Pondside-Ready… before using unmetered entry."))
+                return
+            }
+            guard !StructuralEditing.needsInterpreter(in: tree, body: measure.body) else {
+                rejectEdit("Unmetered entry needs explicit durations here · edit generated timing in Source")
+                return
+            }
+            unmeteredStart = first
+            unmeteredOriginal = meter
+            let at = measure.body.lowerBound
+            let text = "\\omit Staff.TimeSignature "
+            apply(ScoreEdit(name: "Begin Unmetered Entry", edits: [.insert(text, at: at)], selectionAnchors: [tree.events[event].range.lowerBound + text.utf8.count]))
+            statusBar.flash("Unmetered entry · | finishes the bar · ⌥U exits")
+        }
+    }
+
     /// A click on empty staff space: the event to insert after, and the
     /// octave of the clicked staff position, until the next note is typed.
     private struct MouseInsertion { var event: Int; var octave: Int }
@@ -100,6 +166,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private var lensChangedAt = Date.distantPast
     private var lensCloseTask: Task<Void, Never>?
     private var applyingScoreEdit = false
+    private var applyingStructuralEdit = false
     /// Set while the score drives the editor, so the editor's selection
     /// callback does not scroll the score the user is looking at.
     private var scoreIsDriving = false
@@ -236,6 +303,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func wire() {
+        compilerOutput.onOpenSource = { [weak self] location in self?.openDiagnosticSource(location) }
         canvas.delegate = self
         canvas.onZoomChange = { [weak self] _ in self?.updateStatus() }
         canvas.legendValues = { [weak self] in
@@ -255,7 +323,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             self.updateHints()
         }
         editor.onUserEdit = { [weak self] text in
-            guard let self else { return }
+            guard let self, !self.applyingStructuralEdit else { return }
             self.score.userEdited(self.activeFile, text: text)
             AppRPC.shared.publish("score.changed", ["path": .string(self.activeFile.url.path), "by": "app"])
             self.rebuildEngravingMap()
@@ -339,7 +407,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// stepping stops (and any render it waits for has landed).
     private func showLens(closesOnRender: Bool, navigating: Bool = false) {
         let selection = selectionUTF8()
-        guard let content = LensScoreBuilder.build(tree: tree, selection: selection) else {
+        guard let content = LensScoreBuilder.build(tree: tree, selection: selection, structure: score.root.tree) else {
             lensLog.debug("no lens for selection \(selection.lowerBound)..<\(selection.upperBound)")
             if closesOnRender {
                 if !lensWasExplicit { closeLens() }
@@ -367,6 +435,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         guard let lens else { return }
         let modes = lensModes
+        lens.unmetered = unmeteredStart != nil
         lens.available = modes.available
         lens.unavailable = modes.unavailable
         lens.onSwitch = { [weak self] m in self?.openLens(m) }
@@ -418,7 +487,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// ←→ while the lens is open: the next or previous event of the lens's
     /// voice, the lens following.
     private func stepLens(_ step: Int) {
-        guard let content = LensScoreBuilder.build(tree: tree, selection: selectionUTF8()),
+        guard let content = LensScoreBuilder.build(tree: tree, selection: selectionUTF8(), structure: score.root.tree),
               let next = content.neighbor(step) else {
             NSSound.beep()
             return
@@ -610,6 +679,28 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// Applies a score edit as one undoable change, then selects its result.
     private func apply(_ edit: ScoreEdit?) {
         guard let edit, !edit.isEmpty else { NSSound.beep(); return }
+        if unmeteredStart != nil {
+            do {
+                let files = structuralFiles
+                guard let current = files.first(where: { $0.id == activeFile.url.path }) else { return }
+                let proposed = current.parse(edit.edits.apply(to: tree.text))
+                let changes = try StructuralEditing.resizingForContentChange(in: activeFile.url.path, proposed: proposed, files: files, root: score.root.url.path)
+                if applyStructural(changes, name: edit.name, local: edit) { showLens(closesOnRender: true) }
+            } catch { structuralError(error) }
+            return
+        }
+        if StructuralEditing.isManaged(score.root.tree) {
+            do {
+                let current = structuralFile(activeFile)
+                try StructuralEditing.verifyContentEdit(in: current.id, before: tree,
+                    proposed: current.parse(edit.edits.apply(to: tree.text)), root: score.root.tree)
+            } catch let overflow as StructuralEditing.Overflow {
+                rejectEdit("Doesn’t fit in \(overflow.meter.beats)/\(overflow.meter.beatType) · ⌥U for unmetered entry")
+                return
+            } catch { structuralError(error); return }
+        }
+        editFeedback?.dismiss()
+        editFeedback = nil
         let old = editor.text
         let oldBytes = Array(old.utf8)
         let newBytes = edit.edits.apply(to: oldBytes)
@@ -663,6 +754,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func handleScoreKey(_ event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .option, event.keyCode == 32 {
+            toggleUnmetered()
+            return true
+        }
+        if unmeteredStart != nil, event.characters == "|" {
+            finishUnmeteredBar()
+            return true
+        }
         guard let input = keyInput(for: event) else { return false }
         let actions = noteInput.handle(input, now: event.timestamp)
         if actions.isEmpty { return false }
@@ -748,6 +847,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             setSelection(utf8: end..<end, scroll: false)
         case .editSource:
             window?.makeFirstResponder(editor.textView)
+        case .toggleSystemBreak:
+            if let first = targets().events.min() {
+                toggleStructuralBreak(before: first)
+            }
         case .buffer:
             updateInputStatus()
         }
@@ -771,13 +874,23 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let engraved = isEngraved(anchor)
         let anchorPositions = engraved ? highlighted : []
         let anchorDiatonic = engraved ? tree.events[anchor].notes.first.map { tree.notes[$0].absolute.diatonicIndex } : nil
-        let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: noteInput.armedDuration,
-                                            octave: step != nil ? mouse?.octave : nil)
-        mouseInsertion = nil
+        let emptyMeasureAnchor = tree.events[anchor].kind == .spacer && tree.string(tree.events[anchor].range) == "s1*0"
+        let entryDuration = noteInput.armedDuration ?? (emptyMeasureAnchor ? DurationValue.quarter : nil)
+        let next = unmeteredStart == nil
+            ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
+        let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: entryDuration,
+                                            octave: step != nil ? mouse?.octave : nil, accidental: noteInput.armedAccidental,
+                                            insertionAt: next?.body.lowerBound)
+        if let next, let first = tree.events.indices.first(where: { next.body.contains(tree.events[$0].range.lowerBound) }) {
+            selectEvents([first])
+        }
+        let before = activeFile.text
         apply(edit)
-        guard edit != nil else { return }
+        guard edit != nil, activeFile.text != before else { return }
+        mouseInsertion = nil
+        if step != nil { noteInput.clearAccidental(); updateInputStatus() }
         // Instant feedback while LilyPond engraves: a ghost of the new note.
-        if step != nil, let e = targets().events.first, let n = tree.events[e].notes.first {
+        if next == nil, step != nil, let e = targets().events.first, let n = tree.events[e].notes.first {
             canvas.provisionalInsert(after: anchorPositions, path: activeFile.url.path,
                                      anchorDiatonic: anchorDiatonic, diatonic: tree.notes[n].absolute.diatonicIndex)
         }
@@ -828,13 +941,14 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         // ⇧←/→ widens the selection the score shows; the open lens shows
         // the same passage, not the note it was opened on.
-        if lens?.isOpen == true, LensScoreBuilder.build(tree: tree, selection: selectionUTF8()) != nil {
+        if lens?.isOpen == true, LensScoreBuilder.build(tree: tree, selection: selectionUTF8(), structure: score.root.tree) != nil {
             showLens(closesOnRender: false, navigating: true)
         }
     }
 
     private func updateInputStatus() {
-        statusBar.setInput(armed: noteInput.armedDuration?.text, buffer: noteInput.bufferText)
+        let accidental = noteInput.armedAccidental.map { $0 == 2 ? "♯ next" : ($0 == -2 ? "♭ next" : "♮ next") }
+        statusBar.setInput(armed: [noteInput.armedDuration?.text, accidental].compactMap { $0 }.joined(separator: " "), buffer: noteInput.bufferText)
         updateHints()
     }
 
@@ -953,6 +1067,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        structureTask?.cancel()
         player?.stop()
         player = nil
         stopPlayhead()
@@ -1238,6 +1353,7 @@ extension DocumentWindowController: ScoreDocumentDelegate {
 
     func documentStatusDidChange(_ document: ScoreDocument) {
         updateStatus()
+        refreshEngravingSettings()
         // A compile that produced no pages never reaches documentDidEngrave.
         if case .failed = document.status { checkAgentRender() }
     }
@@ -1324,6 +1440,7 @@ extension DocumentWindowController: CommandResponder {
             NSSound.beep()
             return
         }
+        guard structureTask == nil else { statusBar.flash("Finish or cancel score preparation first"); return }
         center.palette.noteUsed(id)
         let selected = targets().events
         let pitched = selected.filter { tree.events[$0].isPitched }
@@ -1332,9 +1449,11 @@ extension DocumentWindowController: CommandResponder {
         case "file.exportPDF": exportPDF(nil)
         case "file.reveal": revealInFinder(nil)
         case "file.migratePatch": offerPatchMigration(asked: true)
+        case "file.migrateScore": runScoreMigration()
         case "file.close": window?.performClose(nil)
 
         case "go.file": showFilePicker()
+        case "go.line": showLinePicker()
         case "go.nextFile": nextFile(nil)
         case "go.previousFile": previousFile(nil)
         case "go.error": goToError()
@@ -1346,6 +1465,11 @@ extension DocumentWindowController: CommandResponder {
         case "go.next": perform(.select(step: 1, extend: false))
         case "go.previous": perform(.select(step: -1, extend: false))
 
+        case "edit.unmetered": toggleUnmetered()
+        case "add.armAccidental": statusBar.flash("Type + for sharp, - for flat, or 0 for natural; repeat to disarm")
+        case "add.barline": finishUnmeteredBar()
+        case "add.systemBreak":
+            if let first = selected.min() { toggleStructuralBreak(before: first) }
         case "add.slur": apply(editor.toggleSpan(open: "(", close: ")", events: pitched, name: "Slur"))
         case "add.beam": apply(editor.toggleSpan(open: "[", close: "]", events: pitched, name: "Beam"))
         case "add.crescendo": apply(editor.toggleSpan(open: "\\<", close: "\\!", events: selected, name: "Crescendo"))
@@ -1399,6 +1523,18 @@ extension DocumentWindowController: CommandResponder {
         case "view.fitWidth": zoomToFitWidth(nil)
         case "view.fullScreen": window?.toggleFullScreen(nil)
         case "view.agentLog": toggleAgentLog()
+        case "view.clearOutput":
+            guard let index = panes.paneIndex(containing: window?.firstResponder as? NSView),
+                  panes.layout.contents.indices.contains(index) else { return }
+            switch panes.layout.contents[index] {
+            case .compilerOutput:
+                compilerOutput.clear()
+                statusBar.flash("LilyPond log cleared")
+            case .terminal:
+                (panes.view(for: .terminal) as? TerminalPane)?.clear()
+                statusBar.flash("Terminal cleared")
+            default: break
+            }
 
         case "pane.focusNext":
             syncFocusedPane()
@@ -1484,6 +1620,10 @@ extension DocumentWindowController: CommandResponder {
             return false
         }
         help.optionChanged(isDown: false)
+        if event.keyCode == 53 {
+            editFeedback?.dismiss()
+            editFeedback = nil
+        }
         if event.keyCode == 53, lens?.isOpen == true {
             closeLens()
             return true
@@ -1573,6 +1713,34 @@ extension DocumentWindowController: CommandResponder {
             choose(order.value[i])
         })
         panel.present(over: window)
+    }
+
+    private func showLinePicker() {
+        let target: NSTextView
+        let name: String
+        syncFocusedPane()
+        if panes.layout.focusedContent == .supercollider, let scPane {
+            target = scPane.editor
+            name = scPane.fileURL.lastPathComponent
+            scPane.editor.hideCompletion()
+        } else {
+            showInFocusedPane(.lilypond)
+            target = editor.textView
+            name = activeFile.url.lastPathComponent
+        }
+        let count = SourceText(target.string).lineCount
+        showEntryPicker(placeholder: "Go to line · \(name) (1–\(count))", presets: [], custom: { text in
+            guard let line = Int(text), line > 0, line <= count else { return nil }
+            return String(line)
+        }) { [weak self, weak target] text in
+            guard let self, let target, let line = Int(text) else { return }
+            let source = SourceText(target.string)
+            guard let range = source.lineRange(line) else { NSSound.beep(); return }
+            let selection = NSRange(location: source.utf16Offset(of: range.lowerBound), length: 0)
+            self.window?.makeFirstResponder(target)
+            target.setSelectedRange(selection)
+            target.scrollRangeToVisible(selection)
+        }
     }
 
     private func showFilePicker() {
@@ -1726,12 +1894,16 @@ extension DocumentWindowController: CommandResponder {
         let to = sectionEndpoint(section.to, timing: timing, staffName: staffName)
         let systems = section.systems.map { s -> JSONValue in
             let staffX = staffLineFraction(s.pageX, of: s.staff)
-            return .object(["page": .number(Double(s.page + 1)),
+            var item: [String: JSONValue] = ["page": .number(Double(s.page + 1)),
                             "ordinal": .number(Double(s.ordinal + 1)),
                             "x": .array([.number(s.fraction.lowerBound), .number(s.fraction.upperBound)]),
                             "staff_x": .array([.number(staffX.lowerBound), .number(staffX.upperBound)]),
                             "page_x": .array([.number(s.pageX.lowerBound), .number(s.pageX.upperBound)]),
-                            "spanner_x": .array([.number(s.piece.minX), .number(s.piece.maxX)])])
+                            "spanner_x": .array([.number(s.piece.minX), .number(s.piece.maxX)])]
+            if let moments = timing?.systemMoments(page: s.page, system: s.system) {
+                item["moments"] = .array([.string(moments.first.description), .string(moments.last.description)])
+            }
+            return .object(item)
         }
         let y = section.staffSpaceRange
         var out: [String: JSONValue] = [
@@ -1778,6 +1950,46 @@ extension DocumentWindowController: CommandResponder {
             out["at"] = musicalJSON(hit)
         }
         return out
+    }
+
+    static func agentDiagnosticKey(_ diagnostic: Diagnostic, file: SourceFile) -> String {
+        [diagnostic.severity.rawValue, file.url.standardizedFileURL.path, diagnostic.message].joined(separator: "\u{1f}")
+    }
+
+    var hasAgentBaseline: Bool { agentBaseline != nil }
+
+    func agentDiagnosticIsNew(_ diagnostic: Diagnostic, file: SourceFile) -> Bool {
+        guard let agentBaseline else { return false }
+        return !agentBaseline.diagnostics.contains(Self.agentDiagnosticKey(diagnostic, file: file))
+    }
+
+    /// A deterministic visual scope check, not a model's claim about the
+    /// image: vector elements inside and outside the original marked range.
+    var rpcGraphicVerification: JSONValue? {
+        guard let agentBaseline else { return nil }
+        let report = GraphicVerification.compare(before: agentBaseline.pages, after: canvas.pages.map(\.page),
+                                                 section: agentBaseline.section)
+        let systems = report.systems.map { s in
+            JSONValue.object(["page": .number(Double(s.page + 1)), "ordinal": .number(Double(s.ordinal + 1)),
+                              "before": .number(Double(s.before)), "after": .number(Double(s.after)),
+                              "added": .number(Double(s.added)), "removed": .number(Double(s.removed)),
+                              "changed": .number(Double(s.changed))])
+        }
+        return ["status": .string(report.status.rawValue), "ok": .bool(report.ok),
+                "selected_changed": .bool(report.selectedChanged),
+                "selected": ["before": .number(Double(report.selectedBefore)),
+                             "after": .number(Double(report.selectedAfter)),
+                             "added": .number(Double(report.selectedAdded)),
+                             "removed": .number(Double(report.selectedRemoved)),
+                             "changed": .number(Double(report.selectedChangedCount))],
+                "outside_unchanged": .bool(report.outsideUnchanged),
+                "outside": ["added": .number(Double(report.outsideAdded)),
+                            "removed": .number(Double(report.outsideRemoved)),
+                            "added_pages": .number(Double(report.outsideAddedPages)),
+                            "removed_pages": .number(Double(report.outsideRemovedPages))],
+                "crossing_changed": .number(Double(report.changedCrossing)),
+                "systems": .array(systems),
+                "method": .string("vector elements against the request's original engraving; source links ignored; boundary-crossing changes are inconclusive")]
     }
 
     private func systemOfSelection(text: String) -> JSONValue? {
@@ -1873,7 +2085,7 @@ extension DocumentWindowController: CommandResponder {
         // Start at the selected bar, timed as the MIDI the mockup came from.
         var start = 0.0
         if let log = score.timingLog, let first = targets().events.first,
-           let window = LensScoreBuilder.build(tree: tree, selection: tree.events[first].range), let target = window.target {
+           let window = LensScoreBuilder.build(tree: tree, selection: tree.events[first].range, structure: score.root.tree), let target = window.target {
             let bar = window.bars.lowerBound + target.measureIndex
             if let row = log.rows.first(where: { $0.bar >= bar }) { start = TempoMap(log).seconds(at: row.moment) }
         }
@@ -1970,6 +2182,7 @@ extension DocumentWindowController: CommandResponder {
                 self.refreshEngravingSettings()
             }
             panel.model.onRestoreAll = { [weak self] in self?.restoreEngravingDefaults() }
+            panel.model.onMigrateStructure = { [weak self] in self?.runScoreMigration() }
             panel.model.onShowSource = { [weak self] in
                 guard let self else { return }
                 if self.activeFile !== self.score.root { self.showFile(self.score.root) }
@@ -1990,21 +2203,292 @@ extension DocumentWindowController: CommandResponder {
         guard let panel = settingsPanel, force || panel.isVisible else { return }
         panel.model.rootName = score.root.displayName
         panel.model.values = settingsDocument.values
+        panel.model.migrationRunning = structureTask != nil
+        var valid = (try? StructuralEditing.validate(structuralFiles, root: score.root.url.path)) != nil
+        if case .failed = score.status { valid = false }
+        if case .errors = score.status { valid = false }
+        panel.model.structuralStatus = valid ? "Shared timeline ready" : "Structural editing needs migration"
     }
 
-    private func restoreEngravingDefaults() {
+    private func minimalSourceEdits(from old: String, to new: String) -> [TextEdit] {
+        guard let difference = TextDiff.minimalReplacement(from: old, to: new) else { return [] }
+        let lower = OffsetConversion.utf8(fromUTF16: difference.location, in: old)
+        let upper = OffsetConversion.utf8(fromUTF16: difference.location + difference.length, in: old)
+        return [TextEdit(lower..<upper, difference.replacement)]
+    }
+
+    private var structuralFiles: [StructuralEditing.File] {
+        score.files.map { structuralFile($0) }
+    }
+
+    private func structuralFile(_ file: SourceFile) -> StructuralEditing.File {
+        var languages: [String: PitchLanguage] = [:]
+        for include in file.tree.includes {
+            if let url = SourceGraph.resolve(include.path, from: file.url, root: score.url, exists: { FileManager.default.fileExists(atPath: $0.path) }),
+               let included = score.file(for: url.path) {
+                languages[include.path] = included.tree.finalLanguage
+            }
+        }
+        return StructuralEditing.File(id: file.url.path, tree: file.tree, entryLanguage: file.entryLanguage, includedLanguages: languages)
+    }
+
+    private func structuralError(_ error: Error) {
+        if structureTask != nil {
+            let message = String(describing: error)
+            structureSheet?.finish()
+            score.structuralWorkFailed(message)
+            compilerOutput.show(message)
+            showMigrationFailure(message)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Pondside could not change the score structure"
+        alert.informativeText = String(describing: error)
+        alert.addButton(withTitle: "OK")
+        if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+    }
+
+    private func rejectEdit(_ message: String) {
+        statusBar.flash(message)
+        editFeedback?.dismiss()
+        if canvas.superview != nil, !canvas.visibleRect.isEmpty {
+            let visible = canvas.visibleRect
+            let anchor = canvas.editFeedbackAnchor ?? lastPageAnchor
+                ?? NSRect(x: visible.midX, y: visible.minY + 60, width: 2, height: 24)
+            editFeedback = EditRejectionFeedback(message: message, anchor: anchor, in: canvas)
+        } else if editor.superview != nil, let window {
+            var actual = NSRange()
+            let screen = editor.textView.firstRect(forCharacterRange: editor.textView.selectedRange(), actualRange: &actual)
+            let anchor = editor.textView.convert(window.convertFromScreen(screen), from: nil)
+            editFeedback = EditRejectionFeedback(message: message, anchor: anchor, in: editor.textView)
+        }
+    }
+
+    /// Both the command and its undo replace the project in one transaction.
+    /// Buffer revisions and disk ownership are checked before any file changes.
+    private func commitStructuralTexts(expected: [URL: String], replacements: [URL: String],
+                                       manager: UndoManager, name: String) throws {
+        try score.replaceProjectSources(expected: expected, replacements: replacements)
+        editFeedback?.dismiss()
+        editFeedback = nil
+        applyingStructuralEdit = true
+        for (url, text) in replacements {
+            editor.mergeExternal(text, into: url, registeringUndo: false)
+            AppRPC.shared.publish("score.changed", ["path": .string(url.path), "by": .string("app")])
+        }
+        applyingStructuralEdit = false
+        let context = StructuralUndoContext(controller: self, manager: manager)
+        manager.registerUndo(withTarget: context) { context in
+            MainActor.assumeIsolated {
+                guard let controller = context.controller, let undoManager = context.manager else { return }
+                do {
+                    let current = Dictionary(uniqueKeysWithValues: controller.score.files.map { ($0.url, $0.text) })
+                    guard replacements.allSatisfy({ current[$0.key] == $0.value }) else {
+                        throw StructuralEditing.Failure("A file changed since this structural edit. Undo its later changes first.")
+                    }
+                    let restore = expected.filter { replacements[$0.key] != nil }
+                    try controller.commitStructuralTexts(expected: current, replacements: restore, manager: undoManager, name: name)
+                } catch { controller.structuralError(error) }
+            }
+        }
+        manager.setActionName(name)
+        rebuildEngravingMap()
+        refreshHighlight(reveal: false)
+    }
+
+    @discardableResult
+    private func applyStructural(_ changes: [StructuralEditing.Change], name: String,
+                                 local: ScoreEdit? = nil) -> Bool {
+        do {
+            let before = Dictionary(uniqueKeysWithValues: score.files.map { ($0.url, $0.text) })
+            var after = before
+            var selection = local?.selectionAnchors ?? [selectionUTF8().lowerBound]
+            if let local { after[activeFile.url] = local.edits.apply(to: activeFile.text) }
+            for change in changes {
+                let url = URL(fileURLWithPath: change.file)
+                guard let text = after[url], change.edits.isNonOverlapping else {
+                    throw StructuralEditing.Failure("The structural edit contains overlapping changes or an unloaded dependency.")
+                }
+                after[url] = change.edits.apply(to: text)
+                if url == activeFile.url { selection = selection.map { change.edits.mapOffset($0) } }
+            }
+            let replacements = after.filter { before[$0.key] != $0.value }
+            guard !replacements.isEmpty else { return true }
+            try commitStructuralTexts(expected: before, replacements: replacements, manager: activeFile.undoManager, name: name)
+            let indices = selection.compactMap { tree.eventIndex(at: $0) }
+            if !indices.isEmpty { selectEvents(indices) }
+            statusBar.flash(name)
+            return true
+        } catch { structuralError(error); return false }
+    }
+
+    private func runScoreMigration(repairs: [(EngravingSetting, EngravingValue)] = []) {
+        guard structureTask == nil, let window else { return }
+        // A defaults/settings sheet may still be completing its dismissal.
+        if window.attachedSheet != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.runScoreMigration(repairs: repairs) }
+            return
+        }
+        let files = structuralFiles
+        let root = score.root.url.path
+        let sheet = StructuralMigrationSheet()
+        structureSheet = sheet
+        sheet.onCancel = { [weak self] in self?.structureTask?.cancel() }
+        sheet.begin(on: window)
+        score.suspendForStructuralWork()
+        closeLens()
+        let ref = WeakRef(sheet)
+        structureTask = Task { [weak self] in
+            guard let self else { return }
+            var render = false
+            var failure: String?
+            defer {
+                sheet.finish()
+                self.structureSheet = nil
+                self.structureTask = nil
+                self.score.resumeAfterStructuralWork(render: render)
+                self.refreshEngravingSettings()
+                if let failure { self.showMigrationFailure(failure) }
+            }
+            do {
+                let installations = await ToolchainStore.shared.installs()
+                let pinned = (try? ProjectConfig.find(from: self.score.url))?.lilypondVersion.flatMap { LilyPondVersion($0) }
+                guard let lily = ToolchainDetector.select(from: installations, for: pinned ?? self.score.declaredVersion) else {
+                    throw StructuralMigration.Failure(stage: .checking, message: "Install LilyPond or choose an installed version in File → LilyPond Version…, then retry Make Score Pondside-Ready…")
+                }
+                let plan = try await StructuralMigration.plan(files: files, root: root, installation: lily, repairs: repairs) { stage in
+                    Task { @MainActor in ref.value?.update(stage.rawValue) }
+                }
+                try Task.checkCancellation()
+                let current = Dictionary(uniqueKeysWithValues: self.score.files.map { ($0.url.path, $0.text) })
+                guard current == plan.expected else {
+                    throw StructuralMigration.Failure(stage: .ready, message: "The score changed during migration. Nothing was saved. Run Make Score Pondside-Ready… again to use the latest source.")
+                }
+                sheet.update("Saving the prepared score…")
+                guard self.applyStructural(plan.changes, name: "Make Score Pondside-Ready") else { return }
+                render = true
+                self.statusBar.flash("Shared timeline ready · engraving the score")
+            } catch is CancellationError {
+                render = true
+                self.statusBar.flash("Score preparation cancelled")
+            } catch {
+                let log = String(describing: error)
+                failure = (error as? StructuralMigration.Failure)?.message ?? log
+                self.score.structuralWorkFailed(log)
+                self.compilerOutput.show(log)
+            }
+        }
+        refreshEngravingSettings()
+    }
+
+    private func showMigrationFailure(_ message: String) {
+        guard let window else { return }
+        if window.attachedSheet != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.showMigrationFailure(message) }
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Score preparation could not finish"
+        let text = SourceMessageView()
+        text.font = Theme.bodyFont
+        text.drawsBackground = false
+        text.textContainerInset = .zero
+        text.frame.size.width = 500
+        text.textContainer?.containerSize = NSSize(width: 500, height: CGFloat.greatestFiniteMagnitude)
+        text.show(message + "\n\nAfter fixing the source, use File → Make Score Pondside-Ready… to try again.")
+        if let container = text.textContainer { text.layoutManager?.ensureLayout(for: container) }
+        let height = ceil(text.textContainer.flatMap { text.layoutManager?.usedRect(for: $0).height } ?? 160)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 500, height: min(280, max(60, height))))
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = height > 280
+        scroll.documentView = text
+        text.frame.size.height = height
+        alert.accessoryView = scroll
+        text.onOpenSource = { [weak self, weak window, weak alert] location in
+            guard let window, let alert else { return }
+            window.endSheet(alert.window, returnCode: .alertSecondButtonReturn)
+            DispatchQueue.main.async { [weak self] in self?.openDiagnosticSource(location) }
+        }
+        alert.addButton(withTitle: "Show Compiler Output")
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertFirstButtonReturn { self?.showInFocusedPane(.compilerOutput) }
+        }
+    }
+
+    private func openDiagnosticSource(_ location: SourceDiagnosticLink) {
+        if ["sc", "scd"].contains(URL(fileURLWithPath: location.file).pathExtension) {
+            let url = URL(fileURLWithPath: location.file, relativeTo: score.url.deletingLastPathComponent()).standardizedFileURL
+            guard FileManager.default.fileExists(atPath: url.path) else { statusBar.flash("Source file is unavailable: \(location.file)"); return }
+            revealPane(.supercollider)
+            guard let scPane else { return }
+            if scPane.fileURL != url { scPane.open(url) }
+            selectDiagnosticLocation(location, in: scPane.editor)
+            return
+        }
+        guard let file = score.file(for: location.file) else {
+            statusBar.flash("Source file is outside this score's loaded files: \(location.file)")
+            return
+        }
+        revealPane(.lilypond)
+        if activeFile !== file { showFile(file) }
+        selectDiagnosticLocation(location, in: editor.textView)
+    }
+
+    private func selectDiagnosticLocation(_ location: SourceDiagnosticLink, in textView: NSTextView) {
+        let source = SourceText(textView.string)
+        guard let position = source.position(line: location.line, displayColumn: location.column ?? 1),
+              let index = source.index(of: position) else { statusBar.flash("That source line no longer exists"); return }
+        let range = NSRange(location: source.utf16Offset(of: index), length: 0)
+        window?.makeFirstResponder(textView)
+        textView.setSelectedRange(range)
+        textView.scrollRangeToVisible(range)
+    }
+
+    private func restoreEngravingDefaults() { presentRestoreDefaults() }
+
+    /// The same choices are offered from Settings and on first opening a
+    /// score. Only converter repairs and coordinated structural editing are
+    /// offered here; individual engraving preferences stay in Settings.
+    private func presentRestoreDefaults() {
         guard let window = settingsPanel ?? window else { return }
         let alert = NSAlert()
-        alert.messageText = "Restore LilyPond's defaults?"
-        alert.informativeText = "Every engraving setting goes back to LilyPond's default: Pondside removes the settings from \(score.root.displayName), or writes the default where another file sets something else. You can undo it in the source."
+        alert.messageText = "Restore defaults for this score?"
+        alert.informativeText = "Restore automatic beaming and key-signature cancellation where conversion disabled them, and enable coordinated meter and break editing. Your other engraving settings are preserved. All changes can be undone together."
         alert.addButton(withTitle: "Restore Defaults")
-        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Keep As Is")
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        let shared = NSButton(checkboxWithTitle: "Enable coordinated meter and break editing", target: nil, action: nil)
+        shared.state = .on
+        stack.addArrangedSubview(shared)
+        let note = NSTextField(wrappingLabelWithString: "Score preparation runs separately with progress and checks the result with LilyPond before saving. Existing line/page breaks and spacing directives are preserved.")
+        note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        note.textColor = .secondaryLabelColor
+        note.preferredMaxLayoutWidth = 440
+        stack.addArrangedSubview(note)
+        var choices: [(EngravingSetting, NSButton)] = []
+        let repairs = ConvertedScoreCheck.restorationSettings(root: score.root.text, others: score.files.dropFirst().map { (file: $0.displayName, text: $0.text) })
+        for setting in repairs {
+            let button = NSButton(checkboxWithTitle: setting.title, target: nil, action: nil)
+            button.state = .on
+            choices.append((setting, button))
+            stack.addArrangedSubview(button)
+        }
+        stack.frame = NSRect(x: 0, y: 0, width: 440, height: stack.fittingSize.height)
+        alert.accessoryView = stack
         alert.beginSheetModal(for: window) { [weak self] response in
             guard let self, response == .alertFirstButtonReturn else { return }
-            let doc = self.settingsDocument
-            let changes = EngravingSetting.all.filter { doc.value(of: $0).value != $0.defaultValue }.map { ($0, $0.defaultValue) }
-            self.applyText(doc.edits(for: changes), to: self.score.root, name: "Restore Engraving Defaults")
-            self.refreshEngravingSettings()
+            let selected = choices.filter { $0.1.state == .on }.map { ($0.0, $0.0.defaultValue) }
+            if shared.state == .on {
+                self.runScoreMigration(repairs: selected)
+            } else {
+                let edits = self.settingsDocument.edits(for: selected)
+                _ = self.applyStructural([.init(file: self.score.root.url.path, edits: edits)], name: "Restore Defaults")
+                self.refreshEngravingSettings()
+            }
         }
     }
 
@@ -2029,32 +2513,18 @@ extension DocumentWindowController: CommandResponder {
         if previous !== file { showFile(previous) }
     }
 
-    /// Once per score: a file musicxml2ly made turns LilyPond's defaults off
-    /// (beaming, key cancellation). Offer to put them back.
+    /// Once per score: offer selectable engraving defaults and the shared
+    /// structural contract. Unsupported contracts are explained in the dialog.
     private func offerToRestoreConvertedSettings() {
-        let key = "Pondside.convertedScoresChecked"
+        let key = "Pondside.scoreDefaultsChecked.v1"
         var checked = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
         guard !checked.contains(score.url.path), let window else { return }
         let findings = ConvertedScoreCheck.findings(in: score.files.map { (file: $0.displayName, text: $0.text) })
-        guard !findings.isEmpty else { return }
+        guard !findings.isEmpty || !StructuralEditing.isManaged(score.root.tree) else { return }
         checked.insert(score.url.path)
         UserDefaults.standard.set(Array(checked), forKey: key)
 
-        let files = Array(Set(findings.map(\.file))).sorted().joined(separator: ", ")
-        let alert = NSAlert()
-        alert.messageText = "\(files) looks converted from MusicXML"
-        alert.informativeText = "musicxml2ly turned some of LilyPond's defaults off:\n"
-            + findings.map { "• \($0.description) (\($0.file), line \($0.line))" }.joined(separator: "\n")
-            + "\n\nPondside can restore them: it writes the defaults in \(score.root.displayName)'s settings. "
-            + "Beams written with [ ] stay as they are. You can undo it in the source."
-        alert.addButton(withTitle: "Restore Defaults")
-        alert.addButton(withTitle: "Keep As Is")
-        alert.beginSheetModal(for: window) { [weak self] response in
-            guard let self, response == .alertFirstButtonReturn else { return }
-            let settings = findings.compactMap { f in EngravingSetting.named(f.setting).map { ($0, f.value) } }
-            self.applyText(self.settingsDocument.edits(for: settings), to: self.score.root, name: "Restore Defaults")
-            self.statusBar.flash("Restored LilyPond's defaults")
-        }
+        presentRestoreDefaults()
     }
 
     /// A SuperCollider patch beside the score that doesn't follow Pondside's
@@ -2063,6 +2533,12 @@ extension DocumentWindowController: CommandResponder {
     /// chosen agent (Settings, ⌘,) finishes the marked lines unattended; without
     /// one, the dialog says how to finish them in the terminal.
     private func offerPatchMigration(asked: Bool = false) {
+        // The defaults offer now applies to every imported score. Let that
+        // sheet finish before presenting a second first-open migration.
+        if window?.attachedSheet != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.offerPatchMigration(asked: asked) }
+            return
+        }
         if let run = agentHandle {
             if asked { confirmStopAgent(run) }
             return
@@ -2076,6 +2552,10 @@ extension DocumentWindowController: CommandResponder {
                 (PatchMigration.candidate(score: scoreURL, configured: configured), AgentRun.choose(preference: preference, model: model))
             }.value
             guard let self, let window = self.window else { return }
+            if window.attachedSheet != nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.offerPatchMigration(asked: asked) }
+                return
+            }
             guard let c = found else {
                 if asked { self.statusBar.flash("The SuperCollider patch is ready for Pondside") }
                 return
@@ -2356,7 +2836,7 @@ extension DocumentWindowController: CommandResponder {
         var unavailable: [LensMode: String] = [:]
         if canvas.graphicSectionSelection != nil { available.insert(.graphics) }
         else { unavailable[.graphics] = "⌥drag across the staff to mark a graphics range" }
-        if LensScoreBuilder.build(tree: tree, selection: selectionUTF8()) != nil { available.insert(.notation) }
+        if LensScoreBuilder.build(tree: tree, selection: selectionUTF8(), structure: score.root.tree) != nil { available.insert(.notation) }
         else { unavailable[.notation] = "No notes here to show (a graphic, or a part the lens can't draw)" }
         if score.patchURL != nil { available.insert(.patch) }
         else { unavailable[.patch] = "This score has no Pondside patch yet: File › Make Patch Pondside-Ready… (␣ f m)" }
@@ -2546,6 +3026,14 @@ extension DocumentWindowController: CommandResponder {
         requestSession = session
         requestIdle?.cancel()
         let snapshot = Dictionary(score.files.map { ($0.url, $0.text) }, uniquingKeysWith: { a, _ in a })
+        if let section = canvas.graphicSectionSelection {
+            let diagnostics = Set(score.files.flatMap { file in
+                file.diagnostics.map { Self.agentDiagnosticKey($0, file: file) }
+            })
+            agentBaseline = AgentBaseline(pages: canvas.pages.map(\.page), section: section, diagnostics: diagnostics)
+        } else {
+            agentBaseline = nil
+        }
         finishAgentRender()
         requestRunning = true
         canvas.beginWork(label: "\(agent.harness.title) working…")
@@ -2607,6 +3095,7 @@ extension DocumentWindowController: CommandResponder {
             // The reply shows once the score shows the change.
             let report: () -> Void = { [weak self] in
                 guard let self else { return }
+                self.agentBaseline = nil
                 if outcome.providerProblem {
                     self.showProviderProblem(agent, outcome.summary, changed: changed)
                     return
@@ -2856,11 +3345,43 @@ extension DocumentWindowController: CommandResponder {
         }
     }
 
+    private func toggleStructuralBreak(before event: Int) {
+        guard StructuralEditing.isManaged(score.root.tree) else {
+            structuralError(StructuralEditing.Failure("Enable shared measures and breaks in File → Make Score Pondside-Ready… before editing system breaks from the score."))
+            return
+        }
+        guard let measure = StructuralEditing.measure(in: tree, at: tree.events[event].range.lowerBound) else {
+            structuralError(StructuralEditing.Failure("This event is outside a shared measure. Restore Defaults can check the project's structural source."))
+            return
+        }
+        do { _ = applyStructural(try StructuralEditing.toggleBreak(before: measure.name, files: structuralFiles, root: score.root.url.path), name: "System Break") }
+        catch { structuralError(error) }
+    }
+
+    private func changeStructuralMeter(_ meter: String, events: [Int]) {
+        guard let event = events.min() else { return }
+        guard StructuralEditing.isManaged(score.root.tree),
+              let measure = StructuralEditing.measure(in: tree, at: tree.events[event].range.lowerBound) else {
+            structuralError(StructuralEditing.Failure("Enable shared measures in File → Make Score Pondside-Ready… before changing meters from the score."))
+            return
+        }
+        let numbers = meter.split(separator: "/").compactMap { Int($0) }
+        guard numbers.count == 2 else { return }
+        do {
+            let changes = try StructuralEditing.changeMeter(LensTime(beats: numbers[0], beatType: numbers[1]), measure: measure.name,
+                files: structuralFiles, root: score.root.url.path, validatingContract: false)
+            _ = applyStructural(changes, name: "Time Signature")
+        } catch let overflow as StructuralEditing.Overflow {
+            let file = URL(fileURLWithPath: overflow.file).lastPathComponent
+            rejectEdit("\(meter) is too short for the music in \(file)")
+        } catch { rejectEdit(String(describing: error)) }
+    }
+
     private func showTimePicker(events: [Int]) {
         let meters = ["4/4", "3/4", "2/4", "2/2", "6/8", "9/8", "12/8", "3/8", "5/4", "5/8", "7/8", "6/4"]
         showEntryPicker(placeholder: "Time signature — or type one, e.g. 11/8", presets: meters.map { ($0, $0, nil) },
                         custom: Self.ratio) { [weak self] meter in
-            self?.applyCommand("\\time \(meter)", events: events, name: "Time Signature")
+            self?.changeStructuralMeter(meter, events: events)
         }
     }
 
@@ -3072,6 +3593,17 @@ extension DocumentWindowController: CommandResponder {
         var l = panes.layout
         l.show(content)
         applyLayout(l)
+    }
+
+    private func revealPane(_ content: PaneContent) {
+        syncFocusedPane()
+        var layout = panes.layout
+        layout.reveal(content)
+        if layout.contents == panes.layout.contents {
+            focusPane(layout.focused)
+        } else {
+            applyLayout(layout)
+        }
     }
 
     private func loadWorkspaces() -> Workspaces {
@@ -3447,3 +3979,12 @@ extension DocumentWindowController {
     }
 }
 
+
+private final class StructuralUndoContext: @unchecked Sendable {
+    weak var controller: DocumentWindowController?
+    weak var manager: UndoManager?
+    init(controller: DocumentWindowController, manager: UndoManager) {
+        self.controller = controller
+        self.manager = manager
+    }
+}

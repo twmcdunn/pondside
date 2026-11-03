@@ -16,6 +16,7 @@ public struct SectionTimeMap: Sendable {
 
     private struct Hit: Sendable {
         var page: Int
+        var system: ClosedRange<Double>
         var x: Double
         var staffTop: Double
         var staffBottom: Double
@@ -55,8 +56,11 @@ public struct SectionTimeMap: Sendable {
                 guard let bounds = EngravedPage.bounds(of: graphics) else { continue }
                 let centre = Point(bounds.midX, bounds.midY)
                 guard let staffGeometry = page.staff(at: centre) else { continue }
+                let systems = EngravedPage.systems(of: page.staves)
+                let middle = (staffGeometry.top + staffGeometry.bottom) / 2
+                guard let system = systems.min(by: { Self.distance($0, to: middle) < Self.distance($1, to: middle) }) else { continue }
                 let head = EngravedPage.notehead(among: graphics, space: staffGeometry.space)
-                found.append(Hit(page: pageIndex,
+                found.append(Hit(page: pageIndex, system: system,
                                  x: head?.bounds.midX ?? bounds.midX,
                                  staffTop: staffGeometry.top, staffBottom: staffGeometry.bottom,
                                  staffName: staff, moment: row.moment, bar: row.bar, source: origin))
@@ -65,11 +69,30 @@ public struct SectionTimeMap: Sendable {
         hits = found
     }
 
-    /// The interpolated bar and moment at one edge. The staff's geometry
-    /// selects the right staff when a page has several; `staffName` narrows
-    /// it further when the timing log names the same voice.
+    private static func distance(_ range: ClosedRange<Double>, to y: Double) -> Double {
+        range.contains(y) ? 0 : min(abs(y - range.lowerBound), abs(y - range.upperBound))
+    }
+
+    private func sameSystem(_ hit: Hit, page: Int, system: ClosedRange<Double>) -> Bool {
+        hit.page == page && abs(hit.system.lowerBound - system.lowerBound) < 0.001
+            && abs(hit.system.upperBound - system.upperBound) < 0.001
+    }
+
+    /// The canonical first and last timed moments on a system. Unlike an
+    /// interpolated edge, these identify the system even when its graphics
+    /// staff is hidden and has no noteheads of its own.
+    public func systemMoments(page: Int, system: ClosedRange<Double>) -> (first: Rational, last: Rational)? {
+        let moments = hits.filter { sameSystem($0, page: page, system: system) }.map(\.moment)
+        guard let first = moments.min(), let last = moments.max() else { return nil }
+        return (first, last)
+    }
+
+    /// The interpolated bar and moment at one edge. Always interpolate on
+    /// the edge's own system: a hidden graphics staff has no matching
+    /// noteheads, so falling back to every staff on the page can otherwise
+    /// mix systems and even produce a backwards range.
     public func edge(at endpoint: GraphicSection.Endpoint, staffName: String? = nil) -> Edge? {
-        var candidates = hits.filter { $0.page == endpoint.page }
+        var candidates = hits.filter { sameSystem($0, page: endpoint.page, system: endpoint.system) }
         let sameStaff = candidates.filter {
             abs($0.staffTop - endpoint.staff.top) < 0.5 && abs($0.staffBottom - endpoint.staff.bottom) < 0.5
         }

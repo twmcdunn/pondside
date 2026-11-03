@@ -550,6 +550,11 @@ final class ScoreCanvasView: NSView {
     /// to the right of each other before LilyPond answers.
     private var lastInserted: (view: PageView, glyph: NoteGlyph, diatonic: Int)?
 
+    var editFeedbackAnchor: NSRect? {
+        if let lastInserted { return convert(lastInserted.view.viewRect(for: lastInserted.glyph.head), from: lastInserted.view) }
+        return selectionAnchor
+    }
+
     /// Provisional rendering of an insertion: a ghost note after the anchor's
     /// notehead, at the new pitch's staff position.
     func provisionalInsert(after positions: Set<SourcePosition>, path: String, anchorDiatonic: Int?, diatonic: Int) {

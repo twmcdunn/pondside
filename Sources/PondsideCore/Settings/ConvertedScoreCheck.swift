@@ -15,6 +15,18 @@ public enum ConvertedScoreCheck {
         public var value: EngravingValue
     }
 
+    /// The small converter repair offered on open. Engraving preferences
+    /// (paper, fonts, spacing, visibility, etc.) are never reset by this offer.
+    public static func restorationSettings(root: String, others: [(file: String, text: String)] = []) -> [EngravingSetting] {
+        let doc = EngravingSettingsDocument(root: root, others: others)
+        let found = findings(in: [(file: "root", text: root)] + others)
+        return ["score.autoBeaming", "staff.keyCancellation"].compactMap { id in
+            guard found.contains(where: { $0.setting == id }), let setting = EngravingSetting.named(id),
+                  doc.value(of: setting).value != setting.defaultValue else { return nil }
+            return setting
+        }
+    }
+
     /// Whether `text` says musicxml2ly made it.
     public static func isConverted(_ text: String) -> Bool {
         text.firstRange(of: "musicxml2ly") != nil || text.firstRange(of: "encodingsoftware") != nil

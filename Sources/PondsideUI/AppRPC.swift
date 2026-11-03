@@ -169,17 +169,27 @@ extension DocumentWindowController {
         case .failed(let why): status = .string("failed: \(why)")
         }
         // What LilyPond reported, for `check` to answer from the app's warm
-        // engraving instead of compiling the score again.
-        let diagnostics: [JSONValue] = score.files.flatMap { f in
-            f.diagnostics.filter { $0.severity != .warning }.prefix(20).map { d -> JSONValue in
-                ["severity": .string(d.severity.rawValue), "file": .string(f.url.path),
-                 "line": d.line.map { .number(Double($0)) } ?? .null,
-                 "column": d.column.map { .number(Double($0)) } ?? .null, "message": .string(d.message)]
+        // engraving instead of compiling the score again. During a request,
+        // separate diagnostics introduced after its baseline from old ones.
+        var diagnostics: [JSONValue] = [], newDiagnostics: [JSONValue] = []
+        for f in score.files {
+            for d in f.diagnostics.filter({ $0.severity != .warning }).prefix(20) {
+                let json = JSONValue.object(["severity": .string(d.severity.rawValue), "file": .string(f.url.path),
+                                             "line": d.line.map { .number(Double($0)) } ?? .null,
+                                             "column": d.column.map { .number(Double($0)) } ?? .null,
+                                             "message": .string(d.message)])
+                diagnostics.append(json)
+                if agentDiagnosticIsNew(d, file: f) { newDiagnostics.append(json) }
             }
         }
-        return ["root": .string(score.root.url.path), "files": .array(score.files.map { .string($0.url.path) }),
-                "active": .string(activeFile.url.path), "status": status,
-                "started": score.compileStarted.map { .number($0.timeIntervalSince1970) } ?? .null,
-                "diagnostics": .array(diagnostics)]
+        var out: [String: JSONValue] = ["root": .string(score.root.url.path), "files": .array(score.files.map { .string($0.url.path) }),
+                                        "active": .string(activeFile.url.path), "status": status,
+                                        "started": score.compileStarted.map { .number($0.timeIntervalSince1970) } ?? .null,
+                                        "diagnostics": .array(diagnostics)]
+        if hasAgentBaseline {
+            out["new_diagnostics"] = .array(newDiagnostics)
+            out["verification"] = rpcGraphicVerification ?? .null
+        }
+        return .object(out)
     }
 }

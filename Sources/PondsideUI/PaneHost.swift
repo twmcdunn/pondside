@@ -1,5 +1,6 @@
 import AppKit
 import PondsideCore
+import PondsideEngrave
 
 /// Lays a `PaneLayout` out in a split view. Slots are frames; content
 /// views move between them, so swapping content never moves a divider.
@@ -149,7 +150,10 @@ final class PanePlaceholder: NSView {
 /// LilyPond's own words from the latest compile.
 @MainActor
 final class CompilerOutputView: NSScrollView {
-    private let textView = NSTextView()
+    private let textView = SourceMessageView()
+    var onOpenSource: ((SourceDiagnosticLink) -> Void)? {
+        didSet { textView.onOpenSource = onOpenSource }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -176,7 +180,14 @@ final class CompilerOutputView: NSScrollView {
     func show(_ log: String) {
         let text = log.isEmpty ? "No compile yet." : log
         guard textView.string != text else { return }
-        textView.string = text
+        textView.show(text)
         textView.scrollToEndOfDocument(nil)
+    }
+
+    func clear() {
+        textView.show("")
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        contentView.scroll(to: .zero)
+        reflectScrolledClipView(contentView)
     }
 }

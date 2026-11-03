@@ -17,6 +17,7 @@ struct LensAnchor {
 @MainActor
 protocol NotationLensSession: AnyObject {
     var isOpen: Bool { get }
+    var unmetered: Bool { get set }
     var onClose: (() -> Void)? { get set }
     var onFailure: ((String) -> Void)? { get set }
     /// The mode bar was clicked: open that lens instead.

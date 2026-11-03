@@ -14,7 +14,13 @@ final class OpencodeTests: XCTestCase {
         run.model = "openrouter/anthropic/claude-sonnet-5-5"
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(run.opencodeConfigContent().utf8)) as? [String: Any])
         XCTAssertEqual(json["model"] as? String, "openrouter/anthropic/claude-sonnet-5-5")
-        XCTAssertEqual((json["permission"] as? [String: String])?["bash"], "deny")
+        let permissions = try XCTUnwrap(json["permission"] as? [String: String])
+        XCTAssertEqual(permissions["bash"], "deny")
+        XCTAssertEqual(permissions["edit"], "deny")
+        XCTAssertEqual(permissions["write"], "deny")
+        let claude = AgentRun.claudeTools.joined(separator: " ")
+        XCTAssertFalse(claude.contains("Read,Edit") || claude.contains("Read Edit Write"))
+        XCTAssertTrue(claude.contains("mcp__pondside"))
         XCTAssertEqual(run.environment(pondside: "/usr/local/bin/pondside", log: nil)["OPENCODE_CONFIG_CONTENT"].flatMap {
             try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }?["model"] as? String,
                        ProcessInfo.processInfo.environment["OPENCODE_CONFIG_CONTENT"] == nil ? "openrouter/anthropic/claude-sonnet-5-5" : nil)

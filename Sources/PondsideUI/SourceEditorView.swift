@@ -46,6 +46,9 @@ final class SourceEditorView: NSView, NSTextViewDelegate {
 
         configure(textView)
         scrollView.documentView = textView
+        scrollView.verticalRulerView = SourceLineRuler(scrollView: scrollView, textView: textView)
+        scrollView.hasVerticalRuler = true
+        scrollView.rulersVisible = true
     }
 
     private func configure(_ tv: NSTextView) {
@@ -102,6 +105,7 @@ final class SourceEditorView: NSView, NSTextViewDelegate {
         textView = view
         activeKey = key
         scrollView.documentView = view
+        (scrollView.verticalRulerView as? SourceLineRuler)?.bind(to: view)
         view.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: .greatestFiniteMagnitude)
         if let origin = scrollOrigins[key] {
             scrollView.contentView.scroll(to: origin)

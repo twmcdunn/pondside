@@ -69,6 +69,7 @@ struct LensContext: Sendable {
     var graces: [Range<Int>] = []
     var unsupported: [String] = []
     var custom: [String] = []
+    var managedMeasures: [(body: Range<Int>, time: LensTime)] = []
 
     func clef(at offset: Int) -> LensClef {
         clefs.last { $0.offset <= offset }?.clef ?? .treble
@@ -122,9 +123,10 @@ enum LensContextScanner {
     /// LilyPond commands that change nothing the lens draws, or that it
     /// reads itself. Anything else is assumed to be a custom definition.
     private static let builtins: Set<String> = [
-        "clef", "time", "key", "partial", "tuplet", "times", "grace", "acciaccatura", "appoggiatura",
+        "clef", "time", "key", "partial", "undo", "tuplet", "times", "grace", "acciaccatura", "appoggiatura",
         "slashedGrace", "bar", "barNumberCheck", "once", "tempo", "mark", "textMark", "fine",
         "break", "noBreak", "pageBreak", "noPageBreak", "pageTurn", "allowPageTurn",
+        "autoLineBreaksOff", "autoLineBreaksOn", "autoPageBreaksOff", "autoPageBreaksOn", "newSpacingSection",
         "autoBeamOn", "autoBeamOff", "cadenzaOn", "cadenzaOff", "default", "global",
         "stemUp", "stemDown", "stemNeutral", "slurUp", "slurDown", "slurNeutral", "slurDashed",
         "slurDotted", "slurSolid", "tieUp", "tieDown", "tieNeutral", "dynamicUp", "dynamicDown",
@@ -237,7 +239,10 @@ enum LensContextScanner {
                 // Markup is text, and its commands are not music.
                 context.flag("markup")
                 index = skipArgument(in: leaves, after: index)
+            case "pondsideMeasure", "pondsideSpace", "pondsideLayout", "pondsideTimeline":
+                break
             default:
+                if name.hasPrefix("pondsideBar") { continue }
                 if unsupportedCommands.contains(name) {
                     context.flag(name)
                 } else if let value = source.variables[name] {

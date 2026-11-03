@@ -58,7 +58,17 @@ public enum FileEdit {
                     found = occurrences(of: plain, in: text)
                     new = unnumbered(c.new) ?? c.new
                 }
-                guard !found.isEmpty else { throw Failure("\(label)old text not found; copy it exactly (without the line numbers), or give from_line/to_line") }
+                guard !found.isEmpty else {
+                    let expected = unnumbered(old) ?? old
+                    if let near = whitespaceNormalizedMatch(of: expected, in: text, starts: starts) {
+                        let actual = String(text[near.range])
+                        let shown = actual.split(separator: "\n", omittingEmptySubsequences: false).prefix(12).joined(separator: "\n")
+                        throw Failure("\(label)old text differs only in whitespace from lines \(near.lines.lowerBound)–\(near.lines.upperBound):\n"
+                            + ScoreContext.numbered(shown, from: near.lines.lowerBound)
+                            + "\nUse from_line/to_line with old copied exactly as a guard. All ranges in one call address the same original snapshot.")
+                    }
+                    throw Failure("\(label)old text not found; use from_line/to_line from the numbered context (all ranges in one call address the same original snapshot), or copy old exactly without line numbers")
+                }
                 guard found.count == 1 else {
                     let lines = found.map { String(line(of: $0.lowerBound, in: text, starts: starts)) }.joined(separator: ", ")
                     throw Failure("\(label)old text is on lines \(lines): include more of it, or give from_line/to_line")
@@ -106,6 +116,27 @@ public enum FileEdit {
             from = text.index(after: r.lowerBound)
         }
         return out
+    }
+
+    /// A unique match whose only difference is whitespace, for an actionable
+    /// error. It is never applied implicitly: exact source edits stay exact.
+    static func whitespaceNormalizedMatch(of needle: String, in text: String,
+                                          starts: [String.Index]) -> (range: Range<String.Index>, lines: ClosedRange<Int>)? {
+        func normalized(_ line: String) -> String {
+            line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        }
+        let expected = needle.split(separator: "\n", omittingEmptySubsequences: false).map { normalized(String($0)) }
+        guard !expected.isEmpty, expected.contains(where: { !$0.isEmpty }) else { return nil }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { normalized(String($0)) }
+        guard starts.count >= expected.count else { return nil }
+        var found: [(range: Range<String.Index>, lines: ClosedRange<Int>)] = []
+        for i in 0...(starts.count - expected.count) where Array(lines[i..<(i + expected.count)]) == expected {
+            let lower = starts[i]
+            let last = i + expected.count - 1
+            let upper = text[starts[last]...].firstIndex(of: "\n") ?? text.endIndex
+            found.append((lower..<upper, (i + 1)...(last + 1)))
+        }
+        return found.count == 1 ? found[0] : nil
     }
 
     /// `text` without the `412| ` prefixes the contexts add, if every

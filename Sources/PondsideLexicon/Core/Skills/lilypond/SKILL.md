@@ -27,10 +27,42 @@ score/
   electronics.ly
   score.ly        \include the above; \header, \paper, the \score with \layout (and a \midi score)
 ```
+For scores without Pondside's shared-measure contract:
+
 - **Absolute pitches** (`c'4 d''8`), not `\relative` -- every note is self-contained, so editing or generating one never shifts the next.
 - **One variable per layer**, each a full-length voice of skips (`s4*7`) where it has nothing: notes, dynamics, boxes/brackets, playback-only tempos, line breaks (`structure`). End each bar with `| % 12` (a bar check plus the bar number), so a wrong duration is caught at the bar where it happens.
 - `\barNumberCheck #30` every ten bars or so.
 - Line and page breaks in their own voice: `structure = { \autoLineBreaksOff \autoPageBreaksOff s4*7 s4*6 \break | ... }`, put in the staff as `\new Devnull \structure`.
+
+**Pondside shared measures.** If the root contains `% pondside-structure v1`,
+its `pondsideBarA`, `pondsideBarB`, … definitions own measure meters and
+lengths. Each voice uses `\pondsideMeasure \pondsideBarA { ... }` for the
+corresponding measure. Keep these wrappers and identities intact. The
+helper pads underfilled bodies; a bare `s1*0` is an empty-measure source
+anchor, and an unadorned single full-measure rest follows the shared
+length. Do not replace these with a second absolute-duration `structure`
+or cue/graphic skip pipeline. Imported skip-only layout tracks use explicit relative anchors such as
+`\pondsideSpace \pondsideBarA #1 #2` (half that shared measure). Preserve
+these anchors so internal spacing/layout events follow a resized measure.
+Ordinary musical durations still have to fit their shared measure.
+
+With `breaks=1`, write explicit system/page breaks only at the end of the
+shared definitions. Write meters only at their beginnings, never next to
+a selected note inside a tremolo or tuplet. A shared meter change affects
+every wrapper referencing it; preserve sounding content and check every
+voice before shortening. With `breaks=0`, local end-of-measure breaks are
+allowed. Keep the helper definition intact. The app's Restore Defaults dialog offers the original beaming/key-cancel
+repairs and a single coordinated editing choice. Unchecking leaves the
+current source alone. Automatic line/page policy and spacing sections are
+preserved during migration; finite skip repeats and grouped layout skips
+are supported. File → Make Score Pondside-Ready… runs a separate,
+cancellable LilyPond analysis of temporary copies before saving and
+engraving. Custom functions are evaluated for timing and retain their
+source calls. In an `evaluated=1` contract, preserve `\pondsideLayout`
+anchors and `\pondsideTimeline`: they keep generated silent layout events
+aligned with the shared measures. Reused passages at differing positions
+and ambiguous mid-measure breaks are rejected. Invalid source must be
+fixed before retrying migration; inspect Compiler Output for the location.
 
 ## The working loop
 

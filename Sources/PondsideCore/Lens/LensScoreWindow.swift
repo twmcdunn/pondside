@@ -163,11 +163,21 @@ public enum LensScoreBuilder {
     /// common tuplets come out exact.
     public static let divisions = 10080
 
-    public static func build(tree: SyntaxTree, selection: Range<Int>, radius: Int = 4) -> LensScoreWindow? {
+    public static func build(tree: SyntaxTree, selection: Range<Int>, radius: Int = 4, structure: SyntaxTree? = nil) -> LensScoreWindow? {
         guard let target = targetEvent(tree: tree, selection: selection),
               let block = LensBlockFinder.block(in: tree, at: tree.events[target].range.lowerBound)
         else { return nil }
         var context = LensContextScanner.scan(tree, block: block.context)
+        let authority = structure ?? tree
+        for measure in StructuralEditing.measures(in: tree) where block.range.contains(measure.invocation.lowerBound) {
+            if StructuralEditing.isManaged(authority), let meter = StructuralEditing.time(in: authority, name: measure.name) {
+                context.times.append((measure.invocation.lowerBound, meter))
+                context.managedMeasures.append((measure.body, meter))
+            } else {
+                context.flag("shared measure definition unavailable")
+            }
+        }
+        context.times.sort { $0.offset < $1.offset }
         let timeline = LensTimeline(tree: tree, block: block, context: &context)
         guard let targetMeasure = timeline.events.first(where: { $0.sourceEvent == target })?.measureIndex else {
             return nil
@@ -369,12 +379,22 @@ struct LensTimeline {
         }
         var current = time
         for child in node.children { current = walk(child, at: current) }
+        if let managed = context.managedMeasures.first(where: { $0.body.lowerBound == node.range.lowerBound + 1 && $0.body.upperBound == node.range.upperBound - 1 }) {
+            return time + managed.time.wholeNotes
+        }
         return current
     }
 
     private func length(of index: Int) -> LensFraction {
         let event = tree.events[index]
         guard event.kind != .lyric, !context.isGrace(at: event.range.lowerBound) else { return .zero }
+        if StructuralEditing.isEmptyChord(event) { return .zero }
+        if event.kind == .spacer && tree.string(event.range) == "s1*0" { return .zero }
+        if event.kind == .multiMeasureRest,
+           let managed = context.managedMeasures.first(where: { $0.body.contains(event.range.lowerBound) }),
+           block.events.filter({ managed.body.contains(tree.events[$0].range.lowerBound) }).count == 1 {
+            return managed.time.wholeNotes
+        }
         let whole = event.effectiveDuration.wholeNotes
         return LensFraction(whole.0, whole.1) * context.durationFactor(at: event.range.lowerBound)
     }

@@ -19,26 +19,30 @@ request is notation or layout -- barlines, beams, clefs, staff lines, spacing,
 noteheads, hidden meters, dynamics -- stop and follow `skill://lilypond`.
 Do not create a Lexicon entry for a one-off notation change; use score code.
 If the request is a drawing, texture, shape or gesture, add a graphic in the
-same range (or edit the existing drawing).
+same range (or edit the existing drawing). A request may combine both kinds:
+make the drawing and traditional-notation changes, each only in that range.
 
-## The fast path (1 call)
+## The fast path (1 call per file)
 
 A request from the lens comes with `score_context` already in it. Its code
 (`definition`, `drawing`, `uses`, `music`) is numbered as in the file
 (`412| `, not part of the line).
 
-1. One `edit` by `from_line`/`to_line` or exact `old` text, straight from that
-   code: no reading the file first. It returns the app's engraving of the
-   change (`check`), so there is no separate check. Fix only what it reports.
-   A new graphic: `graphic_insert`, then `check`.
+1. One atomic MCP `edit` per file, using `from_line`/`to_line` for every hunk
+   (optionally with `old` copied exactly as a guard): no reading the file
+   first and no native Edit/Write. **Every range in a call refers to the same
+   pre-edit snapshot; inserted lines do not renumber later hunks.** Never
+   split dependent hunks into separate calls. The answer includes the
+   engraving, `new_diagnostics` and vector `verification`, so there is no
+   separate check. A new graphic: `graphic_insert` returns the same check.
 2. Without a lens request, call `score_context` (no arguments) first.
 3. Reply in one line: what changed, with the numbers ("Taller: half-height
    1.06 → 2.1."). No plan, no recap, no offers, no preview.
 
-**Make it visible at a glance.** The user judges the result by looking at the
-page at normal zoom. A change too small to see (grains thinned by a third in
-a dense cloud) reads as nothing happening: scale by about 2× per word, and
-for "different" change the shape, not a seed's details.
+**Make it visible at a glance, and proportionate.** The user judges the result
+at normal zoom. Scale an unqualified "taller"/"denser" by about 2× and make
+"different" a different shape. "A little", "slightly" and "subtle" require a
+restrained but still visible change, not 2×. Numbers the user gives win.
 
 ## Read the marked section
 
@@ -57,18 +61,19 @@ The context's `selection` has `kind: "graphic-section"`. It gives:
     the engraved notes' x positions, just before the agent runs.
 - `systems`: every covered system, top to bottom, as
   `{ page, ordinal, x: [lo, hi], staff_x: [lo, hi], page_x: [lo, hi],
-  spanner_x }`. `ordinal` is the 1-based system number for the staff;
-  `staff_x` is the same range as fractions of the staff line, for a
-  `StaffSymbol.stencil` window. On the first system the range runs from
-  `from.x` to the end of the piece, on the middle systems the whole piece,
-  and on the last from the start of the piece to `to.x`.
+  spanner_x, moments: [first, last] }`. `ordinal` is the 1-based system
+  number for the staff; `staff_x` is the same range as fractions of the staff
+  line, for a `StaffSymbol.stencil` window. `moments` are the canonical first
+  and last timed moments on that system. On the first system the range runs
+  from `from.x` to the end of the piece, on the middle systems the whole
+  piece, and on the last from the start of the piece to `to.x`.
 - `units`: the coordinate meanings again.
 
-**The moments identify systems; they are not the boundary.** Use
-`from.at.moment` and `to.at.moment` only to tell `system-moments` which
-system is the start and which the end. The edge is `from.x` / `to.x` (or the
-page x). Never substitute a cue, a bar or a named range; the marked box is
-the range.
+**Canonical system moments identify systems; interpolated edge moments do
+not.** For a drawing window use `systems.first.moments[0]` as `m0` and
+`systems.last.moments[0]` as `m1`; on one system `m0 == m1`. The edge itself
+is always `from.x` / `to.x` (or page x). Use `from.at`/`to.at` only for music
+placement such as a new graphic. Never substitute a cue, bar or named range.
 
 If the context has no `graphic`, the marked stretch has no drawing yet. If the
 request is a drawing, add one (see "A new graphic" below), not a window; if it
@@ -80,15 +85,16 @@ is notation or layout, use `skill://lilypond` and score code instead.
 |---|---|
 | `graphic.entry`, `params`, `start`, `stop` | a Lexicon graphic: edit its alist in place (`\startGraphic "id" #'(...)`) |
 | `graphic.command`, `start`, `stop`, `definition`, `drawing[].text`, `uses`, `notes` | a graphic drawn by the score's own Scheme (`\startGrains`): `drawing` is the stencil procedure (file and lines), `uses` the helpers and constants it calls, in full (numbered) when short, else their definition line, `notes` the file's description |
+| `graphic.section_support` | which of `g-span`, `smoothstep`, `system-moments`, `section-window` already exist, and the insertion anchor for missing ones; never search for them |
 | `event`, `staff`, `music` | where a new graphic goes: the clicked staff's voice |
 | `bar`, `moment` | where "here" is (moment = whole notes from the staff's start) |
-| `systems` | the marked systems and their selected x ranges |
+| `systems` | the marked systems, canonical system moments and selected x ranges |
 
-The code is numbered as in its file. Edit it by `from_line`/`to_line` or exact
-`old` text with the `edit` tool; don't read the file first. `definition` and
+The code is numbered as in its file. Edit it by `from_line`/`to_line`, with
+`old` as an optional guard; don't read the file first. `definition` and
 `drawing` carry full numbered text when under 150 lines; `uses` helpers when
-under 60 lines and within the budget. For a long procedure, use its range
-from the context; don't read the whole project.
+under 60 lines and within the budget, other dependencies by exact range. For
+a long procedure, read only its missing range, never the whole project.
 
 ## Find every drawing in the range
 
@@ -109,9 +115,10 @@ mistake.
 
 ## A drawing by the score's own Scheme: a window in the code
 
-Paste these two helpers near the other drawing helpers (they need `g-span` and
-`smoothstep`, which the score's graphics file defines; add them only if it
-lacks them):
+`graphic.section_support.missing` says exactly which helpers to add and its
+`file`/`insert_after_line` gives the anchor; do not search the project. Paste
+these two helpers only when missing (they need `g-span` and `smoothstep`),
+and include their insertion and the stencil changes in the same atomic edit:
 
 ```scheme
 % The system's first and last moments (whole notes), from its columns.
@@ -151,12 +158,12 @@ In the stencil's `let*`:
 (win (section-window grob 121/4 145/4 0.3 0.6 2.0))
 ```
 
-Take `m0`/`m1` from `from.at.moment`/`to.at.moment` and `f0`/`f1` from
-`from.x`/`to.x`. When both endpoints are on one system, both moments lie in
-that system and the window keeps only the part between the fractions. The
-moments are interpolated from the engraved notes at the edges. Do not use
-`section-window` for barlines or other layout overrides; those are a
-`skill://lilypond` task, and a barline uses `grob-when`, not a drawing window.
+Take `m0` from `selection.systems.first.moments[0]`, `m1` from
+`selection.systems.last.moments[0]`, and `f0`/`f1` from `from.x`/`to.x`.
+When both endpoints are on one system, `m0 == m1` and the fractions keep only
+the marked part. These are canonical system moments, not interpolated edge
+moments. Do not use `section-window` for barlines or other layout overrides;
+those are a `skill://lilypond` task, and a barline uses `grob-when`.
 
 The ramp depends on what changes:
 
@@ -257,7 +264,8 @@ The user marks a passage and asks for a new layer. The box is its span:
    skips in the clicked staff. A voice holds one graphic at a time: if it is
    occupied over the range, use another skip voice or add
    `\new Voice { s1*… }` beside it.
-3. `check` (or let `graphic_insert`/`edit` return the engraving).
+3. Read the returned `new_diagnostics` and `verification`; do not call
+   `check` again (`graphic_insert` and `edit` already return it).
 
 Choose an entry from the table; `lexicon_search` when it has nothing close.
 
@@ -288,7 +296,7 @@ nothing close. **Nothing draws it** ("birds"): write a draft entry at once
 | swelling, breathing | `height . (swell 3 lo hi)` |
 | louder-looking, darker / lighter | `gray` lower / higher; dot `size` up |
 | higher / lower | `centre` ± 1 |
-| different, again | change `seed` |
+| different, again | change the shape, or use a new section-local random stream (never the base seed) |
 | keep out of the notes | `avoid . (note-head-interface accidental-interface)` |
 | "X here" (new) | a new graphic in the marked range |
 

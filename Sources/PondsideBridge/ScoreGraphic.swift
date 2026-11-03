@@ -84,6 +84,25 @@ public enum ScoreGraphic {
         }
         for id in second where helpers.count < 40 { add(id, full: false) }
         if !helpers.isEmpty { out["uses"] = .array(helpers) }
+        // The window recipe's prerequisites, so the agent never has to
+        // search the project just to learn whether they already exist.
+        var present: [JSONValue] = [], missing: [JSONValue] = []
+        var span: Found?
+        for id in ["g-span", "smoothstep", "system-moments", "section-window"] {
+            if let found = procedure(id, in: files) ?? definition(of: id, in: files) {
+                present.append(.string(id))
+                if id == "g-span" { span = found }
+            } else {
+                missing.append(.string(id))
+            }
+        }
+        var support: [String: JSONValue] = ["present": .array(present), "missing": .array(missing),
+                                            "ready": .bool(missing.isEmpty)]
+        if let anchor = span ?? drawings.first {
+            support["file"] = .string(relative(anchor.path))
+            support["insert_after_line"] = .number(Double(anchor.endLine))
+        }
+        out["section_support"] = .object(support)
         let notes = comments(mentioning: "\\" + name, in: files)
         if !notes.isEmpty { out["notes"] = .string(notes) }
         return .object(out)

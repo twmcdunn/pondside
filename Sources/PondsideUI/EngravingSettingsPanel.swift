@@ -14,6 +14,9 @@ final class EngravingSettingsModel: ObservableObject {
     var onChange: (EngravingSetting, EngravingValue) -> Void = { _, _ in }
     var onRestoreAll: () -> Void = {}
     var onShowSource: () -> Void = {}
+    var onMigrateStructure: () -> Void = {}
+    @Published var structuralStatus = ""
+    @Published var migrationRunning = false
 
     func value(_ setting: EngravingSetting) -> EngravingValue {
         values[setting.id]?.value ?? setting.defaultValue
@@ -68,13 +71,23 @@ struct EngravingSettingsView: View {
             }
             Divider()
             HStack {
+                Text(model.structuralStatus)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Make Score Pondside-Ready…", action: model.onMigrateStructure)
+                    .disabled(model.migrationRunning)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            HStack {
                 Text("Saved in \(model.rootName)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button("Show in Source", action: model.onShowSource)
                 Button("Restore Defaults…", action: model.onRestoreAll)
-                    .disabled(!model.hasChanges)
+                    .disabled(model.migrationRunning)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)

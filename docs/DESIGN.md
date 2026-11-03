@@ -1084,14 +1084,76 @@ The defaults are LilyPond's own, and every statement compiles on 2.24 and
   and changing it writes an explicit statement in the root.
 - **Undo:** each change is one undoable edit.
 
-musicxml2ly writes `autoBeaming = ##f` and `printKeyCancellation = ##f`.
-The first time a score with such a file opens, Pondside offers once to
-write LilyPond's defaults in the root. Its `\pointAndClickOff` needs
-nothing (§6).
+Restore Defaults is one small dialog, offered once on first open and
+available in Engraving Settings. It offers the original converter repairs
+for `autoBeaming = ##f` and `printKeyCancellation = ##f`, when still
+needed, plus a single coordinated meter/break editing choice. Unchecking
+leaves that aspect alone. The rest of the engraving preferences stay in
+their Settings controls and are never reset by this offer.
+`\pointAndClickOff` needs nothing (§6).
 
-The Add menu also gained Clef…, Time Signature…, Key Signature…, Tempo…,
-Text…, Cue and a Tuplet… picker for any ratio. Clef, meter, key and tempo
-replace the same command already standing before the note.
+The structural contract lives entirely in LilyPond source: a marked block
+before the root's includes defines `pondsideBarA`, `pondsideBarB`, etc.,
+and every voice references those definitions through `\pondsideMeasure`.
+The helper returns sequential music, preserving relative pitch chains,
+puts the shared meter first and breaks last, and pads each body to its
+shared length. Elastic spacers and full-measure rests follow length
+changes; sounding content is never cut. Overflow is a LilyPond error,
+including in a compile outside Pondside. Meters are changed at measure
+starts, never inside the selected note's tuplet/tremolo braces.
+
+`StructuralEditing` plans minimal edits below the seam. The GUI always
+runs `PondsideEngrave.StructuralMigration` as a separate cancellable job
+with a progress sheet, before engraving the final source. LilyPond
+evaluates temporary original, instrumented and candidate copies. Their
+event traces verify timing, notes and layout boundaries before any save.
+Custom functions remain source calls; their evaluated timing supplies the
+importer's evidence. Ambiguous timing, pickups, cadenzas, independent
+meters and reused source at differing positions are refused.
+Separate silent layout tracks are mapped onto the musical boundaries;
+finite spacer `\repeat unfold` bodies are expanded, grouped bar checks
+need not match the music's bar checks, and `\pondsideLayout` keeps
+evaluated rhythmic slots anchored to the shared `pondsideTimeline`.
+The lower-level source-only importer uses `\pondsideSpace` anchors.
+Automatic line/page policy and spacing sections stay local; explicit
+breaks at boundaries are collected from every supported stream.
+Scheme helper templates and front-matter examples are not score voices.
+Failures expose LilyPond diagnostics without saving. File → Make Score
+Pondside-Ready… and the Settings button always permit retrying; converter
+repairs can still run separately. Later hand edits are checked again before
+GUI structural edits. API.md documents the supported source contract.
+Unchecking a dialog choice preserves its current source. The portable
+contract opt-out operation can expand source-only shared definitions and
+proportional layout spaces back into literal LilyPond music; evaluated
+layout wrappers require their source anchors to remain valid.
+
+The window applies structural plans with revision/ownership checks,
+rollback on a save failure, one graph refresh/engraving, and one invoking
+file undo/redo action. Unmetered insertion, duration edits, dots and
+deletions update the shared definition in the same transaction. The lens
+reads the root's definitions and accounts for padding when it builds its
+measure timeline. GUI meter/break/unmetered commands require the relevant
+shared choice; Source remains available for arbitrary LilyPond.
+
+Note entry checks only changed measure bodies; it does not invoke migration
+or a blocking interpreter compile. Opaque timing remains LilyPond's job
+during normal background engraving. Unmetered changes update the shared
+length and preserve enough room for other voices' music. At a completed
+metered bar's final event, entry continues at the next wrapper in that voice.
+Overflow or a meter too short for another voice is passive inline feedback:
+an opaque label with an SF Symbol beside the selection and a short red
+caret pulse. It never takes focus, moves the music, or requires dismissal;
+Escape or the next accepted edit clears it. Reduce Motion uses a solid
+caret, Increase Contrast strengthens the border, and the label is announced
+to VoiceOver. The opaque card also works with Reduce Transparency. This
+follows the UI skill/HIG rules for frequent, nonblocking feedback near the
+edit; the existing fixed dark Theme remains the app's documented departure
+from following the system appearance.
+
+The Add menu also has Clef…, Time Signature…, Key Signature…, Tempo…,
+Text…, Cue and a Tuplet… picker for any ratio. Clef, key and tempo replace
+the same command already standing before the note. Time Signature edits
+the selected shared measure's definition.
 
 ### Render cache and Open Recent
 
@@ -1125,7 +1187,7 @@ replace the same command already standing before the note.
   score key or chord in the shortcut column (in the secondary colour).
   ⌘⇧E works: Engraving Settings was missing from the File menu.
 - **Panes:** the Lexicon pane (§4). Agents run in the Terminal pane:
-  opening a score writes `.mcp.json` and `opencode.json` beside it, so
+  opening a score writes `.mcp.json`, `opencode.json` and `.codex/config.toml` beside it, so
   `claude` or `opencode` there reaches Pondside through `pondside mcp`.
 - **Source colouring** from the CST's token kinds (commands, strings,
   numbers, comments, Scheme, braces), as TextKit 2 rendering attributes, so

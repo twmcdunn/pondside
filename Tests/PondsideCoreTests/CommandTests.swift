@@ -120,6 +120,32 @@ final class PaletteTests: XCTestCase {
 }
 
 final class PaneTests: XCTestCase {
+    func testSourceNavigationReusesVisiblePaneWithoutSwapping() {
+        for source in [PaneContent.lilypond, .supercollider] {
+            for contents in [[source, .score], [.score, source]] {
+                var layout = PaneLayout(name: "Side by side", contents: contents, fractions: [0.4, 0.6], focused: contents.firstIndex(of: .score)!)
+                layout.reveal(source)
+                XCTAssertEqual(layout.contents, contents)
+                XCTAssertEqual(layout.fractions, [0.4, 0.6])
+                XCTAssertEqual(layout.focusedContent, source)
+                layout.reveal(source)
+                XCTAssertEqual(layout.contents, contents)
+            }
+        }
+    }
+
+    func testSourceNavigationAddsMissingPaneWithoutReplacingScore() {
+        var layout = PaneLayout(name: "Read", contents: [.score])
+        layout.reveal(.lilypond)
+        XCTAssertEqual(layout.contents, [.score, .lilypond])
+        XCTAssertEqual(layout.focusedContent, .lilypond)
+        XCTAssertEqual(layout.fractions.reduce(0, +), 1, accuracy: 1e-9)
+        let fractions = layout.fractions
+        layout.reveal(.lilypond)
+        XCTAssertEqual(layout.contents, [.score, .lilypond])
+        XCTAssertEqual(layout.fractions, fractions)
+    }
+
     func testCyclingKeepsGeometryAndNeverDuplicates() {
         var l = PaneLayout(name: "t", contents: [.lilypond, .score], fractions: [0.4, 0.6], focused: 0)
         l.cycle(available: [.score, .lilypond, .supercollider, .terminal])

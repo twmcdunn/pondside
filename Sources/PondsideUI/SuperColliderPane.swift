@@ -373,6 +373,9 @@ final class SuperColliderPane: NSView, NSTextViewDelegate {
         }
 
         editorScroll.documentView = editor
+        editorScroll.verticalRulerView = SourceLineRuler(scrollView: editorScroll, textView: editor)
+        editorScroll.hasVerticalRuler = true
+        editorScroll.rulersVisible = true
         editorScroll.hasVerticalScroller = true
         editorScroll.autohidesScrollers = true
         editorScroll.drawsBackground = true

@@ -27,6 +27,9 @@ public enum CommandCatalog {
                     category: "File", chords: ["fa"]),
         CommandSpec("file.lilypond", "LilyPond Version…", "Choose which installed LilyPond engraves this score (saved in pondside.toml)",
                     category: "File", chords: ["fl"]),
+        CommandSpec("file.migrateScore", "Make Score Pondside-Ready…",
+                    "Evaluate the score with LilyPond and rebuild its shared meter and break timeline", category: "File",
+                    chords: ["fi"]),
         CommandSpec("file.migratePatch", "Make Patch Pondside-Ready…",
                     "Check the score's SuperCollider patch against Pondside's layout and refactor it", category: "File",
                     chords: ["fm"]),
@@ -37,6 +40,8 @@ public enum CommandCatalog {
     ]
 
     static let go: [CommandSpec] = [
+        CommandSpec("go.line", "Go to Line…", "Jump to a line in the LilyPond or SuperCollider source editor", category: "Go",
+                    chords: ["gi"], shortcut: KeyStroke("l", [.command, .option])),
         CommandSpec("go.file", "Go to File…", "Pick one of the score's files to edit", category: "Go",
                     chords: ["gf"], shortcut: KeyStroke("p", .command)),
         CommandSpec("go.nextFile", "Next File", "Edit the next file the score includes", category: "Go", requires: .severalFiles,
@@ -56,6 +61,10 @@ public enum CommandCatalog {
     ]
 
     static let add: [CommandSpec] = [
+        CommandSpec("add.armAccidental", "Arm Accidental", "+ sharp · - flat · 0 natural for the next note; repeat to disarm", category: "Add", keys: ["+", "-", "0"]),
+        CommandSpec("add.barline", "Finish Unmetered Bar", "Finish the current measure during unmetered entry", category: "Add", requires: .selection, keys: ["|"]),
+        CommandSpec("add.systemBreak", "Toggle System Break", "Start a new system before the selection, or remove its break", category: "Add",
+                    requires: .selection, keys: ["↩"]),
         CommandSpec("add.slur", "Add Slur", "Slur the selection from its first note to its last", category: "Add",
                     requires: .selection, chords: ["as"], keys: ["(", ")"]),
         CommandSpec("add.beam", "Add Beam", "Beam the selection manually", category: "Add",
@@ -83,11 +92,11 @@ public enum CommandCatalog {
         CommandSpec("add.decrescendo", "Add Decrescendo", "A decrescendo hairpin over the selection", category: "Add",
                     requires: .selection, chords: ["ar"]),
         CommandSpec("add.staccato", "Add Staccato", "Toggle a staccato dot", category: "Add",
-                    requires: .selection, chords: ["a."], keys: ["-."]),
+                    requires: .selection, chords: ["a."]),
         CommandSpec("add.accent", "Add Accent", "Toggle an accent", category: "Add",
-                    requires: .selection, chords: ["aa"], keys: ["->"]),
+                    requires: .selection, chords: ["aa"]),
         CommandSpec("add.tenuto", "Add Tenuto", "Toggle a tenuto line", category: "Add",
-                    requires: .selection, chords: ["a-"], keys: ["--"]),
+                    requires: .selection, chords: ["a-"]),
         CommandSpec("add.fermata", "Add Fermata", "Toggle a fermata", category: "Add",
                     requires: .selection, chords: ["af"], keys: ["\\fermata⏎"]),
         CommandSpec("add.note", "Insert Note", "Insert a note after the selection: a–g, nearest octave", category: "Add",
@@ -96,6 +105,7 @@ public enum CommandCatalog {
     ]
 
     static let edit: [CommandSpec] = [
+        CommandSpec("edit.unmetered", "Toggle Unmetered Entry", "Grow the measure as notes are entered; | finishes the bar", category: "Edit", requires: .selection, shortcut: KeyStroke("u", .option)),
         CommandSpec("edit.undo", "Undo", "Undo the last change in this file", category: "Edit",
                     chords: ["eu"], shortcut: KeyStroke("z", .command)),
         CommandSpec("edit.redo", "Redo", "Redo the last undone change", category: "Edit",
@@ -103,7 +113,7 @@ public enum CommandCatalog {
         CommandSpec("edit.delete", "Delete", "Delete the selection; every other note keeps its pitch and duration",
                     category: "Edit", requires: .selection, chords: ["ex"], keys: ["⌫"]),
         CommandSpec("edit.source", "Edit in Source", "Put the text cursor at the selection", category: "Edit",
-                    chords: ["ee"], keys: ["↩"]),
+                    chords: ["ee"]),
         CommandSpec("edit.find", "Find…", "Search the source", category: "Edit",
                     chords: ["ef"], shortcut: KeyStroke("f", .command)),
         CommandSpec("edit.selectAll", "Select All", "Select everything in the focused pane", category: "Edit",
@@ -129,6 +139,8 @@ public enum CommandCatalog {
     ]
 
     static let view: [CommandSpec] = [
+        CommandSpec("view.clearOutput", "Clear Focused Log or Terminal", "Clear the focused LilyPond log or terminal; do nothing in other panes", category: "View",
+                    chords: ["vx"], shortcut: KeyStroke("k", [.command, .shift])),
         CommandSpec("view.zoomIn", "Zoom In", "Enlarge the score", category: "View",
                     chords: ["v="], shortcut: KeyStroke("=", .command)),
         CommandSpec("view.zoomOut", "Zoom Out", "Shrink the score", category: "View",

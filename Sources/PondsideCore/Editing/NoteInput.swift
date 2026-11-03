@@ -34,6 +34,7 @@ public enum InputAction: Hashable, Sendable {
     case select(step: Int, extend: Bool)
     case clearSelection
     case editSource
+    case toggleSystemBreak
     /// The pending input buffer changed (shown in the status line).
     case buffer(String)
 }
@@ -58,6 +59,8 @@ public enum InputAction: Hashable, Sendable {
 /// (pitch-before-duration); with nothing selected it arms the next insertion
 /// (duration-before-pitch). Multi-digit durations ("16") resolve as typed.
 public struct NoteInput: Sendable {
+    /// Quarter-tone units: sharp 2, flat -2, natural 0. Consumed by a successful note insertion.
+    public private(set) var armedAccidental: Int?
     public private(set) var armedDuration: DurationValue?
     private var digits = ""
     private var lastDigitTime = 0.0
@@ -106,6 +109,13 @@ public struct NoteInput: Sendable {
             }
         }
 
+        if direction == nil, case .character(let c) = input.key, ["+", "-", "0"].contains(c) {
+            let value = c == "+" ? 2 : (c == "-" ? -2 : 0)
+            armedAccidental = armedAccidental == value ? nil : value
+            digits = ""
+            return [.buffer(bufferText)]
+        }
+
         // Direction prefix: - ^ _ then a shorthand, a digit, or a command.
         if let dir = direction {
             if case .character(let c) = input.key {
@@ -142,7 +152,7 @@ public struct NoteInput: Sendable {
             return [.clearSelection]
         case .enter:
             digits = ""
-            return [.editSource]
+            return [.toggleSystemBreak]
         case .character(let c):
             return handleCharacter(c, now: now)
         }
@@ -181,7 +191,7 @@ public struct NoteInput: Sendable {
             return [.toggleDot]
         case "(", ")", "~", "[", "]":
             return [.togglePostEvent(String(c))]
-        case "-", "^", "_":
+        case "^", "_":
             direction = c
             return [.buffer(bufferText)]
         case "\\":
@@ -195,6 +205,8 @@ public struct NoteInput: Sendable {
     static func isDurationPrefix(_ s: String) -> Bool {
         durations.contains { String($0).hasPrefix(s) }
     }
+
+    public mutating func clearAccidental() { armedAccidental = nil }
 
     /// Arms a duration directly (e.g. from the palette).
     public mutating func arm(_ d: DurationValue?) {

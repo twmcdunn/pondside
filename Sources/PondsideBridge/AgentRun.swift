@@ -119,7 +119,7 @@ public struct AgentRun: Sendable {
             }
     }
 
-    /// opencode's inline config: no shell, web or subagents, and the model, if one is chosen.
+    /// opencode's inline config: no shell, web, subagents or native file writes (MCP `edit` is the one checked write path), and the model, if one is chosen.
     func opencodeConfigContent() -> String {
         guard let model, !model.isEmpty else { return Self.opencodeConfig }
         let quoted = String(data: (try? JSONSerialization.data(withJSONObject: [model], options: [])) ?? Data(), encoding: .utf8)
@@ -147,15 +147,16 @@ public struct AgentRun: Sendable {
         }
     }
 
-    /// Claude's tools: only the file tools it may use and Pondside's. With
-    /// `--tools` the other built-ins aren't even offered, and with tool
+    /// Claude's tools: read/search plus Pondside's. Native Edit/Write would
+    /// bypass MCP's atomic edits, role restrictions and post-edit checks.
+    /// With `--tools` the other built-ins aren't even offered, and with tool
     /// search off (`environment`) Pondside's tools are loaded up front, so
     /// the first request doesn't spend a model turn finding them (measured:
     /// a one-tool request 10 s → 5 s, cost down 60%).
-    static let opencodeConfig = #"{"permission":{"bash":"deny","webfetch":"deny","websearch":"deny","task":"deny"}}"#
+    static let opencodeConfig = #"{"permission":{"bash":"deny","webfetch":"deny","websearch":"deny","task":"deny","edit":"deny","write":"deny","multiedit":"deny","patch":"deny"}}"#
 
-    static let claudeTools = ["--permission-mode", "dontAsk", "--tools", "Read,Edit,Write,Glob,Grep",
-                              "--allowedTools", "Read Edit Write Glob Grep mcp__pondside"]
+    static let claudeTools = ["--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep",
+                               "--allowedTools", "Read Glob Grep mcp__pondside"]
 
     /// The agent's last words from its JSON output.
     public func parse(_ output: String, status: Int32) -> Outcome {
@@ -413,9 +414,10 @@ public struct AgentRun: Sendable {
     /// to notice reads as a failure (a run that thinned grains by half in
     /// one band "succeeded" and looked unchanged).
     static let atAGlance = """
-    The user looks at the page at normal zoom to judge the result: make the change big enough to see at a \
-    glance (about 2× for "taller", "denser", "wider"; a clearly different shape for "different"), unless \
-    they gave numbers. Too small to notice counts as not done.
+    The user looks at the page at normal zoom: make the change visible at a glance and proportionate to the \
+    words (about 2× for an unqualified "taller", "denser" or "wider"; a clearly different shape for \
+    "different"). "A little", "slightly" and "subtle" call for a restrained but visible change, not 2×. \
+    Numbers the user gives win. Too small to notice counts as not done.
     """
 
     /// What a marked range is: an existing drawing, or only a range (a new
@@ -426,14 +428,14 @@ public struct AgentRun: Sendable {
     }
 
     static let graphicRules = """
-    The context's selection has kind "graphic-section": `from` and `to` are the two edges.
-    `from.x` and `to.x` are their fractions of each endpoint's broken piece; `from.page_x` and
-    `to.page_x` are the same edges in page coordinates; `from.at` and `to.at` are the moment at
-    each edge (interpolated from the engraved notes; the moments identify systems, not the
-    boundary); `systems` lists the selected page-x range on every covered system. Follow
-    skill://graphic-notation: build its `section-window` from `from.at.moment`, `to.at.moment`,
-    `from.x` and `to.x`; change only inside it. Never use the moments as musical boundaries, and
-    never change a shared constant, seed or table.
+    The context's selection has kind "graphic-section": `from` and `to` are the two edges. Their `x` values
+    are fractions of the broken pieces and their `page_x` values are page coordinates. `systems` lists every
+    covered system's selected range and canonical `moments` [first, last]. Follow skill://graphic-notation:
+    for `section-window`, use the first system's first moment as m0, the last system's first moment as m1,
+    and `from.x`/`to.x` as f0/f1 (on one system m0 == m1). These canonical moments identify systems; the
+    interpolated `from.at`/`to.at` moments are for music placement, never system identity or a visual boundary.
+    Change only inside the marked range; never change a shared constant, base seed or table. If the request
+    combines graphics with traditional notation, make both changes in that range (skill://lilypond when needed).
     """
 
     static let emptySectionRules = """
@@ -459,36 +461,42 @@ public struct AgentRun: Sendable {
             : ""
         let targetLine = target == .emptySection
             ? "The marked range has no drawing at its start. A drawing is a new graphic; a notation/layout change is score code."
-            : "The marked range starts on an existing drawing; change that drawing, not the music around it."
+            : "The marked range starts on an existing drawing: change it for the visual request. If the same request also asks for traditional notation, change that too, only in the marked range."
         if followUp {
             return """
             Next request: "\(request)". The user's selection now (score_context):
             \(context)
             \(targetLine)
-            Code in it is numbered as in its file (`412| ` is not part of the line), fresh as of now: \
-            edit with the edit tool by from_line/to_line or exact text, without reading the file; it \
-            returns the engraving.
+            Code in it is numbered as in its file (`412| ` is not part of the line), fresh as of now. \
+            Use one atomic MCP edit per file, with from_line/to_line for every hunk (all ranges refer to \
+            the same pre-edit snapshot; inserted lines do not renumber other hunks). No native Edit/Write. \
+            The reply includes the engraving, new_diagnostics and vector verification; repair a no-op or \
+            outside change before responding. No renders, images or shell.
             \(rules)
-            \(atAGlance) Same rules as before (no renders, images or shell); reply in one short line \
-            with the numbers (old → new).
+            \(atAGlance) Reply in one short line with the numbers (old → new); claim the outside is \
+            unchanged only when verification proves it.
             """
         }
         let quick = target == .emptySection
             ? """
             Be quick: the context has the marked range, the root `\\layout`, and an index of the \
-            score's definitions. Read only the lines you need, never the whole graphics file. Edit \
-            with the edit tool (from_line/to_line, or exact old text; root: \(score.path) for an .ily); \
-            it returns the app's engraving, so no separate check. Fix only what it reports. Don't \
-            render pages, look at images or run shell commands: the user sees the app re-engrave.
+            score's definitions. Read only missing lines you need, never the whole graphics file. Use one \
+            atomic MCP edit per file (root: \(score.path) for an .ily), with from_line/to_line for every \
+            hunk and no native Edit/Write. All ranges in a call refer to the same pre-edit snapshot; inserted \
+            lines do not renumber other hunks. It returns the engraving, new_diagnostics and vector \
+            verification: fix new diagnostics, a selected no-op or outside changes. No separate check, renders, \
+            images or shell. For a new graphic, graphic_insert returns the same check.
             """
             : """
-            Be quick: the context has the graphic's definition, its drawing code and the helpers it \
-            calls, in full, numbered as in their files (`412| ` is a prefix, not part of the line). \
-            Change them with the edit tool (from_line/to_line, or exact old text; root: \(score.path) \
-            for an .ily) without reading the files: one edit call, which returns the app's engraving, \
-            so no separate check. Fix only what it reports. For a new graphic use graphic_insert over \
-            the marked range. Don't render pages, look at images or run shell commands: the user sees \
-            the app re-engrave.
+            Be quick: the context has the graphic's definition, drawing code, short direct helpers in full \
+            and other dependencies by exact range, numbered as in their files (`412| ` is a prefix, not part \
+            of the line). `section_support` says which window helpers exist and where to insert missing ones; \
+            do not search for them. Use one atomic MCP edit per file (root: \(score.path) for an .ily) without reading \
+            the files again: from_line/to_line for every hunk, optionally with its numbered old text as a \
+            guard; no native Edit/Write. All ranges refer to the same pre-edit snapshot, so inserted lines \
+            do not renumber other hunks. It returns the engraving, new_diagnostics and vector verification: \
+            fix new diagnostics, a selected no-op or outside changes. No separate check, renders, images or \
+            shell. For a new graphic, graphic_insert over the marked range returns the same check.
             """
         return """
         The user marked a section in Pondside's score of \(score.path) and asked: "\(request)".
@@ -501,6 +509,7 @@ public struct AgentRun: Sendable {
         \(quick)
         \(rules)
         Final reply: one short line saying what changed, with the numbers, e.g. "Swell taller: peak 1.06 → 2.1."
+        Say the rest is untouched only when verification has outside_unchanged true and crossing_changed 0.
         More requests may follow in this conversation, each with the selection at that moment; \
         "it", "that" and "again" refer to earlier ones.
 

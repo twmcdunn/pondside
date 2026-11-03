@@ -24,6 +24,9 @@ final class PatchAgentTests: XCTestCase {
         let byLine = try FileEdit.apply([.init(new: "B\nB2", fromLine: 2), .init(new: "D", fromLine: 4, toLine: 4)], to: text)
         XCTAssertEqual(byLine.text, "a\nB\nB2\nc\nD\n")
         XCTAssertEqual(byLine.lines, 2...5)
+        let guarded = try FileEdit.apply([.init(old: "b = 1", new: "B\nB2", fromLine: 2),
+                                          .init(old: "d = 1", new: "D", fromLine: 4)], to: text)
+        XCTAssertEqual(guarded.text, byLine.text, "every guarded range still addresses the original snapshot")
         XCTAssertThrowsError(try FileEdit.apply([.init(old: "= 1", new: "= 2")], to: text)) {
             XCTAssertTrue("\($0)".contains("lines 2, 4"), "\($0)")
         }
@@ -35,6 +38,16 @@ final class PatchAgentTests: XCTestCase {
     func testTheContextNumbersItsCode() {
         XCTAssertEqual(ScoreContext.numbered("x\ny", from: 9), " 9| x\n10| y")
         XCTAssertEqual(FileEdit.unnumbered(" 9| x\n10| y"), "x\ny")
+    }
+
+    func testAWhitespaceOnlyEditFailureReturnsTheExactNumberedSource() {
+        let text = "a\n  (n 30))\nc\n"
+        XCTAssertThrowsError(try FileEdit.apply([.init(old: "   (n 30))", new: "changed")], to: text)) {
+            let message = "\($0)"
+            XCTAssertTrue(message.contains("differs only in whitespace from lines 2–2"), message)
+            XCTAssertTrue(message.contains("2|   (n 30))"), message)
+            XCTAssertTrue(message.contains("same original snapshot"), message)
+        }
     }
 
     // MARK: Patch context
@@ -135,7 +148,9 @@ final class PatchAgentTests: XCTestCase {
         XCTAssertTrue(follow.contains("glance"))
         let section = AgentRun.graphicsPrompt(request: "denser", context: "{}", score: URL(fileURLWithPath: "/s.ly"))
         XCTAssertTrue(section.contains("# Graphic notation in Pondside"), "the graphic skill is in the first prompt")
-        XCTAssertTrue(section.contains("from.at.moment") && section.contains("section-window"))
+        XCTAssertTrue(section.contains("canonical `moments`") && section.contains("section-window"))
+        XCTAssertTrue(section.contains("m0 == m1") && section.contains("same pre-edit snapshot"))
+        XCTAssertTrue(section.contains("vector verification") && section.contains("A little"))
         let followSection = AgentRun.graphicsPrompt(request: "more", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
                                                     followUp: true)
         XCTAssertTrue(followSection.contains("graphic-section") && followSection.contains("from.x"))

@@ -14,6 +14,7 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     private var host: LensScoreHostView?
     private weak var anchorView: NSView?
 
+    var unmetered = false
     var onClose: (() -> Void)?
     var onFailure: ((String) -> Void)?
     var onSwitch: ((LensMode) -> Void)?
@@ -21,6 +22,7 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     var unavailable: [LensMode: String] = [:]
 
     private func configure(_ card: NotationLensOverlayView) {
+        card.setUnmetered(unmetered)
         card.tabTarget = LensMode.notation.next(among: available)?.title.lowercased()
         card.modes.configure(current: .notation, available: available, unavailable: unavailable)
         card.modes.onSelect = { [weak self] m in

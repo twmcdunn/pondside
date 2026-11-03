@@ -248,6 +248,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             command("file.scoreSetup"),
             command("file.engravingSettings"),
             command("file.lilypond"),
+            command("file.migrateScore"),
             .separator(),
             command("file.exportPDF"),
             command("file.reveal"),

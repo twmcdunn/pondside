@@ -81,7 +81,8 @@ commands:
       render, cues, lexicon_check) and the Lexicon tiers as resources.
       Claude Code: claude mcp add pondside -- pondside mcp
   agents [<dir>]
-      Write .mcp.json (Claude Code) and opencode.json (opencode) in the
+      Write .mcp.json (Claude Code), opencode.json (opencode), and
+      .codex/config.toml (Codex) in the
       folder (default: the current one), so an agent started there finds
       pondside mcp. Existing files only gain a missing pondside server.
       The app does this for each score's folder when it opens the score.

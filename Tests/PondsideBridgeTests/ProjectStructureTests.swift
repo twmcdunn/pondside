@@ -23,7 +23,7 @@ final class ProjectStructureTests: XCTestCase {
     }
 
     static let layout = ["piece.ly", "lexicon.ily", "renders", "patch/piece.scd", "patch/dependencies/pondside.scd", "patch/resources",
-                         ".mcp.json", "opencode.json"]
+                         ".mcp.json", "opencode.json", ".codex/config.toml"]
 
     func testCreateBuildsTheWholeStructure() throws {
         let dir = try temp()

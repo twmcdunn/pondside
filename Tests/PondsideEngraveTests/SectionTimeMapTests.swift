@@ -66,4 +66,44 @@ final class SectionTimeMapTests: XCTestCase {
         XCTAssertNil(SectionTimeMap(log: TimingLog(rows: []), pages: [page()])
             .edge(at: section.from, staffName: "flute"))
     }
+
+    func testAHiddenGraphicsStaffNeverInterpolatesAcrossSystems() throws {
+        let link = PointAndClickLocation(path: "/graphics.ily", line: 1, character: 0, column: 1)
+        var graphics: [Graphic] = []
+        for y in stride(from: 10.0, through: 14.0, by: 1.0) { graphics.append(line(0, 100, y)) }
+        for y in stride(from: 40.0, through: 44.0, by: 1.0) { graphics.append(line(0, 100, y)) }
+        for (line, ys) in [(1, [12.0]), (2, [42.0])] {
+            for (x, character) in [(20.0, 0), (60.0, 4), (80.0, 8)] {
+                graphics.append(note(x, ys[0], line: line, character: character))
+            }
+        }
+        graphics.append(Graphic(content: .path(VectorPath([.move(Point(0, 50)), .line(Point(100, 54))]),
+                                                  fill: nil, stroke: .black, style: StrokeStyle(width: 0.1)),
+                                bounds: Rect(x: 0, y: 50, width: 100, height: 4), link: link))
+        let page = EngravedPage(widthMM: 210, heightMM: 297,
+                                viewBox: Rect(x: 0, y: 0, width: 100, height: 140), graphics: graphics)
+        let log = TimingLog(rows: [
+            .init(moment: Rational(0), bar: 1, kind: .note(staff: "flute", midi: 60),
+                  origin: .init(file: "/score.ly", line: 1, character: 0)),
+            .init(moment: Rational(3), bar: 1, kind: .note(staff: "flute", midi: 62),
+                  origin: .init(file: "/score.ly", line: 1, character: 4)),
+            .init(moment: Rational(4), bar: 1, kind: .note(staff: "flute", midi: 64),
+                  origin: .init(file: "/score.ly", line: 1, character: 8)),
+            .init(moment: Rational(14), bar: 7, kind: .note(staff: "flute", midi: 60),
+                  origin: .init(file: "/score.ly", line: 2, character: 0)),
+            .init(moment: Rational(17), bar: 7, kind: .note(staff: "flute", midi: 62),
+                  origin: .init(file: "/score.ly", line: 2, character: 4)),
+            .init(moment: Rational(18), bar: 7, kind: .note(staff: "flute", midi: 64),
+                  origin: .init(file: "/score.ly", line: 2, character: 8)),
+        ])
+        let section = try XCTUnwrap(GraphicSection.make(
+            pages: [page], from: (0, Point(20, 52)), to: (0, Point(50, 52)), link: link))
+        let map = SectionTimeMap(log: log, pages: [page])
+        let edge = try XCTUnwrap(map.edge(at: section.to, staffName: "electronicsGraphics"))
+        XCTAssertEqual(edge.moment, Rational(31, 2))
+        XCTAssertEqual(edge.bar, 7)
+        let moments = try XCTUnwrap(map.systemMoments(page: section.to.page, system: section.to.system))
+        XCTAssertEqual(moments.first, Rational(14))
+        XCTAssertEqual(moments.last, Rational(18))
+    }
 }

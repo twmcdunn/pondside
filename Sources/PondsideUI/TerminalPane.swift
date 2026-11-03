@@ -35,6 +35,13 @@ final class TerminalPane: NSView, LocalProcessTerminalViewDelegate {
     /// The view that takes the keyboard.
     var responder: NSView { terminal }
 
+    func clear() {
+        terminal.selectNone()
+        // Feed display controls to the emulator, never to the shell/PTY.
+        terminal.feed(text: "\u{1B}[3J\u{1B}[2J\u{1B}[H")
+        terminal.scroll(toPosition: 1)
+    }
+
     private func start() {
         startedAt = Date()
         let shell = ProcessInfo.processInfo.environment["SHELL"].flatMap { $0.isEmpty ? nil : $0 } ?? "/bin/zsh"

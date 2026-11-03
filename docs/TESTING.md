@@ -53,6 +53,38 @@ check the skipped tests before claiming success.
   agent's context, `sc_lexicon_add`, the two roles' tools and files, and
   the prompts (`PatchAgentTests`).
 
+`StructuralEditingTests` covers migration, source-only ownership, cross-file
+meters, nested tremolos, inherited durations, tuplets, elastic spacers and
+full-measure rests, opt-outs, appending measures, contract violations,
+ordinary overflow, timed spacer content, shared timing in the lens,
+converter-only default choices, grouped layout skips, finite skip repeats,
+automatic layout policies, spacing sections, helper upgrades and exclusion
+of Scheme/front-matter templates.
+Local note-entry tests cover overflow in only the changed measure,
+cross-measure continuation (including full-measure rests), preservation of
+relative pitches and inherited durations, and unmetered shortening that
+retains enough space for other voices. Inline rejection feedback is
+rendered offscreen for visual checks; it must remain click-through and
+respect Reduce Motion and Increase Contrast.
+`StructuralEditingEngravingTests` checks pitches/durations/moments before
+and after migration against LilyPond, the 5/4 → break → 3/2 regression,
+full-measure rest resizing, explicit break moments after padding and
+opt-out, rejection of hand-edited overflow, and the moments of spacing
+sections and page breaks after migrating and resizing independent layout
+tracks. These integration tests
+skip without LilyPond; a portable model test alone cannot verify the
+Scheme helper. `ProjectSourceTransactionTests` covers disk conflicts,
+rollback after a later write fails, preservation of intervening external
+changes, and exact inverse restoration. Dialog behavior and registration
+with the per-file undo manager remain manual UI responsibilities (the app
+is compile-checked). `StructuralMigrationTests` exercises actual interpreter
+evaluation of custom functions, tagged print/MIDI branches, generated
+meters and breaks, generated layout skips and post-events, tremolos,
+reused helpers, invalid source, candidate semantic changes, cancellation
+and repeat migration, generated front-matter legends, and equivalent
+full-measure rest spellings. Source snapshots and inverse edits verify that
+planning never writes the user's files.
+
 ## Gaps, and unit tests to add
 
 Roughly in order of value.

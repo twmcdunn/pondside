@@ -326,13 +326,13 @@ public actor MCPServer {
     }
 
     static let tools: [Tool] = [
-        Tool(name: "edit", description: "Edit a file without reading it first: each edit replaces old (exact text, unique in the file; the contexts' line-number prefixes are ignored) with new, or lines from_line…to_line (as score_context/patch_context number them) with new; give old with from_line to have the lines checked first (safe when an earlier edit may have moved them). All edits apply together or none. For a .ly/.ily file it then waits for the app's engraving and returns check's result, so don't call check after it.",
+        Tool(name: "edit", description: "Atomically edit a file without reading it first. Prefer from_line…to_line from the numbered context, optionally with old as a guard; exact old text is for small unique replacements. ALL ranges in one call address the SAME pre-edit snapshot: inserted lines never renumber other hunks, and all hunks apply together or none. Never split dependent hunks into separate calls. For .ly/.ily it waits for the app's engraving and returns check, new_diagnostics when a request baseline exists, and vector verification of the marked range (selected no-op, wholly-outside changes, boundary-crossing ambiguity); don't call check after it.",
              properties: ["file": ["type": "string", "description": "The file to edit (absolute, or relative to the server's directory)"],
-                          "edits": ["type": "array", "description": "The edits, against the file as it is now",
+                          "edits": ["type": "array", "description": "All hunks against the same pre-edit file snapshot",
                                     "items": ["type": "object", "properties": [
-                                        "old": ["type": "string", "description": "Exact text to replace"],
+                                        "old": ["type": "string", "description": "Exact text to replace, or the expected text guarding a line range"],
                                         "new": ["type": "string", "description": "Its replacement (lines without number prefixes)"],
-                                        "from_line": ["type": "integer", "description": "First line to replace, instead of old"],
+                                        "from_line": ["type": "integer", "description": "First line to replace in the original snapshot"],
                                         "to_line": ["type": "integer", "description": "Last line to replace (default from_line)"]],
                                               "required": ["new"]]],
                           "root": ["type": "string", "description": "The score's root .ly, when editing an .ily (for the check)"]],
@@ -388,7 +388,7 @@ public actor MCPServer {
                           "music": ["type": "string", "description": "Optional LilyPond for a staff above, e.g. the passage's music"],
                           "out": ["type": "string", "description": "Directory for the SVG (default: a temporary one)"]],
              required: ["id"]),
-        Tool(name: "graphic_insert", description: "Insert a Lexicon graphic as a minimal edit: \\startGraphic on the event at the range start, \\stopGraphic on the event at the range stop or at a moment (a skip it falls inside is split), on the same staff; then write lexicon.ily and include it in the root.",
+        Tool(name: "graphic_insert", description: "Insert a Lexicon graphic as a minimal edit: \\startGraphic on the event at the range start, \\stopGraphic on the event at the range stop or at a moment (a skip it falls inside is split), on the same staff; write lexicon.ily and include it in the root, then return the engraving/check and any marked-range vector verification.",
              properties: ["file": file, "id": ["type": "string"], "params": ["type": "string", "description": "Scheme alist"],
                           "start_line": ["type": "integer"], "start_character": ["type": "integer"],
                           "stop_line": ["type": "integer"], "stop_character": ["type": "integer"],
@@ -615,7 +615,9 @@ public actor MCPServer {
             try Data(new.utf8).write(to: source, options: .atomic)
             let root = try args["root"]?.string.map { try path(["file": .string($0)]) } ?? source
             let include = try GraphicEdit.prepareLexiconInclude(root: root, lexicon: lexicon())
-            return "Inserted \(id) in \(source.lastPathComponent); wrote \(include.lastPathComponent). Call check to see it engraved."
+            let done = "Inserted \(id) in \(source.lastPathComponent); wrote \(include.lastPathComponent)."
+            if let fromApp = await appCheck(root) { return done + " check:\n" + fromApp }
+            return done + " check:\n" + (try await callTool("check", ["file": .string(root.path)]))
         case "edit":
             return try await edit(args)
         case "patch_context":
@@ -686,9 +688,16 @@ public actor MCPServer {
             if status == "noLilyPond" { return nil }
             if started >= written, status != "compiling" {
                 let diagnostics = doc["diagnostics"]?.array ?? []
-                let ok = status.hasPrefix("clean")
+                let failed = diagnostics.contains { d in
+                    let severity = d["severity"]?.string ?? ""
+                    return severity == Diagnostic.Severity.error.rawValue || severity == Diagnostic.Severity.fatal.rawValue
+                        || severity == Diagnostic.Severity.programmingError.rawValue
+                }
+                let ok = status.hasPrefix("clean") && !failed
                 var report: [String: JSONValue] = ["ok": .bool(ok), "status": .string(status), "diagnostics": .array(diagnostics),
                                                    "from": "the running app"]
+                if let new = doc["new_diagnostics"] { report["new_diagnostics"] = new }
+                if let verification = doc["verification"], verification != .null { report["verification"] = verification }
                 if !ok, let reply = try? RPCClient.call("document.log", ["path": .string(source.path)]),
                    let log = reply["log"]?.string, !log.isEmpty {
                     report["log"] = .string(log)
