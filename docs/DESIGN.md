@@ -796,7 +796,7 @@ terminal:
   change".
 
 **Settings (⌘,).** Pondside ▸ Settings… holds only what belongs to the app,
-not to a score: the agent (Automatic, Claude Code, opencode or Off, with
+not to a score: the agent (Automatic, Claude Code, opencode, Codex or Off, with
 where each is installed), "Ask Again About Declined Patches", Lights Out
 (also in View) and installing the command-line tool. A score's own settings
 stay in its files and `pondside.toml`. The window applies changes at once,
@@ -1120,8 +1120,7 @@ breaks at boundaries are collected from every supported stream.
 Scheme helper templates and front-matter examples are not score voices.
 Failures expose LilyPond diagnostics without saving. File → Make Score
 Pondside-Ready… and the Settings button always permit retrying; converter
-repairs can still run separately. Later hand edits are checked again before
-GUI structural edits. API.md documents the supported source contract.
+repairs can still run separately. API.md documents the supported source contract.
 Unchecking a dialog choice preserves its current source. The portable
 contract opt-out operation can expand source-only shared definitions and
 proportional layout spaces back into literal LilyPond music; evaluated
@@ -1135,8 +1134,14 @@ reads the root's definitions and accounts for padding when it builds its
 measure timeline. GUI meter/break/unmetered commands require the relevant
 shared choice; Source remains available for arbitrary LilyPond.
 
-Note entry checks only changed measure bodies; it does not invoke migration
-or a blocking interpreter compile. Opaque timing remains LilyPond's job
+Built-in note edits preserve the contract by construction and never run a
+whole-project validator. Metered entry checks only changed measure bodies
+for overflow. Prepared CSTs are adopted directly, without reloading or
+reparsing unchanged includes. Autosave recognizes revisions produced by
+these constrained commands (and their undo); arbitrary Source edits retain
+their separate audit. Shared meter lookup indexes the root once per lens
+build, and mode availability reuses that lens instead of building it again.
+Note entry does not invoke migration or a blocking interpreter compile. Opaque timing remains LilyPond's job
 during normal background engraving. Unmetered changes update the shared
 length and preserve enough room for other voices' music. At a completed
 metered bar's final event, entry continues at the next wrapper in that voice.
@@ -1621,3 +1626,94 @@ handles on the legend's pages; ⎋ ends it.
     **Uninstalling.** Delete `/Applications/Pondside.app`,
     `/Library/Application Support/Pondside/Toolchain` and
     `/usr/local/bin/pondside`.
+
+### Input queue, general requests and performance deployment
+
+Unmetered entry builds a proposed CST and a real LensScoreWindow for each
+keystroke on a worker, then hands that model directly to the lens. There
+are no ghost notes. MusicXML parsing and layout run on a serial actor with
+a measure cache and a small recent-layout cache; selection-only changes
+reuse the displayed layout. Revision checks discard stale layout results.
+A separate worker coalesces coordinated source commits; unmetered deletion,
+pitch and duration changes use this same proposed-CST pipeline as insertion.
+Neither disk writes nor LilyPond engraving block the proposed notation.
+Note undo/redo in both input modes restores exact source revisions and
+explicit before/after selections through the same provisional-CST pipeline.
+Actions register with NSUndoManager as soon as a draft is prepared; inverse
+registration remains synchronous during undo/redo, while persistence remains
+independent. History waits for CST preparation, never for queued disk writes
+or engraving. Cursor mode and selection are restored with the source, rather
+than mapped through a replacement spanning meter definitions and music.
+Ordinary typing in Source retains TextKit undo. Navigation, closing and
+termination still wait for queued source edits; the .ly text remains the
+only durable score state. Metered/unmetered is
+an input preference and never changes time-signature visibility. A break
+pulse represents a net change from the displayed engraving and disappears
+immediately if that change is undone, including before the deferred write.
+These follow HIG Loading and Motion: show feedback immediately, keep the
+editing loop responsive, and use no motion when Reduce Motion is enabled.
+
+`=`, `-`, and `0` toggle visible sharp, flat, and natural accidentals on
+selected notes. With the entry cursor they arm that accidental for the next
+pitched note. Compact `♮ 0`, `♭ -`, and `♯ =` hint groups sit beside the
+meter control; a border and semibold key highlight the armed group without
+changing focus or animating. At narrow widths the mode switch keeps its
+icons and tooltips while dropping labels, avoiding overlap with these
+keyboard hints. With no accidental armed all groups stay
+unhighlighted. Opening the lens on an empty measure starts entry, so those
+keys arm its first note rather than attempting to edit the placeholder.
+Unarmed entry inherits the last accidental for the same pitch and octave
+in the current measure, falling back to the key signature at each new
+measure. Explicit signs
+write LilyPond `!`, and the lens emits those signs even when the key or an
+earlier note makes them redundant. The adapter carries those source display
+marks into layout as user accidentals; unforced notes retain automatic
+suppression. The layout cache includes that explicit-display intent.
+Toggling a visible sign off restores the
+contextual pitch, preventing an automatic accidental from reappearing.
+Option-arrow pitch changes remove explicit display marks and retain normal
+LilyPond accidental suppression. `-` is exclusively the flat key; directed
+articulations remain available through `^` and `_` prefixes.
+
+Ask Agent is an explicit document sheet, appropriate for a deliberate
+project request with target/file choices. It is separate from the transient
+lens. Deploy Patch also uses explicit sheets: name the repository, prepare
+reviewable local artifacts, then publish. Neither sheet opens during note
+entry. The exported player uses opaque dark chrome and vector score cards,
+with two systems visible and a large number-only cue badge. It has no
+frequent scrolling animation or translucent score surface, so Reduce Motion
+and Reduce Transparency do not introduce a second performance path. All
+controls retain accessibility labels; the score remains uncoloured.
+
+Saved performance builds are explicit export artifacts, retained under
+Pondside/Deployments with a receipt and publication checkpoints. The review
+sheet offers local testing, publication or keeping the build for later;
+opening Deploy Patch again offers saved builds before making a new one.
+This follows HIG explicit-action sheets without adding confirmation to
+ordinary editing. Finder opens only through an explicit reveal control.
+The local and released player share a per-launch sound-inventory check.
+Healthy sounds mean no network; missing files are restored before audio
+starts. No installer or privileged directory write is needed. A local
+build has adjacent repair archives; the released copy uses release assets.
+
+The review keeps the public-publishing decision and local-test controls in
+one native sheet. Its text explains what will be shared and how to return;
+the saved filesystem path is behind Show Saved Build in Finder, rather
+than consuming the sheet with a wrapped path. The device-code sheet uses
+selectable, centered monospaced text. These use native controls for system
+appearance/accessibility and require no transient animation.
+
+### Codex and per-refactor agent choice
+
+Settings discovers Codex alongside Claude Code and opencode, retaining the
+existing Automatic priority before falling back to Codex. Codex uses exec
+JSONL and explicit thread-ID resume, with native writes blocked and source
+changes routed through role-scoped, contract-checked MCP tools.
+
+The explicit patch refactor sheet includes a native Agent pop-up and a
+short scope hint. It defaults to Settings and can override the agent for
+that one refactor without changing preferences. Uninstalled options remain
+visible but disabled. The primary button names the current choice, and No
+Agent / Refactor Only leaves manual work marked. Native controls preserve
+keyboard and accessibility behavior without additional animation or focus
+changes (HIG sheets, choices and feedback).

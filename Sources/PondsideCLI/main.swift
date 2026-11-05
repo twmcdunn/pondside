@@ -50,7 +50,7 @@ commands:
       Render the score's Pondside patch (pondside handlers starts one) offline
       in mockup mode against the mockup: the score with its electronics, in
       <name>.mix.wav. The app runs it after each mockup.
-  patch <file.ly> [--scd <patch.scd>] [--from <file.scd>] [--fix [--agent auto|claude|opencode]]
+  patch <file.ly> [--scd <patch.scd>] [--from <file.scd>] [--fix [--agent auto|claude|opencode|codex]]
       Check the score's SuperCollider patch (or, without one, the folder's
       likeliest .scd) against Pondside's patch layout (docs/SUPERCOLLIDER.md).
       --fix migrates it into <name>.scd: wraps it in the mode, engine, cue and
@@ -524,13 +524,13 @@ func patchCommand(_ args: Arguments) async throws -> Int32 {
     }
     guard !result.manual.isEmpty, let preference = args.options["agent"] else { return 0 }
     guard let agent = AgentRun.choose(preference: preference == "auto" ? nil : preference) else {
-        throw CLIError("no agent found (claude or opencode)")
+        throw CLIError("no agent found (claude, opencode or codex)")
     }
     let me = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path
     let pondside = FileManager.default.isExecutableFile(atPath: me) ? me : "pondside"
     print("\(agent.harness.title) is finishing \(c.target.lastPathComponent)…")
     let outcome = try await agent.run(prompt: AgentRun.migrationPrompt(score: source, patch: c.target),
-                                      folder: source.deletingLastPathComponent(), pondside: pondside) { printErr("  " + $0) }
+                                      folder: source.deletingLastPathComponent(), pondside: pondside, role: .patch) { printErr("  " + $0) }
     print(outcome.summary)
     if let cost = outcome.costUSD { print(String(format: "(%@: $%.2f)", agent.harness.title, cost)) }
     let now = (try? String(contentsOf: c.target, encoding: .utf8)) ?? ""

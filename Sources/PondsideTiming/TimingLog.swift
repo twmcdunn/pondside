@@ -20,6 +20,7 @@ public struct TimingLog: Sendable, Hashable {
             case tempo(quartersPerMinute: Double)
             case text(String)
             case note(staff: String, midi: Int)
+            case rest(staff: String)
             case group(staff: String, start: Bool)
             case meter(numerator: Int, denominator: Int)
             /// A Lexicon entry's cue: which entry, how long its music is (whole
@@ -102,6 +103,12 @@ public struct TimingLog: Sendable, Hashable {
                 // rows (and generated notes) end after the pitch.
                 if values.count >= 5, let line = Int(values[3]), let ch = Int(values[4]) {
                     origin = Row.Origin(file: values[2], line: line, character: ch)
+                }
+            case "rest":
+                guard let staff = values.first else { continue }
+                kind = .rest(staff: staff)
+                if values.count >= 4, let line = Int(values[2]), let ch = Int(values[3]) {
+                    origin = Row.Origin(file: values[1], line: line, character: ch)
                 }
             case "group":
                 guard values.count >= 2 else { continue }

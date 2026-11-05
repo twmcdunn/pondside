@@ -51,6 +51,13 @@ public enum TimingDump {
        (let ((staff (ly:context-find context 'Staff)))
          (if staff (ly:context-id staff) "")))
 
+    #(define (pondside-timing-rest context event)
+       (let* ((loc (ly:event-property event 'origin #f))
+              (where (if (ly:input-location? loc)
+                         (let ((o (ly:input-file-line-char-column loc)))
+                           (list (car o) (cadr o) (caddr o))) '())))
+         (apply pondside-timing-row context "rest" (pondside-timing-staff context) where)))
+
     #(define (Pondside_timing_engraver context)
        (make-engraver
         (listeners
@@ -96,6 +103,8 @@ public enum TimingDump {
                                  '())))
                   (apply pondside-timing-row context "note"
                          (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p)) where)))))
+         ((rest-event engraver event) (pondside-timing-rest context event))
+         ((multi-measure-rest-event engraver event) (pondside-timing-rest context event))
          ((note-grouping-event engraver event)
           (pondside-timing-row context "group" (pondside-timing-staff context)
             (if (= (ly:event-property event 'span-direction) START) "start" "stop"))))))

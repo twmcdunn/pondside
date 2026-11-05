@@ -15,6 +15,25 @@ renders `renders/score.mix.wav` (⌘⌥P).
 The reference for every block is docs/SUPERCOLLIDER.md in Pondside; the
 short version is skill://lilypond-supercollider, "The patch".
 
+
+## Performance initialization contract
+
+Preserve `pondside://patch-contract` on every edit (full documentation:
+`docs/SUPERCOLLIDER.md`, “Performance initialization contract”). The main
+`.scd` starts with a usage comment: execute its main block once, then call
+`~triggerCue.()` to fire live cues. A single main block sets `s.options`,
+reboots the server, and puts ALL preparation in `s.waitForBoot`: `~mode`
+(`\live` or `\mockup`, respecting `~pondsideMode`), dependency execution,
+buffer loads, buses, SynthDefs, Pbinds, cue functions and startup synths.
+Finish required asynchronous server preparation with `s.sync` before the
+ready signal. Never add another required setup block or loose setup lines.
+All sounds except the score mockup live in `patch/resources/` or
+`Platform.userAppSupportDir +/+ "sounds"`, including child directories;
+reference them through `~resources` / `~sharedSounds`. No Qt requirement in
+the exported performance patch. Keep the fast edit → patch_check → patch_note
+workflow: use supplied numbered context, read more only when necessary,
+and repeat checks only to resolve a failure or an audible problem.
+
 ## The loop
 
 1. `patch_audit` (score file) lists what is left: findings, and lines marked

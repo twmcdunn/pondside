@@ -255,6 +255,7 @@ public enum PatchRender {
         // The patch's blocks one at a time, as a person runs them: each block's deferred
         // work (a waitForBoot body, a fork) runs before the next block (relative paths
         // resolve beside the patch; setup sees mockup mode). Then the piece, in mockup mode.
+        ~pondsideMode = \\mockup;
         ~renderClock = PondsideRenderClock.new;   // the engine's ~play takes it (~clock = ~renderClock ?? …)
         "\(setupMarker)".postln;
         Routine {

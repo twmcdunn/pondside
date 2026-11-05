@@ -32,6 +32,37 @@ final class LensTests: XCTestCase {
         return try XCTUnwrap(Array(measures)[safe: target.measureIndex])
     }
 
+    func testSharedEmptyMeasureHasSelectableEntryAnchor() throws {
+        let original = "\\score { \\new Staff { \\time 4/4 c1 } }"
+        let files = [StructuralEditing.File(id: "score.ly", tree: SyntaxTree(original))]
+        let changes = try StructuralEditing.migrate(files, root: "score.ly", sharedBreaks: true)
+        let managed = changes.flatMap(\.edits).apply(to: original)
+            .replacingOccurrences(of: "c1", with: "s1*0")
+        let tree = SyntaxTree(managed)
+        let event = try XCTUnwrap(tree.events.indices.first { tree.string(tree.events[$0].range) == "s1*0" })
+        let window = try XCTUnwrap(LensScoreBuilder.build(tree: tree, selection: tree.events[event].range, structure: tree))
+        XCTAssertEqual(window.target?.sourceEvent, event)
+    }
+
+    func testLeftFromInsertionCursorSelectsItsAnchor() throws {
+        let window = try lens("{ c'4 d' e' }", at: "d'")
+        XCTAssertEqual(window.neighbor(-1, inserting: true), window.targetEvent)
+        XCTAssertEqual(window.neighbor(-1), 0)
+        XCTAssertEqual(window.neighbor(1, inserting: true), 2)
+    }
+
+    func testEmptyMeasureHasSelectableEntryAnchor() throws {
+        let text = "{ s1*0 }"
+        let tree = SyntaxTree(text)
+        let window = try lens(text, at: "s1*0")
+        let target = try XCTUnwrap(window.target)
+        XCTAssertEqual(tree.string(tree.events[target.sourceEvent].range), "s1*0")
+        let edit = try XCTUnwrap(ScoreEditor(tree).insert(step: 0, after: target.sourceEvent, duration: .quarter))
+        let result = edit.edits.apply(to: text)
+        XCTAssertTrue(result.contains("c'4"), result)
+        XCTAssertTrue(result.contains("s1*0"), result)
+    }
+
     func testInventionUpperAssignmentIsIsolated() throws {
         let text = try fixture("invention.ly")
         let window = try lens(text, at: "cis8 a'")

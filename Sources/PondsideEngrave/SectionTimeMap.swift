@@ -46,7 +46,9 @@ public struct SectionTimeMap: Sendable {
             return false
         }
         for row in log.rows {
-            guard case .note(let staff, _) = row.kind, let origin = row.origin else { continue }
+            let staff: String
+            switch row.kind { case .note(let name, _), .rest(let name): staff = name; default: continue }
+            guard let origin = row.origin else { continue }
             let position = SourcePosition(line: origin.line, character: origin.character)
             for (pageIndex, page) in pages.enumerated() {
                 let graphics = page.linkedGraphics(at: position).filter { g in

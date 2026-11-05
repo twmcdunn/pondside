@@ -141,6 +141,8 @@ public actor MCPServer {
         case "resources/list":
             let lex = lexicon()
             var list: [JSONValue] = [
+                ["uri": "pondside://patch-contract", "name": "Complete SuperCollider performance contract", "mimeType": "text/markdown"],
+                ["uri": .string(ScoreContract.uri), "name": "Complete .ly editing contract", "mimeType": "text/markdown"],
                 ["uri": "lexicon://index", "name": "Lexicon index", "mimeType": "application/json",
                  "description": "Tier 0: every entry's id, gloss, tags and param names, one line each"],
             ]
@@ -174,6 +176,8 @@ public actor MCPServer {
     }
 
     func readResource(_ uri: String) throws -> (String, String) {
+        if uri == "pondside://patch-contract" { return (PatchContract.documentation, "text/markdown") }
+        if uri == ScoreContract.uri { return (ScoreContract.documentation, "text/markdown") }
         let lex = lexicon()
         if uri == "lexicon://index" { return (lex.indexJSON(), "application/json") }
         if let skill = Self.skills.first(where: { $0.uri == uri }), let text = Self.skillText(skill) {
@@ -200,6 +204,8 @@ public actor MCPServer {
     /// What every client is told first. Short on purpose: the skills hold
     /// the detail, and the user wants terse, fast turns.
     static let instructions = """
+    \(ScoreContract.notice)
+    \(PatchContract.notice)
     Pondside scores are plain LilyPond files: read and edit them directly; the running app re-engraves on \
     every save. Be terse: act, then reply in one short line saying what changed ("Swell taller: peak \
     1.06 → 1.5."). No plans, recaps, options or offers; ask only when the score can't settle it.
@@ -226,6 +232,7 @@ public actor MCPServer {
 
     /// The patch agent's: short, the skill holds the detail.
     static let patchInstructions = """
+    \(PatchContract.notice)
     You are Pondside's patch agent: you change the score's SuperCollider patch (patch/<score>.scd and the \
     files it loads), never the .ly files. Be terse: act, then reply in one short line saying what changed \
     and how it sounds now ("Cue 12: reverb on the flute, mix 0.4 → 0.7; electronics −18 dBFS.").
@@ -279,7 +286,8 @@ public actor MCPServer {
     /// are relative to the skill, which an agent reaches only through us.
     static func skillText(_ s: Skill) -> String? {
         guard let dir = skillDirectory(s),
-              let text = try? String(contentsOf: dir.appendingPathComponent("SKILL.md"), encoding: .utf8) else { return nil }
+              let source = try? String(contentsOf: dir.appendingPathComponent("SKILL.md"), encoding: .utf8) else { return nil }
+        let text = source.contains(ScoreContract.uri) ? source : ScoreContract.notice + "\n\n" + source
         let files = (FileManager.default.subpaths(atPath: dir.path) ?? []).sorted().filter { path in
             path != "SKILL.md" && !path.hasPrefix(".") && !path.contains("/.")
                 && !((try? dir.appendingPathComponent(path).resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? true)
@@ -303,7 +311,7 @@ public actor MCPServer {
         var required: [String]
 
         var json: JSONValue {
-            ["name": .string(name), "description": .string(description),
+            ["name": .string(name), "description": .string(description + (["edit", "graphic_insert"].contains(name) ? " " + ScoreContract.notice : "") + (["edit", "patch_migrate", "sc_lexicon_add"].contains(name) ? " " + PatchContract.notice : "")),
              "inputSchema": ["type": "object", "properties": .object(properties),
                              "required": .array(required.map { .string($0) })]]
         }
@@ -612,8 +620,11 @@ public actor MCPServer {
             guard problems.isEmpty else {
                 throw ToolFailure(problems.map { "line \($0.line): \($0.message)" }.joined(separator: "\n"))
             }
+            let explicitRoot = try args["root"]?.string.map { try path(["file": .string($0)]) }
+            let contractRoot = try editingRoot(source: source, explicit: explicitRoot)
+            try ScoreContract.validateEdit(source: source, text: new, root: contractRoot)
             try Data(new.utf8).write(to: source, options: .atomic)
-            let root = try args["root"]?.string.map { try path(["file": .string($0)]) } ?? source
+            let root = contractRoot
             let include = try GraphicEdit.prepareLexiconInclude(root: root, lexicon: lexicon())
             let done = "Inserted \(id) in \(source.lastPathComponent); wrote \(include.lastPathComponent)."
             if let fromApp = await appCheck(root) { return done + " check:\n" + fromApp }
@@ -729,6 +740,22 @@ public actor MCPServer {
 
     // MARK: Editing
 
+    private func editingRoot(source: URL, explicit: URL?) throws -> URL {
+        let tree = SyntaxTree((try? String(contentsOf: source, encoding: .utf8)) ?? "")
+        if StructuralEditing.isManaged(tree) {
+            if let explicit, SourceGraph.canonical(explicit) != SourceGraph.canonical(source) {
+                throw ToolFailure("This file owns a managed contract: pass it as the root so its contract is checked; see pondside://contract.")
+            }
+            return source
+        }
+        if let explicit { return explicit }
+        if case .score(let root) = ProjectStructure.rootScore(in: project) { return root }
+        guard StructuralEditing.measures(in: tree).isEmpty else {
+            throw ToolFailure("Pass the root .ly path when editing a managed part so the complete contract can be checked; see pondside://contract.")
+        }
+        return source
+    }
+
     /// The `edit` tool: applies the edits, then for a score file returns
     /// the app's engraving of it (check), for a patch file a pointer to
     /// patch_check.
@@ -753,11 +780,34 @@ public actor MCPServer {
         let text = try String(contentsOf: source, encoding: .utf8)
         let (new, lines) = try FileEdit.apply(changes, to: text)
         guard new != text else { return "Nothing changed: the new text is the same as the old." }
-        try Data(new.utf8).write(to: source, options: .atomic)
+        let root = try args["root"]?.string.map { try path(["file": .string($0)]) }
+        if isScore {
+            let target = try editingRoot(source: source, explicit: root)
+            try ScoreContract.validateEdit(source: source, text: new, root: target)
+        }
+        if !isScore {
+            let scoreURL: URL?
+            if let root { scoreURL = root }
+            else if case .score(let score) = ProjectStructure.rootScore(in: project) { scoreURL = score }
+            else { scoreURL = nil }
+            if let scoreURL {
+                let configured = (try? ProjectConfig.find(from: scoreURL))?.handlers
+                let patch = PatchMigration.patchURL(score: scoreURL, configured: configured).standardizedFileURL
+                let main = source.standardizedFileURL == patch ? new : try String(contentsOf: patch, encoding: .utf8)
+                let normalized = PatchContract.consolidate(main, score: scoreURL.lastPathComponent)
+                var replacements = [source.standardizedFileURL: new]
+                replacements[patch] = normalized
+                try PatchContract.validateProject(patch: patch, overrides: replacements)
+                let revisions = try Dictionary(uniqueKeysWithValues: replacements.keys.map { ($0, ContentHash(bytes: try Data(contentsOf: $0))) })
+                try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements)
+                _ = try PatchMigration.ensureEngine(patch: patch, name: scoreURL.deletingPathExtension().lastPathComponent)
+            } else {
+                try Data(new.utf8).write(to: source, options: .atomic)
+            }
+        } else { try Data(new.utf8).write(to: source, options: .atomic) }
         let range = lines.count > 1 ? "lines \(lines.lowerBound)–\(lines.upperBound)" : "line \(lines.lowerBound)"
         let done = "Edited \(source.lastPathComponent), \(range)."
         guard isScore else { return done + " Call patch_check to hear it (renders the mix)." }
-        let root = try args["root"]?.string.map { try path(["file": .string($0)]) }
         if let fromApp = await appCheck(root ?? source) { return done + " check:\n" + fromApp }
         guard let target = root ?? (ext == "ly" ? source : nil) else {
             return done + " The app isn't open on this score: call check on the root .ly."
@@ -824,6 +874,7 @@ public actor MCPServer {
     func patchCheck(_ args: JSONValue) async throws -> String {
         let source = try path(args)
         let patch = try patchFile(for: source)
+        try PatchContract.validateProject(patch: patch)
         let config = try? ProjectConfig.find(from: source)
         let wav = HandlerSync.Layout.mockup(score: source)
         guard FileManager.default.fileExists(atPath: wav.path) else { return "No mockup yet (\(wav.lastPathComponent)): the app writes it after an engraving." }

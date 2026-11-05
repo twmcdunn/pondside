@@ -1,9 +1,10 @@
 import Foundation
+import PondsideTiming
 
 /// One agent conversation that lasts across requests, so a follow-up
-/// ("taller", "no, the other one") has the earlier ones in context. Both
-/// agents run as one process kept open between requests, and compact the
-/// conversation themselves when it grows long, so it never has to restart.
+/// ("taller", "no, the other one") has the earlier ones in context.
+/// Claude Code and opencode keep a process open; Codex resumes its explicit
+/// thread ID with a fresh exec per turn. Each retains its conversation.
 ///
 /// Claude Code: `claude -p --input-format stream-json`; each request is a
 /// message on its stdin, each answer ends with a `result` event.
@@ -25,6 +26,7 @@ public final class AgentSession: @unchecked Sendable {
     private let pondside: String
     private let lock = NSLock()
 
+    private var codexHandle: AgentRun.Handle?
     private var process: Process?
     private var input: FileHandle?
     private var pending: ((AgentRun.Outcome) -> Void)?
@@ -84,9 +86,11 @@ public final class AgentSession: @unchecked Sendable {
         // A stopped request stays in the agent's history unanswered; without
         // this the agent carries it on in the next turn.
         let wasStopped = locked { () -> Bool in defer { stopped = false }; return stopped }
-        let prompt = wasStopped ? "(The user stopped the previous request: drop it, don't carry it on.)\n\n" + prompt : prompt
+        let requestPrompt = (role == .graphics ? ScoreContract.notice : PatchContract.notice) + "\n\n" + prompt
+        let prompt = wasStopped ? "(The user stopped the previous request: drop it, don't carry it on.)\n\n" + requestPrompt : requestPrompt
         let outcome: AgentRun.Outcome
         switch agent.harness {
+        case .codex: outcome = await sendToCodex(prompt, onActivity: onActivity)
         case .claude: outcome = await sendToClaude(prompt, onActivity: onActivity)
         case .opencode: outcome = await sendToOpencode(prompt, onActivity: onActivity)
         }
@@ -100,9 +104,10 @@ public final class AgentSession: @unchecked Sendable {
     /// running; Claude's process is ended.
     public func interrupt() {
         lock.lock()
-        let p = process, id = sessionID, isReady = ready
+        let p = process, id = sessionID, isReady = ready, codex = codexHandle
         stopped = true
         lock.unlock()
+        codex?.stop()
         if agent.harness == .opencode, isReady, let id {
             notify("session/cancel", ["sessionId": id])
         } else {
@@ -113,7 +118,8 @@ public final class AgentSession: @unchecked Sendable {
     /// Ends the process (idle, window closed); the conversation can resume.
     public func close() {
         lock.lock()
-        let p = process, stdin = input
+        let p = process, stdin = input, codex = codexHandle
+        codexHandle = nil
         process = nil
         input = nil
         ready = false
@@ -124,6 +130,7 @@ public final class AgentSession: @unchecked Sendable {
         lock.unlock()
         for k in waiting.values { k(.failure(AgentError("\(agent.harness.title) stopped"))) }
         if p != nil { AgentLog.Run(kind: .graphics, id: "session").log("close", "\(agent.harness.title)'s session process closed", level: .debug) }
+        codex?.stop()
         // End of input ends either process cleanly; terminate in case it doesn't.
         try? stdin?.close()
         p?.terminate()
@@ -148,6 +155,28 @@ public final class AgentSession: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return f()
+    }
+
+    private func sendToCodex(_ prompt: String, onActivity: (@Sendable (String) -> Void)?) async -> AgentRun.Outcome {
+        let handle = AgentRun.Handle()
+        let state = locked { () -> (String?, AgentLog.Run?, Bool) in
+            guard codexHandle == nil else { return (nil, log, false) }
+            codexHandle = handle
+            return (sessionID, log, true)
+        }
+        guard state.2 else { return .init(summary: "Codex is already working.", failed: true, costUSD: nil) }
+        let outcome: AgentRun.Outcome
+        do {
+            outcome = try await agent.run(prompt: prompt, folder: folder, pondside: pondside, handle: handle,
+                                          session: state.0, log: state.1, role: role, onActivity: onActivity)
+        } catch { outcome = .init(summary: "Codex didn't start: \(error.localizedDescription)", failed: true, costUSD: nil) }
+        locked {
+            if codexHandle === handle {
+                sessionID = outcome.sessionID ?? sessionID
+                codexHandle = nil
+            }
+        }
+        return outcome
     }
 
     // MARK: The process
@@ -216,6 +245,7 @@ public final class AgentSession: @unchecked Sendable {
             switch agent.harness {
             case .claude: claudeLine(line)
             case .opencode: acpLine(line)
+            case .codex: break // exec streams are handled by AgentRun.
             }
         }
     }

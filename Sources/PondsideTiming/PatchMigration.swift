@@ -13,7 +13,7 @@ public enum PatchMigration {
     public struct Finding: Sendable, Hashable, Codable {
         public enum Kind: String, Sendable, Hashable, Codable, CaseIterable {
             // done by `migrate`
-            case notAPatch, location, quark, engine, collision, soundIn
+            case notAPatch, location, quark, engine, collision, soundIn, initialization
             // left for a person or an agent
             case loose, timeline, clock, gui, trigger, input, recording, engineName, pipeline, ideOnly
         }
@@ -26,7 +26,7 @@ public enum PatchMigration {
         public var message: String
         public var automatic: Bool { Self.automaticKinds.contains(kind) }
 
-        static let automaticKinds: Set<Kind> = [.notAPatch, .location, .quark, .engine, .collision, .soundIn]
+        static let automaticKinds: Set<Kind> = [.notAPatch, .location, .quark, .engine, .collision, .soundIn, .initialization]
 
         public init(_ kind: Kind, line: Int?, _ message: String, file: String? = nil) {
             self.kind = kind
@@ -157,6 +157,9 @@ public enum PatchMigration {
         for r in src.soundInZero {
             out.append(Finding(.soundIn, line: src.line(r.lowerBound),
                                "SoundIn.ar(0) becomes In.ar(~live): the mockup in mockup mode, input 0 live"))
+        }
+        if src.isPatch, PatchContract.mainBlock(in: text) == nil {
+            out.append(Finding(.initialization, line: nil, "Prepare performance in one main block: options, reboot, waitForBoot, dependencies, sounds, definitions and cue handlers."))
         }
         return out + manual(src)
     }
@@ -320,6 +323,7 @@ public enum PatchMigration {
             """
         }
         if let sheet { t = HandlerSync.sync(t, with: sheet).text }
+        t = PatchContract.consolidate(t, score: score)
 
         let pending = manual(Source(t))
         if !pending.isEmpty, !t.contains("\n// Lines marked \(note)") {
@@ -642,7 +646,8 @@ public enum PatchMigration {
                 let lit = String(text(code[k].range).dropFirst().dropLast())
                 func word(_ i: Int) -> String { i < code.count && i >= 0 ? text(code[i].range) : "" }
                 if word(k + 1) == ".", word(k + 2) == "resolveRelative", word(k + 3) == ".", word(k + 4) == "load" { return lit }
-                if word(k + 1) == ".", word(k + 2) == "loadRelative" { return lit }
+                if word(k + 1) == ".", ["loadRelative", "load"].contains(word(k + 2)) { return lit }
+                if word(k + 1) == ")", word(k + 2) == ".", word(k + 3) == "load", word(k - 1) == "+", word(k - 2) == "/", word(k - 3) == "+", word(k - 4) == "patchFolder" { return lit }
                 if word(k - 1) == "(", word(k - 2) == "load" { return lit }
                 return nil
             }

@@ -10,6 +10,25 @@ words about the electronics there. The `.ly` files are not yours (the score
 agent edits them); `dependencies/pondside.scd` and `dependencies/sc-lexicon.scd`
 are Pondside's. You change the patch: `patch/<score>.scd` and the files it loads.
 
+
+## Performance initialization contract
+
+Preserve `pondside://patch-contract` on every edit (full documentation:
+`docs/SUPERCOLLIDER.md`, “Performance initialization contract”). The main
+`.scd` starts with a usage comment: execute its main block once, then call
+`~triggerCue.()` to fire live cues. A single main block sets `s.options`,
+reboots the server, and puts ALL preparation in `s.waitForBoot`: `~mode`
+(`\live` or `\mockup`, respecting `~pondsideMode`), dependency execution,
+buffer loads, buses, SynthDefs, Pbinds, cue functions and startup synths.
+Finish required asynchronous server preparation with `s.sync` before the
+ready signal. Never add another required setup block or loose setup lines.
+All sounds except the score mockup live in `patch/resources/` or
+`Platform.userAppSupportDir +/+ "sounds"`, including child directories;
+reference them through `~resources` / `~sharedSounds`. No Qt requirement in
+the exported performance patch. Keep the fast edit → patch_check → patch_note
+workflow: use supplied numbered context, read more only when necessary,
+and repeat checks only to resolve a failure or an audible problem.
+
 ## The fast path (3 calls)
 
 1. One `edit` of the handler (or what it touches), by `from_line`/`to_line` or
@@ -56,7 +75,7 @@ score seconds, so the wait lands on the click's time.
   an environment variable (`~verb = Synth(…)`, `~cloud = Pbind(…).play`) so a
   later cue can change or stop it (`~verb.set(\mix, 0.8)`, `~cloud.stop`,
   `~verb.release(4)`). Name it in the note.
-- **Setup** (SynthDefs, buffers, buses) goes in the patch's setup blocks, not in
+- **Setup** (SynthDefs, buffers, buses) goes inside the main block's waitForBoot preparation, not in
   a handler; a SynthDef added in a handler may not exist on the server when the
   handler's first note plays.
 - Effects on the performer read `~live` (a mono bus: the mockup, or the mic

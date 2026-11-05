@@ -27,6 +27,7 @@ public enum InputAction: Hashable, Sendable {
     /// Apply to the selection (if any) and arm for the next inserted note.
     case setDuration(DurationValue)
     case toggleDot
+    case toggleAccidental(Int)
     case insertNote(step: Int)
     case insertRest
     case delete
@@ -35,6 +36,7 @@ public enum InputAction: Hashable, Sendable {
     case clearSelection
     case editSource
     case toggleSystemBreak
+    case togglePageBreak
     /// The pending input buffer changed (shown in the status line).
     case buffer(String)
 }
@@ -44,14 +46,15 @@ public enum InputAction: Hashable, Sendable {
 ///
 /// | keys | effect |
 /// |---|---|
-/// | `a`–`g` (`h`) | insert that note after the selection, nearest octave, key's accidental |
+/// | `a`–`g` (`h`) | insert that note after the selection, nearest octave, current measure's accidental |
 /// | `r` | insert a rest |
 /// | `1 2 4 8 16 32 64 128` | duration, as in LilyPond; applies to the selection and arms the next note |
 /// | `.` | toggle dot |
 /// | `↑` `↓` | diatonic step · `⇧` octave · `⌥` chromatic |
 /// | `←` `→` | previous / next object · `⇧` extends |
 /// | `( ) ~ [ ]` | slur, tie, beam: toggled on the selection |
-/// | `-.` `->` `^-` `_1` … | articulations and fingerings, exactly as typed in LilyPond |
+/// | `=`, `-`, `0` | visible sharp, flat, natural: toggle selection or arm next note |
+/// | `^.` `^>` `^-` `_1` … | directed articulations and fingerings |
 /// | `\trill⏎` | any post-event command, typed as in LilyPond |
 /// | `⌫` | delete · `⎋` cancel / deselect / disarm · `⏎` edit in source |
 ///
@@ -109,14 +112,14 @@ public struct NoteInput: Sendable {
             }
         }
 
-        if direction == nil, case .character(let c) = input.key, ["+", "-", "0"].contains(c) {
-            let value = c == "+" ? 2 : (c == "-" ? -2 : 0)
+        if direction == nil, case .character(let c) = input.key, ["=", "-", "0"].contains(c) {
+            let value = c == "=" ? 2 : (c == "-" ? -2 : 0)
             armedAccidental = armedAccidental == value ? nil : value
             digits = ""
-            return [.buffer(bufferText)]
+            return [.toggleAccidental(value), .buffer("")]
         }
 
-        // Direction prefix: - ^ _ then a shorthand, a digit, or a command.
+        // Direction prefix: ^ or _ then a shorthand, a digit, or a command.
         if let dir = direction {
             if case .character(let c) = input.key {
                 if ".->^+!_".contains(c) {
@@ -152,7 +155,7 @@ public struct NoteInput: Sendable {
             return [.clearSelection]
         case .enter:
             digits = ""
-            return [.toggleSystemBreak]
+            return [input.shift ? .togglePageBreak : .toggleSystemBreak]
         case .character(let c):
             return handleCharacter(c, now: now)
         }

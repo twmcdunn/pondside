@@ -47,10 +47,19 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
 
     func application(_ application: NSApplication, open urls: [URL]) {
         openedFromLaunch = true
-        urls.forEach { self.open($0) }
+        urls.forEach { self.openFromFinder($0) }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard controllers.contains(where: \.hasPendingNoteInput) else { return .terminateNow }
+        Task { @MainActor in
+            for controller in self.controllers { await controller.flushPendingNoteInput() }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         AppRPC.shared.stop()
@@ -63,6 +72,25 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     }
 
     // MARK: Opening
+
+    private func openFromFinder(_ url: URL) {
+        guard url.pathExtension.lowercased() == "ly" else { open(url); return }
+        let folder = url.standardizedFileURL.deletingLastPathComponent()
+        if ProjectStructure.isProjectRoot(folder) {
+            open(folder)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Make \(folder.lastPathComponent) a Pondside project?"
+        alert.informativeText = "Pondside will use this folder as the project root, keep \(url.lastPathComponent) as its score, and add pondside.toml, patch/ and renders/."
+        alert.addButton(withTitle: "Create Project")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try ProjectStructure.adopt(score: url.standardizedFileURL)
+            open(folder)
+        } catch { _ = NSAlert(error: error).runModal() }
+    }
 
     /// Opens a project: its root folder, or a score in it. Every project
     /// gets the same structure (ProjectStructure) before its score opens.
@@ -259,9 +287,9 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             center.menuItem("edit.undo", action: Selector(("undo:"))),
             center.menuItem("edit.redo", action: Selector(("redo:"))),
             .separator(),
-            item("Cut", #selector(NSText.cut(_:)), "x"),
-            item("Copy", #selector(NSText.copy(_:)), "c"),
-            item("Paste", #selector(NSText.paste(_:)), "v"),
+            center.menuItem("edit.cut", action: #selector(NSText.cut(_:))),
+            center.menuItem("edit.copy", action: #selector(NSText.copy(_:))),
+            center.menuItem("edit.paste", action: #selector(NSText.paste(_:))),
             center.menuItem("edit.selectAll", action: #selector(NSText.selectAll(_:))),
             .separator(),
             center.menuItem("edit.find", action: #selector(NSTextView.performFindPanelAction(_:)))
@@ -270,6 +298,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             command("edit.delete"),
             command("edit.source"),
             .separator(),
+            command("edit.generalAgent"),
             command("edit.stopAgent"),
             command("edit.undoAgent"),
             command("edit.newAgentConversation"),

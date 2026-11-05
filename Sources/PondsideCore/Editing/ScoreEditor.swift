@@ -71,7 +71,10 @@ public struct ScoreEditor: Sendable {
             }
         }
         guard !changes.isEmpty else { return nil }
-        let edits = rewritePitches(changes)
+        var edits = rewritePitches(changes)
+        if case .chromatic = move {
+            edits += targets.compactMap { notes[$0].accidentalMark.map { TextEdit($0, "") } }
+        }
         let name: String
         switch move {
         case .step: name = "Move Pitch"
@@ -131,6 +134,101 @@ public struct ScoreEditor: Sendable {
             }
         }
         return edits
+    }
+
+    /// Toggle the requested visible glyph. Removing it restores the pitch
+    /// inherited from the key/earlier notes, so an automatic glyph cannot
+    /// immediately reappear. Explicit additions use LilyPond's force mark.
+    public func toggleAccidental(_ alteration: Int, events selected: [Int], extraNotes: [Int] = [],
+                                 structure: SyntaxTree? = nil) -> ScoreEdit? {
+        guard [-2, 0, 2].contains(alteration) else { return nil }
+        var targets = Set(extraNotes)
+        for event in selected { targets.formUnion(events[event].notes) }
+        targets = targets.filter { notes[$0].role == .event }
+        guard !targets.isEmpty else { return nil }
+        let authority = structure ?? tree
+        let shared = StructuralEditing.isManaged(authority) ? StructuralEditing.times(in: authority) : [:]
+        var timelines: [LensBlock: LensTimeline] = [:]
+        var changes: [Int: Pitch] = [:]
+        var marks: [TextEdit] = []
+        for index in targets.sorted() {
+            let note = notes[index]
+            guard let event = note.event, let block = LensBlockFinder.block(in: tree, at: note.name.lowerBound) else { continue }
+            if timelines[block] == nil {
+                var context = LensContextScanner.scan(tree, block: block.context)
+                for measure in StructuralEditing.measures(in: tree) where block.range.contains(measure.invocation.lowerBound) {
+                    if let time = shared[measure.name] {
+                        context.times.append((measure.invocation.lowerBound, time))
+                        context.managedMeasures.append((measure.body, time))
+                    }
+                }
+                context.times.sort { $0.offset < $1.offset }
+                timelines[block] = LensTimeline(tree: tree, block: block, context: &context)
+            }
+            guard let timeline = timelines[block], let current = timeline.events.first(where: { $0.sourceEvent == event }) else { continue }
+            let prior = timeline.events.filter { $0.voiceIndex == current.voiceIndex && $0.sourceOffset < current.sourceOffset }.sorted { $0.sourceOffset < $1.sourceOffset }
+            var key = current.key
+            var inherited = key.alteration(for: note.absolute.step)
+            var replacementInherited = inherited
+            for previous in prior where previous.measureIndex == current.measureIndex {
+                if previous.key != key { key = previous.key; inherited = key.alteration(for: note.absolute.step); replacementInherited = inherited }
+                for old in previous.notes where notes[old].absolute.step == note.absolute.step && notes[old].absolute.octave == note.absolute.octave {
+                    inherited = notes[old].absolute.alteration
+                    replacementInherited = changes[old]?.alteration ?? inherited
+                }
+            }
+            if key != current.key { inherited = current.key.alteration(for: note.absolute.step); replacementInherited = inherited }
+            let tied = prior.last.map { previous in
+                events[previous.sourceEvent].postEvents.contains { tree.string($0) == "~" }
+                    && previous.notes.contains { notes[$0].absolute == note.absolute }
+            } ?? false
+            let visible = note.accidentalMark != nil || (!tied && note.absolute.alteration != inherited)
+            let remove = note.absolute.alteration == alteration && visible
+            changes[index] = Pitch(step: note.absolute.step, alteration: remove ? replacementInherited : alteration, octave: note.absolute.octave)
+            marks.append(TextEdit(note.accidentalMark ?? (note.spelledRange.upperBound..<note.spelledRange.upperBound), remove ? "" : "!"))
+        }
+        guard !changes.isEmpty else { return nil }
+        let edits = rewritePitches(changes) + marks.filter { !$0.range.isEmpty || !$0.replacement.isEmpty }
+        return ScoreEdit(name: "Toggle Accidental", edits: edits, selectionAnchors: anchorsAfter(edits, events: selected))
+    }
+
+    /// Unarmed entry spells the pitch already in effect at the insertion
+    /// point. Managed wrappers define the bar even while unmetered entry
+    /// extends it; ordinary source uses the lens's rhythmic/voice timeline.
+    private func entryAccidental(step: Int, octave: Int, after anchor: Int, at offset: Int) -> Int {
+        let event = events[anchor]
+        guard let block = LensBlockFinder.block(in: tree, at: event.range.lowerBound) else {
+            return event.key.alteration(for: step)
+        }
+        let prior: [Int]
+        if let measure = StructuralEditing.measures(in: tree).first(where: { $0.body.lowerBound <= offset && offset <= $0.body.upperBound }) {
+            prior = block.events.filter { measure.body.contains(events[$0].range.lowerBound) && events[$0].range.upperBound <= offset }
+        } else {
+            // An insertion before the next wrapper's music must not inherit
+            // an accidental from the previous wrapper or a sibling voice.
+            var scan = LensContextScanner.scan(tree, block: block.context)
+            let timeline = LensTimeline(tree: tree, block: block, context: &scan)
+            guard let current = timeline.events.first(where: { $0.sourceEvent == anchor }) else {
+                return event.key.alteration(for: step)
+            }
+            let position = current.onset + current.duration
+            guard let measure = timeline.starts.lastIndex(where: { $0 <= position }),
+                  position < timeline.starts[measure] + timeline.lengths[measure] else {
+                return event.key.alteration(for: step)
+            }
+            prior = timeline.events.filter {
+                $0.voiceIndex == current.voiceIndex && $0.measureIndex == measure && $0.sourceOffset < offset
+            }.map(\.sourceEvent)
+        }
+        var key = event.key
+        var alteration = key.alteration(for: step)
+        for index in prior {
+            if events[index].key != key { key = events[index].key; alteration = key.alteration(for: step) }
+            for note in events[index].notes where notes[note].absolute.step == step && notes[note].absolute.octave == octave {
+                alteration = notes[note].absolute.alteration
+            }
+        }
+        return key == event.key ? alteration : event.key.alteration(for: step)
     }
 
     // MARK: Duration
@@ -305,7 +403,7 @@ public struct ScoreEditor: Sendable {
     // MARK: Insert and delete
 
     /// Inserts a note (step 0…6, or nil for a rest) after `event`, choosing
-    /// the octave nearest the previous pitch and the key's accidental.
+    /// the octave nearest the previous pitch and the accidental in effect in the measure.
     /// `duration` is the armed duration; nil means "inherit". An explicit
     /// `octave` (mouse entry: the clicked staff position) overrides the
     /// nearest-octave choice.
@@ -324,7 +422,6 @@ public struct ScoreEditor: Sendable {
         var noteText: String
         var inserted: Pitch?
         if let step {
-            let alteration = accidental ?? ev.key.alteration(for: step)
             let previous = ev.notes.first.map { notes[$0].absolute } ?? lastPitch(before: ev.range.upperBound)
             let reference = ev.chainRefAfter.map { notes[$0].absolute }
             let octave: Int
@@ -335,10 +432,12 @@ public struct ScoreEditor: Sendable {
             } else {
                 octave = OctaveRules.nearestOctave(step: step, to: previous ?? Pitch(step: 0, octave: 1))
             }
+            let alteration = accidental ?? entryAccidental(step: step, octave: octave, after: eventIndex, at: at)
             let pitch = Pitch(step: step, alteration: alteration, octave: octave)
             inserted = pitch
             let marks = OctaveRules.marks(for: pitch, mode: ev.octaveMode, reference: reference)
             noteText = ev.language.spell(step: step, alteration: alteration) + OctaveRules.markText(marks)
+                + (accidental == nil ? "" : "!")
         } else {
             noteText = "r"
         }

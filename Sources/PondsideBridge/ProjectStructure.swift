@@ -1,4 +1,5 @@
 import Foundation
+import PondsideCore
 import PondsideEngrave
 import PondsideTiming
 import PondsideLexicon
@@ -25,6 +26,35 @@ public enum ProjectStructure {
         case none
         /// Several candidates, none of them clearly the root.
         case ambiguous([URL])
+
+        public static func == (lhs: RootScore, rhs: RootScore) -> Bool {
+            func canonical(_ url: URL) -> String { url.resolvingSymlinksInPath().standardizedFileURL.path }
+            switch (lhs, rhs) {
+            case let (.score(a), .score(b)): return canonical(a) == canonical(b)
+            case let (.ambiguous(a), .ambiguous(b)): return a.map(canonical) == b.map(canonical)
+            case (.none, .none): return true
+            default: return false
+            }
+        }
+    }
+
+    /// Existing projects may predate pondside.toml; recognize their layout too.
+    public static func isProjectRoot(_ folder: URL) -> Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: folder.appendingPathComponent(ProjectConfig.fileName).path) { return true }
+        return ["patch", "renders"].allSatisfy { name in
+            var directory: ObjCBool = false
+            return fm.fileExists(atPath: folder.appendingPathComponent(name).path, isDirectory: &directory) && directory.boolValue
+        }
+    }
+
+    /// Adopt an existing score without replacing any of its music.
+    public static func adopt(score: URL) throws {
+        let folder = score.deletingLastPathComponent()
+        let config = folder.appendingPathComponent(ProjectConfig.fileName)
+        let text = (try? String(contentsOf: config, encoding: .utf8)) ?? ""
+        try Data(settingScore(score.lastPathComponent, in: text).utf8).write(to: config, options: .atomic)
+        _ = ensure(score: score)
     }
 
     /// The score a project root opens: pondside.toml's `[project] score`;
@@ -57,12 +87,13 @@ public enum ProjectStructure {
 
     /// A new score: `\version`, the Lexicon include, a title and a bar.
     public static func template(title: String) -> String {
-        """
+        let escapedTitle = title.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\r", with: " ")
+        let text = """
         \\version "2.26.0"
         \\include "lexicon.ily"
 
         \\header {
-          title = "\(title.replacingOccurrences(of: "\"", with: "\\\""))"
+          title = "\(escapedTitle)"
         }
 
         \\relative c' {
@@ -71,6 +102,11 @@ public enum ProjectStructure {
         }
 
         """
+        let files = [StructuralEditing.File(id: "score.ly", tree: SyntaxTree(text))]
+        // This built-in, complete musical stream is validated by the same
+        // portable migration as imported scores before any file is written.
+        let changes = try! StructuralEditing.migrate(files, root: "score.ly", sharedBreaks: true)
+        return changes.flatMap(\.edits).apply(to: text)
     }
 
     /// Makes `folder` a new project root holding `<folder name>.ly` (the

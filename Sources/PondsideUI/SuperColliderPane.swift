@@ -34,6 +34,7 @@ final class SuperColliderPane: NSView, NSTextViewDelegate {
     private(set) var fileURL: URL
     private var watcher: FileWatcher?
     private var undo = UndoManager()
+    private var drafts: [URL: String] = [:]
     private var lastWritten: String?
     private var saveTask: Task<Void, Never>?
     private var loading = false
@@ -83,19 +84,18 @@ final class SuperColliderPane: NSView, NSTextViewDelegate {
         return scdFiles(near: score).first { !$0.lastPathComponent.hasSuffix(".before-pondside.scd") } ?? patch
     }
 
-    /// .scd files in the score's folder and its immediate subfolders.
+    /// Every project .scd file, with packages and hidden tooling excluded.
     static func scdFiles(near score: URL) -> [URL] {
         let fm = FileManager.default
-        let dir = score.deletingLastPathComponent()
-        var out: [URL] = []
-        for u in (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey], options: .skipsHiddenFiles)) ?? [] {
-            if u.pathExtension == "scd" { out.append(u) }
-            else if (try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                out += ((try? fm.contentsOfDirectory(at: u, includingPropertiesForKeys: nil, options: .skipsHiddenFiles)) ?? [])
-                    .filter { $0.pathExtension == "scd" }
-            }
-        }
-        return out.sorted { $0.path < $1.path }
+        guard let entries = fm.enumerator(at: score.deletingLastPathComponent(),
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+        return entries.compactMap { item -> URL? in
+            guard let url = item as? URL, url.pathExtension.lowercased() == "scd",
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { return nil }
+            return url
+        }.sorted { $0.path < $1.path }
     }
 
     func open(_ url: URL) {
@@ -106,7 +106,7 @@ final class SuperColliderPane: NSView, NSTextViewDelegate {
         let text = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
         lastWritten = FileManager.default.fileExists(atPath: fileURL.path) ? text : nil
         loading = true
-        editor.load(text)
+        editor.load(drafts[fileURL] ?? text)
         loading = false
         let w = FileWatcher(url: fileURL) { [weak self] change in
             Task { @MainActor in self?.diskChanged(change.text) }
@@ -186,12 +186,18 @@ final class SuperColliderPane: NSView, NSTextViewDelegate {
         let text = editor.string
         guard text != lastWritten, !(lastWritten == nil && text.isEmpty) else { return }
         do {
+            let main = Self.initialFile(for: scoreURL)
+            if let existing = try? String(contentsOf: main, encoding: .utf8), existing.contains(PatchContract.marker) {
+                try PatchContract.validateProject(patch: main, overrides: [fileURL.standardizedFileURL: text])
+            }
             watcher?.noteOwnWrite(text)
             try text.write(to: fileURL, atomically: true, encoding: .utf8)
             if lastWritten == nil { rebuildFileMenu() }
             lastWritten = text
+            drafts.removeValue(forKey: fileURL)
         } catch {
-            flash?("Couldn't save \(fileURL.lastPathComponent): \(error.localizedDescription)")
+            drafts[fileURL] = text
+            flash?("Patch draft retained in editor: \(error)")
         }
     }
 

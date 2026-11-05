@@ -158,3 +158,14 @@ final class CollectionsTests: XCTestCase {
         """)
     }
 }
+
+final class RestTimingTests: XCTestCase {
+    func testRestRowsKeepTheirSourceAndNeverBecomePitchCollections() {
+        let log = TimingLog(parsing: "PONDSIDE-TIMING\t1/2\t2\t@0\trest\tflute\t/score/flute.ily\t12\t4\n", prefix: "PONDSIDE-TIMING\t")
+        XCTAssertEqual(log.rows.count, 1)
+        XCTAssertEqual(log.rows.first?.kind, .rest(staff: "flute"))
+        XCTAssertEqual(log.rows.first?.origin?.line, 12)
+        XCTAssertEqual(log.rows.first?.origin?.character, 4)
+        XCTAssertTrue(log.collections(staff: "flute").isEmpty)
+    }
+}

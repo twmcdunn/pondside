@@ -36,6 +36,9 @@ final class ScoreSetupModel: ObservableObject {
     @Published var fileNames: [String] = []
     @Published var header: [String: EngravingSettingsDocument.HeaderField] = [:]
     @Published var sections: Set<FrontMatter.Section> = []
+    @Published var performanceDownload: String?
+    @Published var printsPerformanceDownload = false
+    var onPerformanceDownload: (Bool) -> Void = { _ in }
     @Published var notesHeading = ""
     /// nil: the notes hold markup of the user's own.
     @Published var paragraphs: [String]? = []
@@ -284,6 +287,12 @@ private struct CoverPage: View {
             } footer: {
                 Text("A page of its own before the score, laid out from these fields. Title, subtitle, composer and dedication also head the score’s first page.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if let address = model.performanceDownload {
+                Section("Performance App") {
+                    Toggle("Print download link on the cover", isOn: Binding(get: { model.printsPerformanceDownload }, set: { model.onPerformanceDownload($0) }))
+                    Text(address).font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                }
             }
             Section("Header") {
                 ForEach(FrontMatter.headerFields, id: \.key) { field in

@@ -47,7 +47,7 @@ targets += [
                                                .product(name: "SheetMusicMusicXML", package: "swift-sheet-music"),
                                                .product(name: "SheetMusicLayout", package: "swift-sheet-music"),
                                                .product(name: "SheetMusicLayoutApple", package: "swift-sheet-music"),
-                                               .product(name: "SheetMusicUI", package: "swift-sheet-music")]),
+                                               .product(name: "SheetMusicUI", package: "swift-sheet-music")], resources: [.copy("Performance")]),
     .executableTarget(name: "PondsideApp", dependencies: ["PondsideUI"]),
 ]
 #endif

@@ -44,6 +44,8 @@ public struct NoteInfo: Sendable, Hashable {
     public var name: Range<Int>
     /// The octave marks; empty (at `name.upperBound`) when there are none.
     public var marks: Range<Int>
+    /// Explicit `!` or cautionary `?` accidental display mark.
+    public var accidentalMark: Range<Int>?
     /// `='` octave check, if any.
     public var octaveCheck: Range<Int>?
     public var writtenStep: Int

@@ -18,6 +18,11 @@ struct LensAnchor {
 protocol NotationLensSession: AnyObject {
     var isOpen: Bool { get }
     var unmetered: Bool { get set }
+    var enteringNotes: Bool { get set }
+    var armedDuration: String { get set }
+    var armedAccidental: Int? { get set }
+    var onSelectEvent: ((Int, Bool) -> Void)? { get set }
+    func showFeedback(_ message: String)
     var onClose: (() -> Void)? { get set }
     var onFailure: ((String) -> Void)? { get set }
     /// The mode bar was clicked: open that lens instead.

@@ -107,7 +107,7 @@ struct LensContext: Sendable {
 }
 
 enum LensContextScanner {
-    private struct Leaf {
+    struct Leaf {
         var kind: SyntaxKind
         var range: Range<Int>
         var text: String
@@ -146,7 +146,7 @@ enum LensContextScanner {
     ]
 
     /// Whole-file facts every scan needs, gathered once.
-    private struct Source {
+    struct Source {
         var tree: SyntaxTree
         var leaves: [Leaf] = []
         var variables: [String: Range<Int>]
@@ -180,6 +180,12 @@ enum LensContextScanner {
     static func scan(_ tree: SyntaxTree, block: Range<Int>) -> LensContext {
         var context = LensContext()
         scan(Source(tree), range: block, at: nil, into: &context, depth: 0)
+        return context
+    }
+
+    static func scan(_ source: Source, block: Range<Int>) -> LensContext {
+        var context = LensContext()
+        scan(source, range: block, at: nil, into: &context, depth: 0)
         return context
     }
 

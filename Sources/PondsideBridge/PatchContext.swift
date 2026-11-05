@@ -1,5 +1,6 @@
 import Foundation
 import PondsideCore
+import PondsideEngrave
 import PondsideLexicon
 import PondsideTiming
 
@@ -183,12 +184,17 @@ public enum PatchContext {
             throw MCPServer.ToolFailure("no SuperCollider Lexicon entry \(unknown.joined(separator: ", ")); the entries: \(lexicon.ids.joined(separator: " "))")
         }
         let all = lexicon.closure(existing + ids.filter { !existing.contains($0) })
-        try FileManager.default.createDirectory(at: include.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data(lexicon.includeFile(for: all).utf8).write(to: include, options: .atomic)
         let text = try String(contentsOf: patch, encoding: .utf8)
-        let with = SCLexiconInclude.withLoadLine(text)
+        let normalized = PatchContract.consolidate(text, score: patch.deletingPathExtension().lastPathComponent + ".ly")
+        let with = SCLexiconInclude.withLoadLine(normalized)
+        let includeText = lexicon.includeFile(for: all)
+        let patchURL = patch.standardizedFileURL, includeURL = include.standardizedFileURL
+        try PatchContract.validateProject(patch: patchURL, overrides: [patchURL: with, includeURL: includeText])
+        try FileManager.default.createDirectory(at: include.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if !FileManager.default.fileExists(atPath: include.path) { try Data().write(to: include, options: .withoutOverwriting) }
+        let revisions = try Dictionary(uniqueKeysWithValues: [patchURL, includeURL].map { ($0, ContentHash(bytes: try Data(contentsOf: $0))) })
+        try ProjectSourceTransaction.replace(expected: revisions, replacements: [patchURL: with, includeURL: includeText])
         guard with != text else { return (all, nil) }
-        try Data(with.utf8).write(to: patch, options: .atomic)
         let line = with.components(separatedBy: "\n").firstIndex { $0.hasPrefix(SCLexiconInclude.loadLine) }.map { $0 + 1 }
         return (all, line)
     }

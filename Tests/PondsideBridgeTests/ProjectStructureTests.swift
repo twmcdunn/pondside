@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 import PondsideLexicon
+import PondsideCore
 @testable import PondsideBridge
 
 /// Every project root gets the same structure, and a folder resolves to
@@ -25,12 +26,26 @@ final class ProjectStructureTests: XCTestCase {
     static let layout = ["piece.ly", "lexicon.ily", "renders", "patch/piece.scd", "patch/dependencies/pondside.scd", "patch/resources",
                          ".mcp.json", "opencode.json", ".codex/config.toml"]
 
+    func testAdoptsExistingScoreWithoutChangingMusic() throws {
+        let dir = try temp()
+        try write("{ c'1 }", dir, "original.ly")
+        XCTAssertFalse(ProjectStructure.isProjectRoot(dir))
+        let score = dir.appendingPathComponent("original.ly")
+        try ProjectStructure.adopt(score: score)
+        XCTAssertTrue(ProjectStructure.isProjectRoot(dir))
+        XCTAssertEqual(ProjectStructure.rootScore(in: dir), .score(score))
+        XCTAssertEqual(try String(contentsOf: score, encoding: .utf8), "{ c'1 }")
+    }
+
     func testCreateBuildsTheWholeStructure() throws {
         let dir = try temp()
         let score = try ProjectStructure.create(at: dir)
         XCTAssertEqual(score.lastPathComponent, "piece.ly")
         for path in Self.layout { XCTAssertTrue(exists(dir, path), path) }
-        XCTAssertTrue(try String(contentsOf: score, encoding: .utf8).contains("\\include \"lexicon.ily\""))
+        let text = try String(contentsOf: score, encoding: .utf8)
+        XCTAssertTrue(text.contains("\\include \"lexicon.ily\""))
+        XCTAssertTrue(StructuralEditing.isManaged(SyntaxTree(text)))
+        try StructuralEditing.verifyLengths([.init(id: score.path, tree: SyntaxTree(text))], root: score.path)
     }
 
     /// A score copied without its generated lexicon.ily (the include LilyPond

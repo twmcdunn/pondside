@@ -270,6 +270,7 @@ public enum AgentStreamEvents {
         switch harness {
         case .claude: return claude(e)
         case .opencode: return opencode(e)
+        case .codex: return codex(e)
         }
     }
 

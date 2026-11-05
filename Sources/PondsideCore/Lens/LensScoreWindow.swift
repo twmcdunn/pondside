@@ -1,10 +1,12 @@
 public struct LensNote: Sendable, Hashable {
     public var sourceNote: Int
     public var indexInChord: Int
+    public var forcesAccidental: Bool
 
-    public init(sourceNote: Int, indexInChord: Int) {
+    public init(sourceNote: Int, indexInChord: Int, forcesAccidental: Bool = false) {
         self.sourceNote = sourceNote
         self.indexInChord = indexInChord
+        self.forcesAccidental = forcesAccidental
     }
 }
 
@@ -16,7 +18,7 @@ public struct LensEvent: Sendable, Hashable {
     /// The MusicXML voice, from 0: a branch of `<< { } \\ { } >>`.
     public var voiceIndex: Int
     /// Position among the measure's chords and rests in this voice. Grace
-    /// notes and spacers do not count; they never stand on their own.
+    /// notes and spacers do not count, except the entry anchor in an empty measure.
     public var ordinal: Int
     public var notes: [LensNote]
     public var isRest: Bool
@@ -112,8 +114,9 @@ public struct LensScoreWindow: Sendable {
     /// back to the nearest event of any voice where that voice ends; nil at
     /// the edge of the music. Graces are stepped over: the lens can't mark
     /// them.
-    public func neighbor(_ step: Int) -> Int? {
+    public func neighbor(_ step: Int, inserting: Bool = false) -> Int? {
         guard let target, step != 0 else { return nil }
+        if inserting && step < 0 { return target.sourceEvent }
         let ahead = events
             .filter { !$0.isGrace && (step > 0 ? $0.sourceEvent > target.sourceEvent : $0.sourceEvent < target.sourceEvent) }
             .sorted { step > 0 ? $0.sourceEvent < $1.sourceEvent : $0.sourceEvent > $1.sourceEvent }
@@ -169,8 +172,9 @@ public enum LensScoreBuilder {
         else { return nil }
         var context = LensContextScanner.scan(tree, block: block.context)
         let authority = structure ?? tree
+        let sharedTimes = StructuralEditing.isManaged(authority) ? StructuralEditing.times(in: authority) : [:]
         for measure in StructuralEditing.measures(in: tree) where block.range.contains(measure.invocation.lowerBound) {
-            if StructuralEditing.isManaged(authority), let meter = StructuralEditing.time(in: authority, name: measure.name) {
+            if let meter = sharedTimes[measure.name] {
                 context.times.append((measure.invocation.lowerBound, meter))
                 context.managedMeasures.append((measure.body, meter))
             } else {
@@ -213,7 +217,7 @@ public enum LensScoreBuilder {
             if let open = openTuplets.removeValue(forKey: voice) { tuplets.append(open.span) }
         }
         for measure in measures {
-            for event in measure.events where !event.isSpacer {
+            for event in measure.events where !event.isSpacer || (measure.events.allSatisfy { $0.isSpacer } && event.sourceEvent == measure.events.first?.sourceEvent) {
                 let index = events.count
                 if !event.isGrace {
                     let innermost = event.tuplets.last
@@ -237,7 +241,7 @@ public enum LensScoreBuilder {
                     measureIndex: measure.index,
                     voiceIndex: event.voiceIndex,
                     ordinal: event.ordinal,
-                    notes: event.notes.enumerated().map { LensNote(sourceNote: $0.element, indexInChord: $0.offset) },
+                    notes: event.notes.enumerated().map { LensNote(sourceNote: $0.element, indexInChord: $0.offset, forcesAccidental: tree.notes[$0.element].accidentalMark != nil) },
                     isRest: event.isRest,
                     isGrace: event.isGrace,
                     isTarget: event.sourceEvent == target

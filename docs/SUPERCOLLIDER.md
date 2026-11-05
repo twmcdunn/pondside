@@ -211,7 +211,7 @@ both play the mockup.
 A request at a point in the score about the electronics goes to the patch
 agent: ⇥ from the lens's request line (lens → score request → patch
 request → lens), or Edit › Ask the Patch Agent… (␣ e p). It runs like the
-score's agent (Claude Code or opencode, chosen in Settings), in a
+score's agent (Claude Code, opencode or Codex, chosen in Settings), in a
 conversation of its own kept between requests (␣ e N starts a new one), with
 its MCP server in the patch role (`pondside mcp --role patch`): it sees the
 patch tools only and can edit only the patch's `.scd` files.
@@ -383,7 +383,7 @@ folder's likeliest `.scd` (the most `SynthDef`, `Synth`, `.play`, `p.on`,
 a custom patch. If anything isn't to standard, a dialog lists what
 Pondside does itself and what needs an agent:
 
-- **Refactor with Claude Code** (or opencode) migrates the patch, then runs
+- **Refactor with Claude Code** (or opencode / Codex) migrates the patch, then runs
   the agent unattended in the score's folder. The status bar shows that it
   is working; ␣ f m stops it. When it finishes, a sheet shows the agent's
   summary, the time, the cost (Claude reports it), and the marks left;
@@ -396,18 +396,34 @@ Pondside does itself and what needs an agent:
   Pondside-Ready… (␣ f m) asks again at any time.
 
 Pondside ▸ Settings… (⌘,) chooses the agent:
-Automatic (the first one installed: Claude Code, then opencode), Claude
-Code, opencode, or Off. It looks for them on the login shell's PATH and in
-their installers' usual places.
+Automatic (the first installed: Claude Code, then opencode, then Codex),
+Claude Code, opencode, Codex, or Off. It looks on the login shell's PATH
+and in the installers' usual locations. Codex uses the installed CLI's
+existing authentication (`codex login`); it does not ask for an API key in
+Pondside. Install Codex separately if it is marked not installed.
+
+The refactor sheet also has an Agent dropdown. It starts with Use Settings,
+lets you choose any installed agent or No Agent, and applies that override
+only to this refactor. The Refactor button updates to name the selected
+agent; Refactor Only skips the agent. The global Settings choice is unchanged.
 
 The unattended run (`AgentRun`; also `pondside patch score.ly --fix --agent
-auto|claude|opencode`):
+auto|claude|opencode|codex`):
 
-| | Claude Code | opencode |
-|---|---|---|
-| Command | `claude -p <prompt> --output-format json --permission-mode dontAsk --allowedTools "Read Edit Write Glob Grep mcp__pondside" --mcp-config <pondside> --strict-mcp-config` | `opencode run --format json --dir <folder> --auto <prompt>` |
-| May | read and edit files in the folder, use Pondside's MCP tools; anything else is denied without asking | anything not explicitly denied (`--auto`): opencode can't be limited more narrowly from the command line |
-| Result | the JSON's `result` and `total_cost_usd` | the text of the last step's events |
+| | Claude Code | opencode | Codex |
+|---|---|---|---|
+| Command | `claude -p … --output-format stream-json --verbose` | `opencode run --format json --dir <folder> --auto --title Pondside …` | `codex exec --json --ignore-user-config …` |
+| Editing | Pondside's checked MCP edit tool; native read/search only | Pondside's checked MCP edit tool; shell, web, subagents and native edits disabled | Pondside's role-scoped MCP edit tool; native sandbox read-only, shell/web/subagents disabled |
+| Result | final result and reported USD cost | final step text | final agent message and explicit thread ID |
+
+Codex runs one process per turn and continues lens requests with
+`codex exec resume <thread-id>`; it never resumes an unrelated last session.
+Stopping/closing a request terminates that exec, and New Conversation drops
+the thread ID. JSONL events supply activity and errors to Agent Log. The
+per-run configuration isolates Pondside's MCP server from unrelated user
+servers while retaining CLI authentication. Official protocol reference:
+[Codex non-interactive mode](https://developers.openai.com/codex/noninteractive).
+
 
 The prompt contains the sc-patch-migration skill itself, so nothing
 depends on slash commands working without a person. It tells the agent not
@@ -434,3 +450,80 @@ block. The patch rendered with no marks left.
 An MCP server can't make an agent run a skill. It offers the skill as a
 prompt, which Claude Code shows as the slash command above, and its
 instructions point agents at the skill when they see `// pondside:` marks.
+
+## Performance initialization contract
+
+The complete performance contract is also served to agents as
+[`pondside://patch-contract`](pondside://patch-contract). Every patch edit,
+including general requests, must preserve it. The main file starts with a
+usage comment: execute the main block once, then call `~triggerCue.()` for
+live cues. The `// @pondside init v2` block configures `s.options`, calls
+`s.reboot`, and registers `s.waitForBoot` from the reboot callback. All
+required preparation is inside that boot routine: mode, dependencies,
+buffers, buses, SynthDefs, Pbinds, cue functions and startup synths. The
+routine synchronizes server work before printing `PONDSIDE_PREPARED`.
+No second required block or loose setup line is allowed. Optional IDE UI
+may live in an explicitly live-only block; the exported player evaluates
+only the main initialization block and has no Qt.
+
+`~mode = ~pondsideMode ? \live` respects the renderer's `\mockup` override
+and the player's `\live` override. The offline clock runs the same
+preparation directly without rebooting a physical server. Preserve
+`~renderClock` and the generated engine; do not add another cue clock.
+
+Except for the mockup in `renders/`, all sound files must be under the
+main patch's `resources/` directory or under
+`Platform.userAppSupportDir +/+ "sounds"`, including child directories.
+Use `~resources` or `~sharedSounds`; dependencies share those roots.
+Desktop, Downloads and application-bundle sample paths are unsupported.
+MCP edits validate the changed patch and loaded dependencies before an
+atomic write. Editor drafts that violate the contract remain in the
+editor and are not saved over the working patch.
+
+### General requests and deployment
+
+Edit → Ask Agent (Command-Shift-A) accepts a project-wide request or a
+selected `.ly` / `.scd` file. Score and patch conversations retain their
+respective MCP roles and receive the full contract reference.
+
+SuperCollider → Deploy Patch asks for a new public GitHub repository name.
+Preparation builds a small AppKit app
+using the same headless SuperCollider runtime as Pondside, vector score
+system cards and derived cue timing. It prepares the app and separate
+`resources.zip` / `sounds.zip` release archives locally for review. The
+review offers Publish Release, Run Locally and Keep Local. Builds are saved
+under `~/Library/Application Support/Pondside/Deployments`; Deploy Patch
+lists saved builds so the same tested version can be published later.
+Publish Release opens GitHub's browser/device sign-in when needed, creates
+the repository, pushes source files and uploads the release. Credentials
+stay with gh and the system credential store. Publication checkpoints let
+an interrupted push/upload resume without rebuilding. Reassigning publishing
+metadata updates the signature, while preserving executable code.
+
+The downloaded ZIP contains a self-contained `.app`: unzip and open it
+anywhere, with no installer, admin access, Pondside, SuperCollider installation
+or developer tools required. Sound files go into the user's Application
+Support directory rather than modifying the signed app. Pondside bundles a
+precompiled player so preparing a deployment from the packaged editor also
+requires no compiler. Each player uses an independent audio-server port so
+local testing does not reboot the editor's server.
+
+On every launch, the player checks its bundled sound inventory against
+project resources in its writable Application Support project and shared
+sounds under SuperCollider's Application Support `sounds`. Existing regular
+files of the expected size need no installation or network request. Missing
+or truncated files are restored before initialization. A saved local build
+can restore them from its adjacent sound archives; a downloaded app fetches
+only the required archives from the latest GitHub release. Healthy files
+are left untouched. No first-run flag can conceal a deleted sound. The first cue starts
+the on-screen elapsed timer. Space / Right Arrow advances cues; Left Arrow
+returns to the previous cue. A large square shows only the cue number.
+Two adjacent systems remain visible, following the current cue and its
+elapsed score time, capped at the next manually triggered cue.
+
+The direct release download is written in `front-matter.ily`; Score Setup
+→ Cover Page can hide its printed link while retaining the address.
+Exported apps are ad-hoc signed; use a Developer ID and notarization for
+unrestricted distribution. The runtime and upstream license notices are
+included with each app. Private repositories are not offered because a
+performer's app downloads release assets without GitHub credentials.

@@ -62,6 +62,8 @@ final class SourceFile {
     /// Parsed in context (the language in effect where it is included).
     fileprivate(set) var tree: SyntaxTree
     fileprivate(set) var entryLanguage: PitchLanguage = .nederlands
+    // Revisions produced by constrained score commands (including undo).
+    fileprivate var constructedRevisions: Set<ContentHash> = []
     /// The text the current pages were engraved from (their links refer to it).
     fileprivate(set) var engravedText: String?
     /// The text the current diagnostics refer to.
@@ -152,7 +154,7 @@ final class ScoreDocument {
 
     /// What runs in the background besides engraving, for the status bar.
     var activities: [String] {
-        (mockupRunning ? ["Rendering the mockup..."] : []) + (mixRunning ? ["Rendering the mix..."] : [])
+        (mockupRunning ? ["Preparing playback…"] : []) + (mixRunning ? ["Rendering the mix..."] : [])
     }
     private var mockupPending = false
     /// The cue sheet is the playback's, not the canvas's.
@@ -187,6 +189,7 @@ final class ScoreDocument {
             .appendingPathComponent("Pondside", isDirectory: true)
             .appendingPathComponent(ContentHash(canonical.path).description, isDirectory: true)
         declaredVersion = LilyPondVersion.declared(in: files[0].text)
+        contractRequired = StructuralEditing.isManaged(files[0].tree)
     }
 
     func file(for path: String) -> SourceFile? {
@@ -248,6 +251,7 @@ final class ScoreDocument {
         flushPendingSaves()
         scheduleCheckpoint(after: .zero)
         renderTask?.cancel()
+        inputEngraveTask?.cancel()
         renderTask = nil
         let d = daemon
         Task { await d?.stop() }
@@ -308,21 +312,72 @@ final class ScoreDocument {
             changed = true
         }
         files = next
+        contractRequired = contractRequired || StructuralEditing.isManaged(root.tree)
         declaredVersion = LilyPondVersion.declared(in: root.text)
         if changed { delegate?.documentFilesDidChange(self) }
     }
 
     // MARK: Editing and saving
 
-    func userEdited(_ file: SourceFile, text newText: String) {
-        file.text = newText
-        refreshGraph()
+    func userEdited(_ file: SourceFile, text newText: String, prepared: SyntaxTree? = nil) {
+        if let prepared {
+            let before = ContentHash(file.text)
+            if before == file.sync.lastSyncedHash || file.constructedRevisions.contains(before) {
+                file.constructedRevisions.insert(before)
+                file.constructedRevisions.insert(ContentHash(newText))
+            }
+            file.text = newText
+            file.tree = prepared
+        } else {
+            file.text = newText
+            refreshGraph()
+        }
         file.saveTask?.cancel()
         file.saveTask = Task { [weak self, weak file] in
             try? await Task.sleep(for: ScoreDocument.autosaveDelay)
             guard !Task.isCancelled, let self, let file else { return }
-            self.save(file)
-            self.engrave()
+            if self.save(file) { self.engrave() }
+        }
+    }
+
+    func inputSnapshot() -> UnmeteredInputTransaction.Snapshot {
+        var dirty = Set<URL>()
+        var revisions: [URL: ContentHash] = [:]
+        let inputFiles = files.map { file -> StructuralEditing.File in
+            file.saveTask?.cancel()
+            file.saveTask = nil
+            if ContentHash(file.text) != file.sync.lastSyncedHash { dirty.insert(file.url) }
+            revisions[file.url] = file.sync.lastSyncedHash
+            var languages: [String: PitchLanguage] = [:]
+            for include in file.tree.includes {
+                if let url = SourceGraph.resolve(include.path, from: file.url, root: self.url, exists: { FileManager.default.fileExists(atPath: $0.path) }),
+                   let dependency = self.file(for: url.path) { languages[include.path] = dependency.tree.finalLanguage }
+            }
+            return StructuralEditing.File(id: file.url.path, tree: file.tree, entryLanguage: file.entryLanguage, includedLanguages: languages)
+        }
+        return .init(files: inputFiles, revisions: revisions, dirty: dirty)
+    }
+
+    func willWriteInput(_ prepared: UnmeteredInputTransaction.Prepared) {
+        for (url, text) in prepared.replacements { file(for: url.path)?.watcher?.noteOwnWrite(text) }
+    }
+
+    private var inputEngraveTask: Task<Void, Never>?
+
+    func adoptInput(_ prepared: UnmeteredInputTransaction.Prepared) {
+        for source in prepared.plan.files {
+            guard let file = file(for: source.id) else { continue }
+            file.text = source.tree.text
+            file.tree = source.tree
+            if prepared.replacements[file.url] != nil { file.sync.noteSynced(source.tree.text) }
+        }
+        contractRequired = StructuralEditing.isManaged(root.tree)
+        scheduleCheckpoint(after: .seconds(30))
+        inputEngraveTask?.cancel()
+        inputEngraveTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(200))
+            guard !Task.isCancelled else { return }
+            self?.engrave()
         }
     }
 
@@ -352,6 +407,7 @@ final class ScoreDocument {
             file.sync.noteSynced(text)
         }
         refreshGraph()
+        contractRequired = StructuralEditing.isManaged(root.tree)
         scheduleCheckpoint(after: .seconds(30))
         engrave()
     }
@@ -364,16 +420,55 @@ final class ScoreDocument {
         }
     }
 
-    private func save(_ file: SourceFile) {
+    @discardableResult
+    private func save(_ file: SourceFile) -> Bool {
         file.saveTask = nil
-        guard ContentHash(file.text) != file.sync.lastSyncedHash else { return }
+        guard ContentHash(file.text) != file.sync.lastSyncedHash else { return true }
         do {
-            file.watcher?.noteOwnWrite(file.text)
-            try Data(file.text.utf8).write(to: file.url, options: .atomic)
-            file.sync.noteSynced(file.text)
+            if contractRequired || StructuralEditing.isManaged(root.tree) {
+                guard StructuralEditing.isManaged(root.tree) else {
+                    throw StructuralEditing.Failure("The generated shared-measure contract was removed. Restore it before saving; see pondside://contract.")
+                }
+                let dirty = files.filter { ContentHash($0.text) != $0.sync.lastSyncedHash }
+                let replacements = Dictionary(uniqueKeysWithValues: dirty.map { ($0.url, $0.text) })
+                // Read unchanged dependencies from disk, including generated
+                // includes that may have changed before their watcher fires.
+                let graph = SourceGraph.load(root: url, overrides: replacements)
+                // Arbitrary Source edits need an audit. Built-in notation
+                // commands already preserve the contract by construction.
+                if !dirty.allSatisfy({ $0.constructedRevisions.contains(ContentHash($0.text)) }) {
+                    let proposed = graph.files.map { StructuralEditing.File(id: $0.url.path, tree: $0.tree) }
+                    try StructuralEditing.verifyLengths(proposed, root: url.path)
+                }
+                var revisions: [URL: ContentHash] = [:]
+                for source in graph.files {
+                    let bytes = try Data(contentsOf: source.url)
+                    if let dirtyFile = dirty.first(where: { $0.url == source.url }),
+                       ContentHash(bytes: bytes) != dirtyFile.sync.lastSyncedHash {
+                        throw StructuralEditing.Failure("\(dirtyFile.displayName) changed on disk. Resolve its conflict before saving.")
+                    }
+                    revisions[source.url] = ContentHash(bytes: bytes)
+                }
+                try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements, willWrite: { url, text in
+                    self.file(for: url.path)?.watcher?.noteOwnWrite(text)
+                })
+                for source in files where replacements[source.url] != nil {
+                    source.saveTask?.cancel()
+                    source.saveTask = nil
+                    source.sync.noteSynced(source.text)
+                }
+                contractRequired = true
+            } else {
+                file.watcher?.noteOwnWrite(file.text)
+                try Data(file.text.utf8).write(to: file.url, options: .atomic)
+                file.sync.noteSynced(file.text)
+            }
             scheduleCheckpoint(after: .seconds(30))
+            return true
         } catch {
-            setStatus(.failed("Could not save \(file.displayName): \(error.localizedDescription)"))
+            stashRecovery(file.text, for: file, label: "unsaved-contract")
+            setStatus(.failed("Not saved: \(error). The source buffer is retained; see pondside://contract."))
+            return false
         }
     }
 
@@ -384,7 +479,7 @@ final class ScoreDocument {
             stashRecovery(diskText, for: file, label: "disk")
             file.sync.noteSynced(diskText)
             file.saveTask?.cancel()
-            save(file)
+            guard save(file) else { return }
         } else {
             stashRecovery(file.text, for: file, label: "unsaved")
             adopt(diskText, in: file)
@@ -414,7 +509,7 @@ final class ScoreDocument {
         refreshGraph()
     }
 
-    private func stashRecovery(_ contents: String, for file: SourceFile, label: String) {
+    func stashRecovery(_ contents: String, for file: SourceFile, label: String) {
         let fm = FileManager.default
         guard let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
         let dir = support.appendingPathComponent("Pondside/Recovery", isDirectory: true)
@@ -487,7 +582,9 @@ final class ScoreDocument {
     /// The score's files as the last mockup started from: an edit that
     /// touched only the front matter (the legend, the cover) can't change the
     /// sound, so it renders nothing.
+    private var contractRequired = false
     private var mockupTexts: [URL: String]?
+    private var mockupInFlightTexts: [URL: String]?
     /// What the last mix was rendered from (the mockup, its cues, the patch
     /// and what it loads): the mix renders only when one of them changed.
     private var mixInputs: String?
@@ -495,19 +592,23 @@ final class ScoreDocument {
     private func renderMockup() {
         guard let tool = Bundle.main.resourceURL?.appendingPathComponent("pondside"),
               FileManager.default.isExecutableFile(atPath: tool.path) else { return }
-        if mockupRunning {
-            mockupPending = true
-            return
-        }
         let texts = Dictionary(files.map { ($0.url.standardizedFileURL, $0.text) }, uniquingKeysWith: { a, _ in a })
-        if let last = mockupTexts {
+        let baseline = mockupRunning ? mockupInFlightTexts : mockupTexts
+        if let last = baseline {
             let changed = Set(texts.keys).union(last.keys).filter { texts[$0] != last[$0] }
-            if changed.isEmpty || changed.allSatisfy({ $0.lastPathComponent == FrontMatter.fileName }) {
-                mockupTexts = texts
+            let soundUnchanged = changed.allSatisfy { url in
+                if url.lastPathComponent == FrontMatter.fileName { return true }
+                guard let before = last[url], let after = texts[url] else { return false }
+                return PlaybackSourceSignature.equivalent(before, after)
+            }
+            if soundUnchanged {
+                if mockupRunning { mockupPending = false }
+                else { mockupTexts = texts }
                 return
             }
         }
-        mockupTexts = texts
+        if mockupRunning { mockupPending = true; return }
+        mockupInFlightTexts = texts
         let process = Process()
         process.executableURL = tool
         let timing = workDirectory.appendingPathComponent("playback-\(UUID().uuidString).timing")
@@ -529,6 +630,8 @@ final class ScoreDocument {
             Task { @MainActor in
                 guard let doc = ref.value else { return }
                 doc.mockupRunning = false
+                doc.mockupInFlightTexts = nil
+                if rendered { doc.mockupTexts = texts }
                 if let text, !doc.mockupPending { doc.adoptTiming(TimingLog(parsing: text, prefix: TimingDump.marker)) }
                 if doc.mockupPending {
                     doc.mockupPending = false
@@ -543,6 +646,7 @@ final class ScoreDocument {
             try process.run()
             mockupRunning = true
         } catch {
+            mockupInFlightTexts = nil
             Logger(subsystem: "app.pondside", category: "mockup").notice("\(error.localizedDescription, privacy: .public)")
         }
     }

@@ -33,7 +33,9 @@ public struct PlayheadTrack: Sendable {
         }
         var found: [(seconds: Double, x: Double, position: PlayheadPosition)] = []
         for row in log.rows {
-            guard case .note = row.kind, let origin = row.origin,
+            let anchored: Bool
+            switch row.kind { case .note, .rest: anchored = true; default: anchored = false }
+            guard anchored, let origin = row.origin,
                   let (_, position) = Self.locate(origin, in: pages, info: info, canon: canon)
             else { continue }
             found.append((map.seconds(at: row.moment), position.x, position))

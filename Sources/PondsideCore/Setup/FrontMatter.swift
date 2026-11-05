@@ -719,3 +719,49 @@ public struct FrontMatter: Sendable {
         return .insert(line + "\n\n", at: at)
     }
 }
+
+extension FrontMatter {
+    /// Deployment metadata lives in the same included LilyPond source as
+    /// the printed link; hiding it retains the download address.
+    public var performanceDownload: String? {
+        text.split(separator: "\n").first { $0.hasPrefix("%% @pondside performance-url ") }.map { String($0.dropFirst("%% @pondside performance-url ".count)) }
+    }
+    public var printsPerformanceDownload: Bool { text.contains("%% @pondside performance-link\n") }
+    public func edits(performanceDownload address: String, enabled: Bool) -> [TextEdit] {
+        guard address.hasPrefix("https://github.com/"), !address.contains("\n"), !address.contains("\""), !address.contains("\\") else { return [] }
+        var edits: [TextEdit] = []
+        let prefix = "%% @pondside performance-url "
+        var offset = 0
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix(prefix) { edits.append(TextEdit(offset..<(offset + line.utf8.count + (offset + line.utf8.count < text.utf8.count ? 1 : 0)), "")) }
+            offset += line.utf8.count + 1
+        }
+        let marker = "%% @pondside performance-link\n"
+        if let start = Self.find(Array(marker.utf8), in: bytes) {
+            let end = bytes[(start + marker.utf8.count)...].firstIndex(of: 10).map { $0 + 1 } ?? bytes.count
+            edits.append(TextEdit(start..<end, ""))
+        }
+        var updated = edits.apply(to: text)
+        updated = prefix + address + "\n" + updated
+        if enabled, let cover = FrontMatter(updated).range(of: .cover) {
+            let current = Array(updated.utf8)
+            let coverText = String(decoding: current[cover], as: UTF8.self)
+            if let local = Self.find(Array("  \\markup \\null".utf8), in: Array(coverText.utf8)) {
+                let at = cover.lowerBound + local
+                let link = marker + "  \\markup \\fill-line { \\with-url \"\(address)\" \\small \"Download performance app\" }\n"
+                updated = [TextEdit(at..<at, link)].apply(to: updated)
+            }
+        }
+        // Keep one inverse-editable replacement; unrelated bytes are identical.
+        guard updated != text else { return [] }
+        var a = Array(text.utf8), b = Array(updated.utf8)
+        var first = 0
+        while first < min(a.count, b.count), a[first] == b[first] { first += 1 }
+        while a.count > first, b.count > first, a.last == b.last { a.removeLast(); b.removeLast() }
+        return [TextEdit(first..<a.count, String(decoding: b[first...], as: UTF8.self))]
+    }
+    private static func find(_ needle: [UInt8], in haystack: [UInt8]) -> Int? {
+        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
+        return (0...(haystack.count - needle.count)).first { Array(haystack[$0..<($0 + needle.count)]) == needle }
+    }
+}

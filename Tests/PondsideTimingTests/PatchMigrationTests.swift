@@ -45,11 +45,12 @@ final class PatchMigrationTests: XCTestCase {
         let r = PatchMigration.migrate(custom, source: "piece.scd", score: "score.ly", name: "score")
         XCTAssertTrue(r.text.hasPrefix(HandlerSync.patchMarker))
         XCTAssertTrue(r.text.contains("(from piece.scd)"))
-        XCTAssertTrue(r.text.contains(HandlerSync.setupBlock + "\n\n// My piece\n"), "the composer's code right after the setup block")
+        XCTAssertNotNil(PatchContract.mainBlock(in: r.text))
+        XCTAssertTrue(r.text.contains("// My piece"), "preserve the composer's comments")
         XCTAssertTrue(r.text.contains("Out.ar(out, In.ar(~live))"))
         XCTAssertTrue(r.text.contains("~buf = Buffer.read"), "nothing of the composer's renamed")
         XCTAssertTrue(r.text.contains("~start = {"))
-        XCTAssertTrue(r.text.hasSuffix(HandlerSync.runLines))
+        XCTAssertTrue(r.text.contains(PatchContract.readyMarker))
         XCTAssertTrue(r.text.contains("/mcp__pondside__sc-patch-migration"))
         for f in r.manual {
             let line = r.text.components(separatedBy: "\n")[f.line! - 1]
@@ -85,7 +86,7 @@ final class PatchMigrationTests: XCTestCase {
         XCTAssertTrue(starter.contains("~cue[\\cue1]"))
         XCTAssertTrue(PatchMigration.isUntouchedStarter(starter))
         XCTAssertFalse(PatchMigration.isUntouchedStarter(starter.replacingOccurrences(
-            of: "// Sounds and effects", with: "(\nSynthDef(\\a, { }).add;\n)\n// Sounds and effects")))
+            of: HandlerSync.cuesAnchor, with: "SynthDef(\\a, { }).add;\n" + HandlerSync.cuesAnchor)))
         XCTAssertFalse(PatchMigration.isUntouchedStarter(starter.replacingOccurrences(
             of: "~cue[\\cue1] = { |cue|\n\n};", with: "~cue[\\cue1] = { |cue|\n\tSynth(\\default);\n};")))
         XCTAssertFalse(PatchMigration.isUntouchedStarter(custom))
@@ -93,7 +94,7 @@ final class PatchMigrationTests: XCTestCase {
 
     func testLiveOnlyBlocksAndPondsidesOwnCodeAreNotReported() {
         let patch = HandlerSync.patchStarter(sheet(), name: "score")
-            .replacingOccurrences(of: "// Sounds and effects", with: "(\n\(HandlerSync.liveOnlyMarker)\nWindow(\"x\").front;\nMIDIdef.noteOn(\\p, { ~triggerCue.() });\n)\n// Sounds and effects")
+            + "\n(\n\(HandlerSync.liveOnlyMarker)\nWindow(\"x\").front;\nMIDIdef.noteOn(\\p, { ~triggerCue.() });\n)\n"
         XCTAssertEqual(PatchMigration.audit(patch), [])
     }
 
@@ -103,7 +104,7 @@ final class PatchMigrationTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         let patch = dir.appendingPathComponent("score.scd")
         let starter = HandlerSync.patchStarter(sheet(), name: "score")
-            .replacingOccurrences(of: "// Sounds and effects", with: "(\n\"deps/cues.scd\".resolveRelative.load;\n)\n// Sounds and effects")
+            .replacingOccurrences(of: HandlerSync.cuesAnchor, with: "\"deps/cues.scd\".resolveRelative.load;\n" + HandlerSync.cuesAnchor)
         try Data(starter.utf8).write(to: patch)
         try Data("~cues = [];\nfork({ 1.wait }, SystemClock);\n~loadCueTimes = { \"export_piece.sh\".unixCmd };\n".utf8)
             .write(to: dir.appendingPathComponent("deps/cues.scd"))

@@ -71,29 +71,8 @@ public enum HandlerSync {
     /// and effects, a stub per cue, and how to run it. Everything else is in
     /// the engine (`engine(name:)`, `dependencies/pondside.scd`).
     public static func patchStarter(_ sheet: CueSheet, name: String) -> String {
-        var out = """
-        \(patchMarker) for \(sheet.score). Run each ( … ) block with ⌘↩, a line with ⇧↩.
-        \(engineIntro(name: name))
-
-        \(setupBlock)
-
-        // Sounds and effects: SynthDefs, buffers, effects (on the performer: In.ar(~live)).
-        (
-
-        )
-
-        // Cues: ~cue[\\cueN] runs at cue N, as a routine (wait, fork and patterns work).
-        (
-        \(cuesAnchor)
-
-        """
-        for cue in sheet.cues { out += patchStub(cue) + "\n" }
-        out += """
-        )
-
-        \(runLines)
-        """
-        return out
+        let body = HandlerSync.cuesAnchor + "\n" + sheet.cues.map { patchStub($0) }.joined(separator: "\n")
+        return PatchContract.initialization(body: body, score: sheet.score) + "\n"
     }
 
     static func engineIntro(name: String) -> String {
@@ -167,6 +146,10 @@ public enum HandlerSync {
         \t\t}
         \t} { "no %: engrave the score in Pondside first".format(path).warn; [] }
         };
+        // Required preparation belongs to the main waitForBoot routine.
+        e[\\list] = e[\\cues].value;
+        e[\\buf] !? { e[\\buf].free };
+        e[\\buf] = if(~mode == \\mockup) { Buffer.read(s, e[\\renders] +/+ e[\\name] ++ ".wav") };
         e[\\fire] = { |c| ("cue " ++ c.name).postln; ~cue[c.handler] !? { |f| f.value(c) } };
         e[\\fireNow] = { |c| fork { e[\\fire].(c) } };   // a routine: a cue may wait
         // plays from `from` seconds on the score's clock (beats = seconds); in mockup mode the
@@ -185,11 +168,8 @@ public enum HandlerSync {
         // starts the piece at cue i (0: from the start): the cues before it run at once
         e[\\start] = { |i|
         \t~stop.();
-        \te[\\list] = e[\\cues].value;
         \tfork {
         \t\tvar from = if(i > 0 and: { i < e[\\list].size }) { e[\\list][i].time } { 0 };
-        \t\te[\\buf] !? { e[\\buf].free };
-        \t\te[\\buf] = if(~mode == \\mockup) { Buffer.read(s, e[\\renders] +/+ e[\\name] ++ ".wav") };
         \t\ts.sync;
         \t\te[\\index] = 0;
         \t\te[\\list].do { |c, j| if(c.time < from) { e[\\fireNow].(c); e[\\index] = j + 1 } };

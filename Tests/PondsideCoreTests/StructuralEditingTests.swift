@@ -2,6 +2,28 @@ import XCTest
 @testable import PondsideCore
 
 final class StructuralEditingTests: XCTestCase {
+    func testWholeProjectPreflightRejectsLocalTimingOverflowAndRemovedContract() throws {
+        let files = try managed()
+        for replacement in ["\\time 3/4 c4", "c1 c4"] {
+            var proposed = files
+            proposed[1].tree = proposed[1].parse(files[1].tree.text.replacingOccurrences(of: "c4", with: replacement))
+            XCTAssertThrowsError(try StructuralEditing.verifyProjectEdit(before: files, proposed: proposed, root: "score.ly"))
+        }
+        var proposed = files
+        proposed[0].tree = SyntaxTree(files[0].tree.text.replacingOccurrences(of: StructuralEditing.marker, with: "% removed"))
+        XCTAssertThrowsError(try StructuralEditing.verifyProjectEdit(before: files, proposed: proposed, root: "score.ly"))
+    }
+
+    func testPageAndSystemBreaksToggleAndReplaceEachOther() throws {
+        var files = try managed()
+        files = apply(try StructuralEditing.toggleBreak(before: "pondsideBarB", files: files, root: "score.ly", kind: .page), to: files)
+        XCTAssertEqual(StructuralEditing.breakBefore("pondsideBarB", in: files[0].tree), .page)
+        files = apply(try StructuralEditing.toggleBreak(before: "pondsideBarB", files: files, root: "score.ly"), to: files)
+        XCTAssertEqual(StructuralEditing.breakBefore("pondsideBarB", in: files[0].tree), .system)
+        files = apply(try StructuralEditing.toggleBreak(before: "pondsideBarB", files: files, root: "score.ly"), to: files)
+        XCTAssertNil(StructuralEditing.breakBefore("pondsideBarB", in: files[0].tree))
+    }
+
     func testMigrationCommandIsReachableWithoutKeyboardConflicts() {
         XCTAssertTrue(CommandCatalog.standard.contains { $0.id == "file.migrateScore" && !$0.chords.isEmpty })
         XCTAssertTrue(Keymap().problems().isEmpty)
@@ -435,4 +457,15 @@ final class StructuralEditingTests: XCTestCase {
         XCTAssertEqual(try StructuralEditing.migrate(after, root: "score.ly", sharedBreaks: true).count, 0)
     }
 
+    func testSharedTimeIndexMatchesIndividualDefinitions() throws {
+        let source = "\\score { \\new Staff { \\time 3/4 c'2. | \\time 5/8 d'8 e'2 | \\time 4/4 f'1 } }"
+        let initial = [StructuralEditing.File(id: "score.ly", tree: SyntaxTree(source))]
+        let changes = try StructuralEditing.migrate(initial, root: "score.ly", sharedBreaks: true)
+        let tree = SyntaxTree(changes.flatMap(\.edits).apply(to: source))
+        let indexed = StructuralEditing.times(in: tree)
+        XCTAssertEqual(indexed.count, 3)
+        for measure in StructuralEditing.measures(in: tree) {
+            XCTAssertEqual(indexed[measure.name], StructuralEditing.time(in: tree, name: measure.name))
+        }
+    }
 }

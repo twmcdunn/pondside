@@ -4,6 +4,12 @@ import XCTest
 final class NoteInputTests: XCTestCase {
     func ch(_ c: Character) -> KeyInput { KeyInput(.character(c)) }
 
+    func testSystemAndPageBreakKeys() {
+        var input = NoteInput()
+        XCTAssertEqual(input.handle(KeyInput(.enter), now: 0), [.toggleSystemBreak])
+        XCTAssertEqual(input.handle(KeyInput(.enter, shift: true), now: 1), [.togglePageBreak])
+    }
+
     func testDurationsAsInLilyPond() {
         var input = NoteInput()
         XCTAssertEqual(input.handle(ch("8"), now: 0), [.setDuration(DurationValue(log: 3)), .buffer("")])
@@ -33,8 +39,8 @@ final class NoteInputTests: XCTestCase {
     func testLilyPondSyntaxAsAccelerator() {
         var input = NoteInput()
         XCTAssertEqual(input.handle(ch("("), now: 0), [.togglePostEvent("(")])
-        XCTAssertEqual(input.handle(ch("-"), now: 0), [.buffer("-")])
-        XCTAssertEqual(input.handle(ch("."), now: 0), [.togglePostEvent("-."), .buffer("")])
+        XCTAssertEqual(input.handle(ch("^"), now: 0), [.buffer("^")])
+        XCTAssertEqual(input.handle(ch("."), now: 0), [.togglePostEvent("^."), .buffer("")])
         XCTAssertEqual(input.handle(ch("^"), now: 0), [.buffer("^")])
         XCTAssertEqual(input.handle(ch("3"), now: 0), [.togglePostEvent("^3"), .buffer("")])
         for c in "\\tri" { _ = input.handle(ch(c), now: 0) }

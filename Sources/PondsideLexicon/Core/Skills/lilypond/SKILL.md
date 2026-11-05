@@ -1,4 +1,6 @@
 ---
+
+For managed `.ly`/`.ily` scores, preserve the generated shared definitions and ordered voice wrappers, keep content within each shared meter, and edit shared meters/breaks instead of adding local commands; read the [complete .ly contract](pondside://contract) before editing.
 name: lilypond
 description: Engrave scores with GNU LilyPond 2.26 and get them looking right -- installing it on macOS, laying out a project (score.ly + parts + a defs.ily of house commands), compiling and checking the PDF visually, horizontal and vertical spacing (tight staves, even systems, fixed breaks, margins), dynamics and hairpins in their own voice, hidden meters, Scheme callbacks and custom stencils, and the Guile/LilyPond gotchas that silently break them. Use this skill whenever someone writes or edits .ly/.ily files, asks for anything to be engraved, notated or "put in the score" in LilyPond, pastes a LilyPond error ("Guile signaled an error", "bar check failed", "unbound variable"), asks how to move/space/hide/restyle something in a LilyPond score, or starts a new piece in LilyPond -- even if they just say "the score" in a project that has .ly files. See also lilypond-contemporary-notation (aleatoric/extended), lilypond-electronics-staff (cues, collections), lilypond-supercollider (patch integration).
 ---

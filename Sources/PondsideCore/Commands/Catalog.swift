@@ -61,10 +61,11 @@ public enum CommandCatalog {
     ]
 
     static let add: [CommandSpec] = [
-        CommandSpec("add.armAccidental", "Arm Accidental", "+ sharp · - flat · 0 natural for the next note; repeat to disarm", category: "Add", keys: ["+", "-", "0"]),
+        CommandSpec("add.armAccidental", "Visible Accidental", "= sharp · - flat · 0 natural: toggle the selected glyph or arm the next note", category: "Add", keys: ["=", "-", "0"]),
         CommandSpec("add.barline", "Finish Unmetered Bar", "Finish the current measure during unmetered entry", category: "Add", requires: .selection, keys: ["|"]),
         CommandSpec("add.systemBreak", "Toggle System Break", "Start a new system before the selection, or remove its break", category: "Add",
                     requires: .selection, keys: ["↩"]),
+        CommandSpec("add.pageBreak", "Toggle Page Break", "Start a new page before the selection, or remove its page break", category: "Add", requires: .selection, keys: ["⇧↩"]),
         CommandSpec("add.slur", "Add Slur", "Slur the selection from its first note to its last", category: "Add",
                     requires: .selection, chords: ["as"], keys: ["(", ")"]),
         CommandSpec("add.beam", "Add Beam", "Beam the selection manually", category: "Add",
@@ -105,11 +106,15 @@ public enum CommandCatalog {
     ]
 
     static let edit: [CommandSpec] = [
+        CommandSpec("edit.generalAgent", "Ask Agent…", "Request any change to LilyPond or SuperCollider files", category: "Edit", chords: ["eg"], shortcut: KeyStroke("a", [.command, .shift])),
         CommandSpec("edit.unmetered", "Toggle Unmetered Entry", "Grow the measure as notes are entered; | finishes the bar", category: "Edit", requires: .selection, shortcut: KeyStroke("u", .option)),
         CommandSpec("edit.undo", "Undo", "Undo the last change in this file", category: "Edit",
                     chords: ["eu"], shortcut: KeyStroke("z", .command)),
         CommandSpec("edit.redo", "Redo", "Redo the last undone change", category: "Edit",
                     chords: ["eU"], shortcut: KeyStroke("z", [.command, .shift])),
+        CommandSpec("edit.copy", "Copy", "Copy selected notation", category: "Edit", shortcut: KeyStroke("c", .command)),
+        CommandSpec("edit.cut", "Cut", "Copy and remove selected notation", category: "Edit", shortcut: KeyStroke("x", .command)),
+        CommandSpec("edit.paste", "Paste", "Insert copied notation after the selection", category: "Edit", shortcut: KeyStroke("v", .command)),
         CommandSpec("edit.delete", "Delete", "Delete the selection; every other note keeps its pitch and duration",
                     category: "Edit", requires: .selection, chords: ["ex"], keys: ["⌫"]),
         CommandSpec("edit.source", "Edit in Source", "Put the text cursor at the selection", category: "Edit",
@@ -191,6 +196,7 @@ public enum CommandCatalog {
     }()
 
     static let supercollider: [CommandSpec] = [
+        CommandSpec("sc.deploy", "Deploy Patch…", "Prepare a standalone performance app and publish a GitHub release", category: "SuperCollider", chords: ["sp"]),
         CommandSpec("sc.evaluate", "Evaluate", "Run the selection, or the ( … ) block around the caret, in SuperCollider",
                     category: "SuperCollider", requires: .supercollider, chords: ["se"], keys: ["⌘↩"]),
         CommandSpec("sc.evaluateLine", "Evaluate Line", "Run the caret's line in SuperCollider", category: "SuperCollider",

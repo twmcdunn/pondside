@@ -301,7 +301,7 @@ public enum SCLexiconInclude {
         guard !patch.contains(loadLine) else { return patch }
         let engine = "\"\(HandlerSync.Layout.engineFile)\".loadRelative;"
         var lines = patch.components(separatedBy: "\n")
-        if let i = lines.firstIndex(where: { $0.contains(engine) }) {
+        if let i = lines.firstIndex(where: { $0.contains(engine) || $0.contains("(patchFolder +/+ \"\(HandlerSync.Layout.engineFile)\").load;") }) {
             lines.insert(loadLine + "   // Pondside's SuperCollider Lexicon entries (sc_lexicon_add)", at: i + 1)
             return lines.joined(separator: "\n")
         }

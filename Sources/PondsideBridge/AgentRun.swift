@@ -1,15 +1,17 @@
 import Foundation
+import PondsideTiming
 
 /// A coding agent run once, without a person at the keyboard: `claude -p`
-/// or `opencode run`, in the score's folder, with Pondside's MCP server.
+/// `opencode run` or `codex exec`, in the score's folder with Pondside's MCP server.
 /// Pondside uses it to finish a patch migration (skill sc-patch-migration).
 public enum AgentHarness: String, CaseIterable, Sendable {
-    case claude, opencode
+    case claude, opencode, codex
 
     public var title: String {
         switch self {
         case .claude: return "Claude Code"
         case .opencode: return "opencode"
+        case .codex: return "Codex"
         }
     }
 }
@@ -74,6 +76,7 @@ public struct AgentRun: Sendable {
         let usual: [String]
         switch harness {
         case .claude: usual = ["\(home)/.local/bin/claude", "\(home)/.claude/local/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude"]
+        case .codex: usual = ["/opt/homebrew/bin/codex", "/usr/local/bin/codex", "\(home)/.local/bin/codex", "/Applications/Codex.app/Contents/Resources/codex"]
         case .opencode: usual = ["\(home)/.opencode/bin/opencode", "/opt/homebrew/bin/opencode", "/usr/local/bin/opencode"]
         }
         let onPath = loginPath.split(separator: ":").map { "\($0)/\(harness.rawValue)" }
@@ -133,8 +136,9 @@ public struct AgentRun: Sendable {
     /// and call Pondside's tools (anything else is denied, not asked);
     /// opencode can't be limited to the folder, so it auto-approves, with
     /// its shell, web and subagent tools denied (`environment`).
-    public func arguments(prompt: String, folder: URL, pondside: String, session: String? = nil) -> [String] {
+    public func arguments(prompt: String, folder: URL, pondside: String, session: String? = nil, role: MCPServer.Role = .graphics) -> [String] {
         switch harness {
+        case .codex: return codexArguments(prompt: prompt, folder: folder, pondside: pondside, session: session, role: role)
         case .claude:
             let mcp = #"{"mcpServers":{"pondside":{"type":"stdio","command":"\#(pondside)","args":["mcp"]}}}"#
             return ["-p", prompt, "--output-format", "stream-json", "--verbose"] + Self.claudeTools
@@ -161,6 +165,7 @@ public struct AgentRun: Sendable {
     /// The agent's last words from its JSON output.
     public func parse(_ output: String, status: Int32) -> Outcome {
         switch harness {
+        case .codex: return parseCodex(output, status: status)
         case .claude:
             // A stream of events ending in { type: result, result, is_error, total_cost_usd, … }
             let json = output.split(separator: "\n").reversed().lazy
@@ -195,6 +200,7 @@ public struct AgentRun: Sendable {
     public func activity(_ line: Substring) -> String? {
         guard let e = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else { return nil }
         switch harness {
+        case .codex: return codexActivity(e)
         case .claude:
             guard e["type"] as? String == "assistant",
                   let content = (e["message"] as? [String: Any])?["content"] as? [[String: Any]] else { return nil }
@@ -238,7 +244,7 @@ public struct AgentRun: Sendable {
         public func stop() {
             lock.lock(); defer { lock.unlock() }
             stopped = true
-            process?.terminate()
+            if process?.isRunning == true { process?.terminate() }
         }
 
         public var wasStopped: Bool {
@@ -252,11 +258,12 @@ public struct AgentRun: Sendable {
     /// `onActivity` hears each change of what it is doing (`activity`).
     /// `log` records the run: command line, every event, stderr, exit.
     public func run(prompt: String, folder: URL, pondside: String, handle: Handle = Handle(),
-                    timeout: TimeInterval = 30 * 60, session: String? = nil, log: AgentLog.Run? = nil,
+                    timeout: TimeInterval = 30 * 60, session: String? = nil, log: AgentLog.Run? = nil, role: MCPServer.Role = .graphics,
                     onActivity: (@Sendable (String) -> Void)? = nil) async throws -> Outcome {
+        let prompt = ScoreContract.notice + "\n" + PatchContract.notice + "\n\n" + prompt
         let p = Process()
         p.executableURL = URL(fileURLWithPath: executable)
-        p.arguments = arguments(prompt: prompt, folder: folder, pondside: pondside, session: session)
+        p.arguments = arguments(prompt: prompt, folder: folder, pondside: pondside, session: session, role: role)
         p.currentDirectoryURL = folder
         p.environment = environment(pondside: pondside, log: log)
         // Claude names its version in its first event; opencode's `run` output doesn't.
@@ -289,6 +296,7 @@ public struct AgentRun: Sendable {
             throw error
         }
         log?.log("pid", "Process \(p.processIdentifier)", level: .debug)
+        if handle.wasStopped, p.isRunning { p.terminate() }
         let deadline = Date().addingTimeInterval(timeout)
         var timedOut = false
         // opencode logs a provider's refusal (free limit, no funds) and may
@@ -357,6 +365,7 @@ public struct AgentRun: Sendable {
         var env = ProcessInfo.processInfo.environment
         env["PATH"] = URL(fileURLWithPath: pondside).deletingLastPathComponent().path + ":" + Self.loginPath
         switch harness {
+        case .codex: break
         case .claude: env["ENABLE_TOOL_SEARCH"] = "false"
         case .opencode:
             // No shell, web or subagents: an unattended edit doesn't need
@@ -425,9 +434,11 @@ public struct AgentRun: Sendable {
     public enum RequestTarget: String, Sendable {
         case existingGraphic
         case emptySection
+        case project
     }
 
     static let graphicRules = """
+    \(ScoreContract.notice)
     The context's selection has kind "graphic-section": `from` and `to` are the two edges. Their `x` values
     are fractions of the broken pieces and their `page_x` values are page coordinates. `systems` lists every
     covered system's selected range and canonical `moments` [first, last]. Follow skill://graphic-notation:
@@ -439,6 +450,7 @@ public struct AgentRun: Sendable {
     """
 
     static let emptySectionRules = """
+    \(ScoreContract.notice)
     The marked range starts where there is no drawing. The range is still the only range: change
     only inside it. Decide what the request asks for before editing:
     - a drawing, texture, shape or gesture: add a new graphic in the marked range with
@@ -454,6 +466,10 @@ public struct AgentRun: Sendable {
     public static func graphicsPrompt(request: String, context: String, score: URL,
                                       followUp: Bool = false,
                                       target: RequestTarget = .existingGraphic) -> String {
+        if target == .project {
+            return ScoreContract.notice + "\n\nGeneral LilyPond project request: \(request)\n\(context)\nThe scope is the requested file/project, not a marked graphics range. Use atomic MCP edits; preserve shared definitions and wrappers. Read only missing lines needed for the request, check the returned engraving, and reply in one short line."
+        }
+
         let rules = target == .emptySection ? Self.emptySectionRules : Self.graphicRules
         let skill = MCPServer.skills.first { $0.folder == "graphic-notation" }.flatMap(MCPServer.skillText) ?? ""
         let lilypond = target == .emptySection
@@ -491,8 +507,8 @@ public struct AgentRun: Sendable {
             Be quick: the context has the graphic's definition, drawing code, short direct helpers in full \
             and other dependencies by exact range, numbered as in their files (`412| ` is a prefix, not part \
             of the line). `section_support` says which window helpers exist and where to insert missing ones; \
-            do not search for them. Use one atomic MCP edit per file (root: \(score.path) for an .ily) without reading \
-            the files again: from_line/to_line for every hunk, optionally with its numbered old text as a \
+            do not search for them. Use the edit tool for one atomic MCP edit per file
+            (root: \(score.path) for an .ily) without reading the files again: from_line/to_line for every hunk, optionally with its numbered old text as a \
             guard; no native Edit/Write. All ranges refer to the same pre-edit snapshot, so inserted lines \
             do not renumber other hunks. It returns the engraving, new_diagnostics and vector verification: \
             fix new diagnostics, a selected no-op or outside changes. No separate check, renders, images or \
@@ -526,7 +542,10 @@ public struct AgentRun: Sendable {
 
     /// A request from the lens for the patch agent: its own conversation,
     /// whose memory is the patch doc (in the context), not the chat.
-    public static func patchPrompt(request: String, context: String, score: URL, patch: URL, followUp: Bool = false) -> String {
+    public static func patchPrompt(request: String, context: String, score: URL, patch: URL, followUp: Bool = false, general: Bool = false) -> String {
+        if general {
+            return PatchContract.notice + "\n\nGeneral patch request: \(request)\nProject context (scope is the requested file/project, not a cue window):\n\(context)\nUse the atomic edit tool, then patch_check once and patch_note. Keep the response to one short line."
+        }
         if followUp {
             return """
             Next patch request: "\(request)". patch_context at the user's point now (code numbered as in its \
@@ -537,7 +556,7 @@ public struct AgentRun: Sendable {
             patch_note what changed and why; reply in one short line with what you changed and how it sounds.
             """
         }
-        let skill = MCPServer.skills.first { $0.folder == "sc-patch-editing" }.flatMap(MCPServer.skillText) ?? ""
+        let skill = PatchContract.notice + "\n\n" + (MCPServer.skills.first { $0.folder == "sc-patch-editing" }.flatMap(MCPServer.skillText) ?? "")
         return """
         The user clicked a point in Pondside's score \(score.path) and asked for a change to its SuperCollider \
         patch \(patch.path): "\(request)".

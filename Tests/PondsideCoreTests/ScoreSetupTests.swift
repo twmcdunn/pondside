@@ -348,3 +348,24 @@ final class LegendScanTests: XCTestCase {
         XCTAssertEqual(Definitions.predicates("(define-music-function (a b) ((number? 1) string?) x)"), ["number?", "string?"])
     }
 }
+
+final class PerformanceFrontMatterTests: XCTestCase {
+    func testDownloadLinkCanBeHiddenWithoutLosingAddress() {
+        let original = FrontMatter(FrontMatter.template([.cover]))
+        let url = "https://github.com/owner/piece/releases/latest/download/Piece.zip"
+        let shown = FrontMatter(original.edits(performanceDownload: url, enabled: true).apply(to: original.text))
+        XCTAssertEqual(shown.performanceDownload, url)
+        XCTAssertTrue(shown.printsPerformanceDownload)
+        let hidden = FrontMatter(shown.edits(performanceDownload: url, enabled: false).apply(to: shown.text))
+        XCTAssertEqual(hidden.performanceDownload, url)
+        XCTAssertFalse(hidden.printsPerformanceDownload)
+        XCTAssertEqual(FrontMatter(hidden.edits(performanceDownload: url, enabled: true).apply(to: hidden.text)).text, shown.text)
+        XCTAssertTrue(shown.edits(performanceDownload: url, enabled: true).isEmpty)
+    }
+    func testDownloadLinkRejectsSourceInjection() {
+        let original = FrontMatter(FrontMatter.template([.cover]))
+        for address in ["file:///tmp/app", "https://github.com/o/r\ncode", "https://github.com/o/\"r", "https://github.com/o/\\r"] {
+            XCTAssertTrue(original.edits(performanceDownload: address, enabled: true).isEmpty)
+        }
+    }
+}

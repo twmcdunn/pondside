@@ -28,6 +28,13 @@ protocol ScoreCanvasDelegate: AnyObject {
 @MainActor
 final class ScoreCanvasView: NSView {
     weak var delegate: ScoreCanvasDelegate?
+    var onCopyNotation: (() -> Void)?
+    var onCutNotation: (() -> Void)?
+    var onPasteNotation: (() -> Void)?
+    @objc func copy(_ sender: Any?) { onCopyNotation?() }
+    @objc func cut(_ sender: Any?) { onCutNotation?() }
+    @objc func paste(_ sender: Any?) { onPasteNotation?() }
+
 
     private(set) var pages: [RenderedPage] = []
     private var pageViews: [PageView] = []
@@ -67,6 +74,47 @@ final class ScoreCanvasView: NSView {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
+
+    private var breakFeedback: NSImageView?
+
+    func clearBreakFeedback() {
+        breakFeedback?.layer?.removeAllAnimations()
+        breakFeedback?.removeFromSuperview()
+        breakFeedback = nil
+    }
+
+    func showBreakFeedback(kind: StructuralEditing.BreakKind, removing: Bool = false) {
+        guard breakFeedback == nil else { return }
+        let badge = BreakProgressIcon()
+        let label = "\(removing ? "Removing" : "Adding") \(kind == .page ? "page" : "system") break · engraving…"
+        badge.image = NSImage(systemSymbolName: kind == .page ? "doc" : "arrow.turn.down.left", accessibilityDescription: label)?
+            .withSymbolConfiguration(.init(pointSize: 15, weight: .medium))
+        badge.contentTintColor = Theme.accent
+        badge.imageScaling = .scaleProportionallyDown
+        badge.toolTip = label
+        badge.setAccessibilityElement(true)
+        badge.setAccessibilityRole(.image)
+        badge.setAccessibilityLabel(label)
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = Theme.chrome.withAlphaComponent(0.94).cgColor
+        badge.layer?.cornerRadius = 6
+        let rect = selectionAnchor ?? NSRect(x: visibleRect.midX, y: visibleRect.minY + 40, width: 2, height: 20)
+        badge.frame = NSRect(x: min(max(visibleRect.minX + 8, rect.minX), max(visibleRect.minX + 8, visibleRect.maxX - 32)),
+                             y: max(visibleRect.minY + 8, rect.minY - 30), width: 24, height: 24)
+        addSubview(badge, positioned: .above, relativeTo: nil)
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1
+            pulse.toValue = 0.35
+            pulse.duration = 0.65
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            badge.layer?.add(pulse, forKey: "waitingForBreakRender")
+        }
+        breakFeedback = badge
+        displayIfNeeded()
+        CATransaction.flush()
+    }
 
     // MARK: Content
 
@@ -415,9 +463,9 @@ final class ScoreCanvasView: NSView {
         var sameFile: [String: Bool] = [:]
         for v in pageViews {
             guard let page = v.rendered?.page else { continue }
-            let matches = page.graphics.filter { g in
+            let matches = positions.flatMap { page.linkedGraphics(at: $0) }.filter { g in
                 guard !v.removed.contains(g) else { return false }
-                guard let link = g.link, positions.contains(link.position) else { return false }
+                guard let link = g.link else { return false }
                 guard let path else { return true }
                 if let known = sameFile[link.path] { return known }
                 let same = PathMatching.same(link.path, path)
@@ -1264,3 +1312,8 @@ private final class WorkBadge: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }
 
+
+@MainActor
+private final class BreakProgressIcon: NSImageView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}

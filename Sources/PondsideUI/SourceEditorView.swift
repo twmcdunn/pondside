@@ -145,6 +145,11 @@ final class SourceEditorView: NSView, NSTextViewDelegate {
     /// cross-file undo step instead).
     func mergeExternal(_ newText: String, into key: URL, registeringUndo: Bool = true) {
         guard let view = views[key] else { return }
+        // Input transactions briefly lock user editing. Their committed source
+        // must still reach TextKit before selections/highlights use its offsets.
+        let wasEditable = view.isEditable
+        view.isEditable = true
+        defer { view.isEditable = wasEditable }
         let manager = view.undoManager
         if !registeringUndo { manager?.disableUndoRegistration() }
         defer { if !registeringUndo { manager?.enableUndoRegistration() } }

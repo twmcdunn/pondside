@@ -15,6 +15,11 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     private weak var anchorView: NSView?
 
     var unmetered = false
+    var enteringNotes = false
+    var armedDuration = "4"
+    var armedAccidental: Int?
+    var onSelectEvent: ((Int, Bool) -> Void)?
+    func showFeedback(_ message: String) { card?.showFeedback(message) }
     var onClose: (() -> Void)?
     var onFailure: ((String) -> Void)?
     var onSwitch: ((LensMode) -> Void)?
@@ -23,6 +28,8 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
 
     private func configure(_ card: NotationLensOverlayView) {
         card.setUnmetered(unmetered)
+        card.setDuration(armedDuration)
+        card.setArmedAccidental(armedAccidental)
         card.tabTarget = LensMode.notation.next(among: available)?.title.lowercased()
         card.modes.configure(current: .notation, available: available, unavailable: unavailable)
         card.modes.onSelect = { [weak self] m in
@@ -39,6 +46,8 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     func present(lens: LensScoreWindow, fileLabel: String, anchor: LensAnchor?, explicit: Bool) -> Bool {
         if let popover, let host, let card, popover.isShown {
             do {
+                host.enteringNotes = enteringNotes
+                host.onSelectEvent = onSelectEvent
                 try host.load(lens)
             } catch {
                 lensLog.error("refresh failed: \(String(describing: error), privacy: .public)")
@@ -57,13 +66,23 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
                 popover.positioningRect = anchor.rect
             }
             card.layoutSubtreeIfNeeded()
-            host.centerTarget(animated: !Self.reduceMotion)
+            host.centerTarget(animated: !enteringNotes && !Self.reduceMotion)
             return true
         }
         guard let anchor else { return false }
 
         let host = LensScoreHostView()
+        host.onLoad = { [weak self, weak host] in
+            guard let self, let host, self.host === host else { return }
+            host.centerTarget(animated: !self.enteringNotes && !Self.reduceMotion)
+        }
+        host.onFailure = { [weak self] message in
+            self?.dismiss(animated: false)
+            self?.onFailure?(message)
+        }
         do {
+            host.enteringNotes = enteringNotes
+            host.onSelectEvent = onSelectEvent
             try host.load(lens)
         } catch {
             lensLog.error("load failed: \(String(describing: error), privacy: .public)")

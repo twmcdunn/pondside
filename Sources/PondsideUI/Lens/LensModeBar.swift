@@ -54,6 +54,15 @@ enum LensMode: Int, CaseIterable {
 @MainActor
 final class LensModeBar: NSSegmentedControl {
     var onSelect: ((LensMode) -> Void)?
+    var compact = false {
+        didSet {
+            guard compact != oldValue else { return }
+            for mode in LensMode.allCases where mode.rawValue < segmentCount {
+                setLabel(compact ? "" : mode.title, forSegment: mode.rawValue)
+            }
+            invalidateIntrinsicContentSize()
+        }
+    }
 
     /// `current` selected; the others enabled when `available`; `unavailable`
     /// tooltips say why one isn't.
@@ -64,7 +73,7 @@ final class LensModeBar: NSSegmentedControl {
         controlSize = .small
         for m in LensMode.allCases {
             setImage(m.icon, forSegment: m.rawValue)
-            setLabel(m.title, forSegment: m.rawValue)
+            setLabel(compact ? "" : m.title, forSegment: m.rawValue)
             setImageScaling(.scaleProportionallyDown, forSegment: m.rawValue)
             setEnabled(m == current || available.contains(m), forSegment: m.rawValue)
             setToolTip(available.contains(m) || m == current ? m.help : (unavailable[m] ?? m.help), forSegment: m.rawValue)

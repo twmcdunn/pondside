@@ -27,6 +27,15 @@ rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$bin/PondsideApp" "$app/Contents/MacOS/Pondside"
 cp "$bin/pondside" "$app/Contents/Resources/pondside"
+# The performance player is precompiled, so creating an exported app does
+# not ask a musician to install Xcode or Command Line Tools.
+player_source=".build/PerformancePlayer-main.swift"
+cp Sources/PondsideUI/Performance/Player.swift.txt "$player_source"
+for player_arch in arm64 x86_64; do
+  "$SWIFT"c -target "$player_arch-apple-macos14.0" -swift-version 6 -O "$player_source" -o ".build/PerformancePlayer-$player_arch"
+done
+lipo -create .build/PerformancePlayer-arm64 .build/PerformancePlayer-x86_64 -output "$app/Contents/Resources/PerformancePlayer"
+
 # SwiftPM resource bundles (the Lexicon, the Bravura font). Bundle.module
 # looks beside the app's resources, and beside the CLI, which lives there
 # too; newer toolchains no longer fall back to the build directory.

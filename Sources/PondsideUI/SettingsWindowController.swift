@@ -48,6 +48,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func build() {
+        agentPopup.setAccessibilityLabel("Coding agent")
         agentPopup.target = self
         agentPopup.action = #selector(agentChanged)
         agentDetail.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
@@ -119,7 +120,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         agentPopup.selectItem(at: index)
         var detail = "Carries out requests from the lens (⌘L on a graphic, or ⇥ in the lens) and finishes SuperCollider patch migrations, in the background."
         for (h, path) in found {
-            detail += "\n\(h.title): " + (path ?? "not installed — the Pondside installer can add it")
+            let missing = h == .codex ? "not installed — install the Codex CLI and run codex login" : "not installed — the Pondside installer can add it"
+            detail += "\n\(h.title): " + (path ?? missing)
         }
         agentDetail.stringValue = detail
         fillModels()
@@ -129,6 +131,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let i = agentPopup.indexOfSelectedItem
         let value: String? = i == 0 ? nil : i <= found.count ? found[i - 1].0.rawValue : "off"
         UserDefaults.standard.set(value, forKey: DocumentWindowController.agentKey)
+        _ = DocumentWindowController.agent(value)
         fillModels()
     }
 

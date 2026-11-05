@@ -495,7 +495,9 @@ struct Parser {
             children.append(SyntaxNode(.octaveMarks, s..<pos))
             marksRange = s..<pos
         }
+        var accidentalMark: Range<Int>?
         if at(pos) == Ch.bang || at(pos) == Ch.question {
+            accidentalMark = pos..<(pos + 1)
             children.append(SyntaxNode(.accidentalMark, pos..<(pos + 1)))
             pos += 1
         }
@@ -531,7 +533,7 @@ struct Parser {
         }
         let word = text(t.start, t.end)
         notes.append(NoteInfo(
-            role: role, name: t.start..<t.end, marks: marksRange, octaveCheck: check?.range,
+            role: role, name: t.start..<t.end, marks: marksRange, accidentalMark: accidentalMark, octaveCheck: check?.range,
             writtenStep: step, writtenAlteration: alteration, writtenMarks: marks,
             absolute: Pitch(step: step, alteration: alteration, octave: check?.octave ?? octave),
             mode: mode, referent: referent, language: language, longForm: word.contains("-"), event: event))

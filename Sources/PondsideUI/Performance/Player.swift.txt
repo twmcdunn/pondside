@@ -1,0 +1,328 @@
+import AppKit
+import AVFoundation
+import Darwin
+
+struct Manifest: Codable {
+    struct Cue: Codable { var name: String; var seconds: Double }
+    struct System: Codable { var file: String; var seconds: Double }
+    var title: String
+    var repository: String
+    var patch: String
+    var cues: [Cue]
+    var systems: [System]
+}
+
+@MainActor final class PerformanceView: NSView {
+    var systems: [NSImage] = [] { didSet { needsDisplay = true } }
+    var cue = 0 { didSet { setAccessibilityValue("Cue \(cue)"); needsDisplay = true } }
+    var elapsed: TimeInterval = 0 { didSet { needsDisplay = true } }
+    var message = "Preparing sounds…" { didSet { needsDisplay = true } }
+    var onKey: ((UInt16) -> Void)?
+    override var acceptsFirstResponder: Bool { true }
+    override var isFlipped: Bool { true }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Performance score. Space or Right Arrow advances a cue; Left Arrow returns to the previous cue.")
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func keyDown(with event: NSEvent) {
+        if [UInt16(49), 123, 124].contains(event.keyCode) { onKey?(event.keyCode) }
+        else { super.keyDown(with: event) }
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor(calibratedWhite: 0.105, alpha: 1).setFill(); bounds.fill()
+        let badge = NSRect(x: 24, y: 16, width: 68, height: 68)
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: badge, xRadius: 12, yRadius: 12).fill()
+        let number = NSAttributedString(string: String(cue), attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 36, weight: .semibold), .foregroundColor: NSColor.white])
+        number.draw(at: NSPoint(x: badge.midX - number.size().width / 2, y: badge.midY - number.size().height / 2))
+        let clock = String(format: "%02d:%02d", Int(elapsed) / 60, Int(elapsed) % 60)
+        NSAttributedString(string: clock, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 28, weight: .regular), .foregroundColor: NSColor.white]).draw(at: NSPoint(x: 112, y: 26))
+        NSAttributedString(string: message, attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.lightGray]).draw(at: NSPoint(x: 112, y: 63))
+        guard !systems.isEmpty else { return }
+        let available = NSRect(x: 24, y: 106, width: bounds.width - 48, height: bounds.height - 130)
+        let gap: CGFloat = 16
+        let ratios = systems.map { $0.size.height / max(1, $0.size.width) }
+        let width = min(available.width, (available.height - gap * CGFloat(systems.count - 1)) / ratios.reduce(0, +))
+        var y = available.minY
+        for (i, image) in systems.enumerated() {
+            let rect = NSRect(x: available.midX - width / 2, y: y, width: width, height: width * ratios[i])
+            NSColor(calibratedWhite: 0.94, alpha: 1).setFill(); rect.fill()
+            image.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 0.94, respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+            y += rect.height + gap
+        }
+    }
+}
+
+@MainActor final class Player: NSObject, NSApplicationDelegate {
+    let resources: URL
+    let applicationSupport: URL
+    init(resources: URL = Bundle.main.resourceURL!, applicationSupport: URL? = nil) {
+        self.resources = resources
+        self.applicationSupport = applicationSupport ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        super.init()
+    }
+    var manifest: Manifest!
+    var window: NSWindow!
+    let view = PerformanceView(frame: NSRect(x: 0, y: 0, width: 1200, height: 850))
+    var process: Process?
+    var input: FileHandle?
+    var timer: Timer?
+    var started: Date?
+    var cueDate = Date()
+    var current = -1
+    var ready = false
+    var initialized = false
+    var serverPort: UInt16 = 0
+    var output = ""
+    var log = ""
+    var imageIndex = -1
+    var work: URL!
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        do {
+            manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: resources.appendingPathComponent("performance.json")))
+            window = NSWindow(contentRect: view.frame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+            window.title = manifest.title
+            window.minSize = NSSize(width: 700, height: 500)
+            window.contentView = view
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.center(); window.makeKeyAndOrderFront(nil); window.makeFirstResponder(view)
+            view.onKey = { [weak self] key in self?.trigger(previous: key == 123) }
+            showSystems(at: 0)
+            Task {
+                do {
+                    try await prepare()
+                    guard await AVCaptureDevice.requestAccess(for: .audio) else { throw Failure("Allow microphone access in System Settings → Privacy & Security → Microphone, then reopen the app.") }
+                    try boot()
+                }
+                catch { fail(error.localizedDescription) }
+            }
+        } catch { fail(error.localizedDescription) }
+    }
+    func fail(_ message: String) {
+        view.message = message
+        let alert = NSAlert(); alert.messageText = "The performance patch could not start"; alert.informativeText = message
+        if let window { alert.beginSheetModal(for: window) } else { alert.runModal() }
+    }
+    func prepare() async throws {
+        let fm = FileManager.default
+        let support = applicationSupport.appendingPathComponent("Pondside Performances").appendingPathComponent(manifest.repository)
+        try fm.createDirectory(at: support, withIntermediateDirectories: true)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+        work = support.appendingPathComponent(version)
+        if !fm.fileExists(atPath: work.path) {
+            try fm.copyItem(at: resources.appendingPathComponent("Project"), to: work)
+        }
+        let inventory = try JSONDecoder().decode([String: [SoundFile]].self,
+            from: Data(contentsOf: resources.appendingPathComponent("sound-inventory.json")))
+        let destinations = ["resources.zip": work.appendingPathComponent(manifest.patch).deletingLastPathComponent().appendingPathComponent("resources"),
+                            "sounds.zip": applicationSupport.appendingPathComponent("SuperCollider/sounds")]
+        var missing: [String: Set<String>] = [:]
+        for name in ["resources.zip", "sounds.zip"] {
+            guard let files = inventory[name], let destination = destinations[name] else { throw Failure("The app's sound inventory is incomplete.") }
+            let paths = Set(files.filter { !soundIsPresent($0, at: destination) }.map(\.path))
+            if !paths.isEmpty { missing[name] = paths }
+        }
+        // This check runs every time. No first-run flag can hide deleted
+        // or incomplete sound files, and a healthy install never uses GitHub.
+        guard !missing.isEmpty else { return }
+        let buildFolder = resources.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let localAssets = buildFolder.appendingPathComponent("Assets")
+        let receipt = (try? Data(contentsOf: buildFolder.appendingPathComponent("deployment.json")))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        let prepared = receipt?["prepared"] as? [String: Any]
+        let hasLocalAssets = prepared?["repository"] as? String == manifest.repository
+            && missing.keys.allSatisfy { fm.fileExists(atPath: localAssets.appendingPathComponent($0).path) }
+        if hasLocalAssets {
+            view.message = "Restoring missing sounds…"
+            for (name, paths) in missing {
+                let destination = destinations[name]!
+                try await Task.detached {
+                    try installArchive(localAssets.appendingPathComponent(name), to: destination, stagingAt: support, only: paths)
+                }.value
+            }
+        } else {
+            var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(manifest.repository)/releases/latest")!)
+            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let release = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let assets = release["assets"] as? [[String: Any]] else { throw Failure("Cannot read the latest GitHub release. Check your network connection.") }
+            for (name, paths) in missing.sorted(by: { $0.key < $1.key }) {
+                guard let asset = assets.first(where: { $0["name"] as? String == name }), let address = asset["browser_download_url"] as? String,
+                      let url = URL(string: address), url.scheme == "https", url.host == "github.com", let destination = destinations[name] else { throw Failure("The release is missing \(name).") }
+                view.message = "Restoring \(name)…"
+                let (download, result) = try await URLSession.shared.download(from: url)
+                guard (result as? HTTPURLResponse)?.statusCode == 200 else { throw Failure("Download failed: \(name)") }
+                let archive = support.appendingPathComponent(UUID().uuidString + ".zip")
+                try fm.moveItem(at: download, to: archive)
+                defer { try? fm.removeItem(at: archive) }
+                try await Task.detached { try installArchive(archive, to: destination, stagingAt: support, only: paths) }.value
+            }
+        }
+        for (name, paths) in missing {
+            let files = inventory[name]!.filter { paths.contains($0.path) }
+            guard files.allSatisfy({ soundIsPresent($0, at: destinations[name]!) }) else {
+                throw Failure("The sound archive does not match this app. Download the latest performance app and try again.")
+            }
+        }
+    }
+
+    func boot() throws {
+        view.message = "Preparing patch…"
+        serverPort = try availableUDPPort()
+        let executable = resources.appendingPathComponent("SuperCollider.app/Contents/MacOS/sclang")
+        let scResources = executable.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources")
+        let config = work.appendingPathComponent("sclang_conf.yaml")
+        let path = scResources.appendingPathComponent("SCClassLibrary").path.replacingOccurrences(of: "'", with: "''")
+        try "includePaths:\n    - '\(path)'\nexcludePaths: []\nexcludeDefaultPaths: true\n".write(to: config, atomically: true, encoding: .utf8)
+        let p = Process(), stdin = Pipe(), stdout = Pipe()
+        p.executableURL = executable; p.arguments = ["-l", config.path, "-i", "pondside-performance"]
+        p.currentDirectoryURL = work
+        p.standardInput = stdin; p.standardOutput = stdout; p.standardError = stdout
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let text = String(decoding: data, as: UTF8.self)
+            Task { @MainActor in self?.receive(text) }
+        }
+        p.terminationHandler = { [weak self] process in
+            let status = process.terminationStatus
+            Task { @MainActor in self?.ready = false; self?.view.message = "Audio engine stopped (\(status))" }
+        }
+        process = p; input = stdin.fileHandleForWriting
+        try p.run()
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(90))
+            guard let self, !ready else { return }
+            fail("Patch preparation did not finish.\n" + String(log.suffix(1800)))
+        }
+    }
+    func receive(_ text: String) {
+        output += text; log += text
+        if log.count > 12000 { log = String(log.suffix(12000)) }
+        if !initialized, output.contains("Welcome to SuperCollider") {
+            initialized = true
+            let patch = work.appendingPathComponent(manifest.patch).path
+            let literal = patch.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            send("s = Server(\\pondsidePerformance, NetAddr(\"127.0.0.1\", \(serverPort))); Server.default = s; ~pondsideMode = \\live; \"\(literal)\".load;")
+        }
+        if output.contains("PONDSIDE_PREPARED") {
+            ready = true; view.message = "Space / → next cue     ← previous cue"
+            output = ""
+        }
+        if output.count > 4000 { output = String(output.suffix(4000)) }
+    }
+    func send(_ code: String) { try? input?.write(contentsOf: Data((code + "\u{1b}").utf8)) }
+    func trigger(previous: Bool) {
+        guard ready, !manifest.cues.isEmpty else { NSSound.beep(); return }
+        let next = previous ? max(0, current - 1) : current + 1
+        guard manifest.cues.indices.contains(next) else { return }
+        let cue = manifest.cues[next]
+        if previous {
+            let name = cue.name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            send("~triggerCue.(\"\(name)\");")
+        } else { send("~triggerCue.();") }
+        current = next; cueDate = Date(); view.cue = Int(cue.name) ?? next + 1
+        if started == nil {
+            started = Date()
+            timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                Task { @MainActor in self?.tick() }
+            }
+        }
+        tick()
+    }
+    func tick() {
+        view.elapsed = started.map { Date().timeIntervalSince($0) } ?? 0
+        guard manifest.cues.indices.contains(current) else { return }
+        let base = manifest.cues[current].seconds
+        var time = base + Date().timeIntervalSince(cueDate)
+        if current + 1 < manifest.cues.count { time = min(time, manifest.cues[current + 1].seconds - 0.001) }
+        showSystems(at: time)
+    }
+    func showSystems(at time: Double) {
+        let last = manifest.systems.lastIndex { $0.seconds <= time } ?? 0
+        let first = min(last, max(0, manifest.systems.count - 2))
+        guard first != imageIndex else { return }; imageIndex = first
+        view.systems = manifest.systems.dropFirst(first).prefix(2).compactMap { NSImage(contentsOf: resources.appendingPathComponent($0.file)) }
+    }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate(); send("s.quit; 0.exit;")
+        let p = process
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { if p?.isRunning == true { p?.terminate() } }
+    }
+}
+struct Failure: Error, LocalizedError { var message: String; init(_ message: String) { self.message = message }; var errorDescription: String? { message } }
+func availableUDPPort() throws -> UInt16 {
+    let descriptor = socket(AF_INET, SOCK_DGRAM, 0)
+    guard descriptor >= 0 else { throw Failure("Cannot reserve an audio-server port") }
+    defer { close(descriptor) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let result = withUnsafePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+    }
+    guard result == 0 else { throw Failure("Cannot reserve an audio-server port") }
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let bound = withUnsafeMutablePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+    }
+    guard bound == 0 else { throw Failure("Cannot read the audio-server port") }
+    return UInt16(bigEndian: address.sin_port)
+}
+struct SoundFile: Codable { var path: String; var bytes: Int }
+func soundIsPresent(_ file: SoundFile, at directory: URL) -> Bool {
+    guard !file.path.hasPrefix("/"), !file.path.split(separator: "/").contains(".."), !file.path.contains("\\") else { return false }
+    let target = directory.appendingPathComponent(file.path)
+    guard let values = try? target.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]) else { return false }
+    return values.isRegularFile == true && values.isSymbolicLink != true && values.fileSize == file.bytes
+}
+func installArchive(_ archive: URL, to destination: URL, stagingAt support: URL, only paths: Set<String>? = nil) throws {
+    let fm = FileManager.default
+    let listing = try command("/usr/bin/unzip", ["-Z1", archive.path])
+    for entry in listing.split(separator: "\n") {
+        guard !entry.hasPrefix("/"), !entry.split(separator: "/").contains(".."), !entry.contains("\\") else { throw Failure("Unsafe sound archive member") }
+    }
+    let details = try command("/usr/bin/unzip", ["-Z", "-l", archive.path])
+    guard !details.split(separator: "\n").contains(where: { $0.hasPrefix("l") }) else { throw Failure("Sound archives cannot contain symbolic links") }
+    let staging = support.resolvingSymlinksInPath().standardizedFileURL.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fm.createDirectory(at: staging, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: staging) }
+    _ = try command("/usr/bin/ditto", ["-x", "-k", archive.path, staging.path])
+    guard let enumerator = fm.enumerator(atPath: staging.path) else { throw Failure("Cannot read sound archive") }
+    var files: [(URL, String)] = []
+    for case let relative as String in enumerator {
+        let file = staging.appendingPathComponent(relative)
+        let values = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .isRegularFileKey])
+        guard values.isSymbolicLink != true else { throw Failure("Sound archives cannot contain symbolic links") }
+        if values.isRegularFile == true { files.append((file, relative)) }
+    }
+    let root = destination.resolvingSymlinksInPath().standardizedFileURL.path
+    for (file, relative) in files {
+        if let paths, !paths.contains(relative) { continue }
+        let target = destination.appendingPathComponent(relative)
+        guard target.resolvingSymlinksInPath().standardizedFileURL.path.hasPrefix(root + "/") else { throw Failure("Sound destination escapes its installation directory") }
+        try fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(contentsOf: file).write(to: target, options: .atomic)
+    }
+}
+func command(_ executable: String, _ arguments: [String]) throws -> String {
+    let process = Process(), output = Pipe()
+    process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
+    process.standardOutput = output; process.standardError = output
+    try process.run()
+    let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+    guard process.terminationStatus == 0 else { throw Failure(String(decoding: data, as: UTF8.self)) }
+    return String(decoding: data, as: UTF8.self)
+}
+let app = NSApplication.shared
+let delegate = Player()
+app.setActivationPolicy(.regular)
+app.delegate = delegate
+app.activate(ignoringOtherApps: true)
+app.run()

@@ -440,6 +440,17 @@ public enum StructuralEditing {
         return LensContextScanner.scan(root, block: node.range).times.first?.time
     }
 
+    /// Reuse the lexical index across shared definitions instead of indexing
+    /// the entire root once for every measure in a lens refresh.
+    public static func times(in root: SyntaxTree) -> [String: LensTime] {
+        let source = LensContextScanner.Source(root)
+        var result: [String: LensTime] = [:]
+        for (name, node) in definitions(in: root) {
+            if let time = LensContextScanner.scan(source, block: node.range).times.first?.time { result[name] = time }
+        }
+        return result
+    }
+
     /// Check the contract after hand edits too. A marker alone is not proof
     /// that all voices still share a timeline, or that no local meter was added.
     public static func validate(_ files: [File], root: String) throws {
@@ -635,6 +646,18 @@ public enum StructuralEditing {
         }
     }
 
+    /// Validate the complete proposed GUI transaction before changing buffers
+    /// or disk. A managed score cannot silently lose its contract.
+    public static func verifyProjectEdit(before: [File], proposed: [File], root: String,
+                                         allowingContractRemoval: Bool = false) throws {
+        guard let next = proposed.first(where: { $0.id == root }) else { throw Failure("The root score is missing.") }
+        let wasManaged = before.first(where: { $0.id == root }).map { isManaged($0.tree) } ?? false
+        if wasManaged && !isManaged(next.tree) && !allowingContractRemoval {
+            throw Failure("This edit removes the shared-measure contract. Preserve its generated block and voice wrappers; see pondside://contract.")
+        }
+        if isManaged(next.tree) { try verifyLengths(proposed, root: root) }
+    }
+
     /// Keystroke validation trusts the migrated wrapper structure and checks
     /// only bodies changed by this edit. Opaque functions are checked by the
     /// normal background engraving, never by a synchronous preflight.
@@ -730,15 +753,32 @@ public enum StructuralEditing {
         return command
     }
 
+    public enum BreakKind: Sendable { case system, page
+        var command: String { self == .page ? "\\pageBreak" : "\\break" }
+    }
+
+    public static func breakState(in tree: SyntaxTree) -> [String: BreakKind] {
+        Dictionary(uniqueKeysWithValues: definitions(in: tree).compactMap { name, node in
+            breakIn(tree, node: node).map { (name, $0 == "\\pageBreak" ? .page : .system) }
+        })
+    }
+
+    public static func breakBefore(_ measure: String, in tree: SyntaxTree) -> BreakKind? {
+        let all = definitions(in: tree)
+        guard let index = all.firstIndex(where: { $0.0 == measure }), index > 0,
+              let command = breakIn(tree, node: all[index - 1].1) else { return nil }
+        return command == "\\pageBreak" ? .page : .system
+    }
+
     /// A boundary before a selected measure belongs to its predecessor's end.
-    public static func toggleBreak(before measure: String, files: [File], root: String) throws -> [Change] {
+    public static func toggleBreak(before measure: String, files: [File], root: String, kind: BreakKind = .system) throws -> [Change] {
         try validate(files, root: root)
         guard let file = files.first(where: { $0.id == root }), managesBreaks(file.tree) else { throw Failure("Shared breaks are not enabled in Restore Defaults.") }
         let all = definitions(in: file.tree)
         guard let index = all.firstIndex(where: { $0.0 == measure }), index > 0 else { throw Failure("There is no system boundary before the first measure.") }
         let (name, node) = all[index - 1]
         guard let time = time(in: file.tree, name: name) else { throw Failure("The preceding measure has no literal meter.") }
-        let command: String? = breakIn(file.tree, node: node) == nil ? "\\break" : nil
+        let command: String? = breakIn(file.tree, node: node) == kind.command ? nil : kind.command
         return [Change(file: root, edits: [TextEdit(node.range, String(definition(name: name, time: time, breakCommand: command).dropFirst(name.utf8.count + 3)))])]
     }
 

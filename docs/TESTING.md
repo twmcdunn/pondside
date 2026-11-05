@@ -13,7 +13,7 @@ coverage and intent.
 | Engraving tests | CI against LilyPond 2.24.3 and 2.26.0 | the driver, warm daemon, SVG, timing, Lexicon entries | LilyPond; they `XCTSkip` without it |
 | Corpus round-trip / fuzz | CI with `PONDSIDE_CORPUS` | parser losslessness on LilyPond's own regression suite and snippets | the LilyPond sources |
 | UI | by hand | layout, focus, HIG behaviour | the running app (`.claude/skills/pondside-ui`) |
-| Agent smoke test (planned) | by hand | breaks in Claude Code or opencode | the agents installed and logged in |
+| Agent smoke test (planned) | by hand | breaks in Claude Code, opencode or Codex | the agents installed and logged in |
 
 A green `swift test` without LilyPond has tested nothing about engraving:
 check the skipped tests before claiming success.
@@ -22,13 +22,18 @@ check the skipped tests before claiming success.
 
 - **Core** (`PondsideCoreTests`): lossless CST (`tree.reconstructed ==
   text`), minimal-diff `ScoreEditor` edits and their inverses, note input,
-  the command catalog and keyboard audit, pane layouts (including the
+  accidental visibility/entry and contextual glyph toggling (`AccidentalTests`),
+  the command catalog and keyboard audit, chronological input-draft edit
+  mapping, exact undo/redo source and selection restoration, and constrained
+  content edits without unrelated project audits
+  (`UnmeteredInputPlanTests`), pane layouts (including the
   Agent Log toggle), engraving settings, the lens, SuperCollider parsing,
   Score Setup (`ScoreSetupTests`: instrument matching, staff names and
   clefs through variables and files, `front-matter.ily` sections, notes
   and legend, header fields, legend candidates found in the instrumental
   music: `LegendScanTests`).
-- **Engrave**: toolchain, daemon, SVG geometry and hit-testing, mockup and
+- **Engrave**: proposed CST/lens construction on every unmetered keystroke
+  without disk writes (`UnmeteredInputTransactionTests`), toolchain, daemon, SVG geometry and hit-testing, mockup and
   mix rendering, playback, render cache, shadow history, timing dump; the
   marked section's interpolated edge moments (`SectionTimeMapTests`), the
   staff-line window recipe (`StaffLineWindowTests`) and the bounded raw
@@ -49,7 +54,8 @@ check the skipped tests before claiming success.
   empty-section prompt), agent configs (`AgentSetup`), the agent log (`AgentLogTests`:
   JSONL append and incremental read, both agents' event streams, the
   pane's presentation), opencode's models, inline config and log-read
-  provider errors (`OpencodeTests`); the `edit` tool's edits, the patch
+  provider errors (`OpencodeTests`); Codex JSONL, sandbox/MCP configuration,
+  explicit conversation resume and reset with a fake CLI (`CodexAgentTests`); the `edit` tool's edits, the patch
   agent's context, `sc_lexicon_add`, the two roles' tools and files, and
   the prompts (`PatchAgentTests`).
 

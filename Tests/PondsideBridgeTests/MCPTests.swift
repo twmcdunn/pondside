@@ -3,6 +3,16 @@ import XCTest
 @testable import PondsideBridge
 
 final class MCPTests: XCTestCase {
+    func testContractResourceAndEditToolGuidance() async throws {
+        let server = MCPServer(project: try temp())
+        let resource = try await call(server, #"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"pondside://contract"}}"#)
+        XCTAssertTrue(resource.jsonString().contains("pondsideMeasure"))
+        let tools = try await call(server, #"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        let edits = tools["result"]?["tools"]?.array?.filter { ["edit", "graphic_insert"].contains($0["name"]?.string ?? "") } ?? []
+        XCTAssertEqual(edits.count, 2)
+        XCTAssertTrue(edits.allSatisfy { $0["description"]?.string?.contains("pondside://contract") == true })
+    }
+
     func temp() throws -> URL {
         let d = FileManager.default.temporaryDirectory.appendingPathComponent("pondside-mcp-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)

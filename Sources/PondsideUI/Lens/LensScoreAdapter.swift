@@ -13,11 +13,26 @@ enum LensScoreAdapter {
 
     static func score(for lens: LensScoreWindow) throws -> Score {
         var score = try MusicXMLParser.parse(Data(lens.xml.utf8))
+        preserveWrittenAccidentals(lens, in: &score)
         trim(&score, reachesEnd: lens.reachesEnd)
         attachSlurs(lens, to: &score)
         attachTuplets(lens, to: &score)
         attachTremolos(lens, to: &score)
         return score
+    }
+
+    /// MusicXML import loses LilyPond's !/? display intent. Mark only those
+    /// source-forced glyphs as user accidentals; ordinary pitch changes keep
+    /// the layout engine's automatic accidental suppression.
+    static func preserveWrittenAccidentals(_ lens: LensScoreWindow, in score: inout Score) {
+        for event in lens.events where event.notes.contains(where: \.forcesAccidental) {
+            guard let at = element(of: event, in: lens, score: score) else { continue }
+            updateChord(in: &score, measure: event.measureIndex, slot: at.slot, index: at.index) { chord in
+                for note in event.notes where note.forcesAccidental && chord.notes.indices.contains(note.indexInChord) {
+                    chord.notes.updateNote(at: note.indexInChord) { $0.accidentalRole = .user }
+                }
+            }
+        }
     }
 
     /// A window cut from the middle of the music: the renderer would number

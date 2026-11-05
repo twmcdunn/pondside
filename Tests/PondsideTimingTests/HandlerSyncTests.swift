@@ -67,9 +67,9 @@ final class HandlerSyncTests: XCTestCase {
     func testANewPatchHasTheEngineAndOneStubPerCueInsideTheCueBlock() {
         let s = HandlerSync.patchStarter(sheet([("1", Rational(0)), ("2", Rational(1))]), name: "quartet")
         XCTAssertTrue(s.hasPrefix(HandlerSync.patchMarker))
-        XCTAssertTrue(s.contains("~mode = \\mockup;"))
-        XCTAssertTrue(s.contains("\"dependencies/pondside.scd\".loadRelative;"))
-        XCTAssertTrue(s.contains("~triggerCue.();      // cue 1 starts the piece"))
+        XCTAssertTrue(s.contains("~mode = ~pondsideMode ? \\live;"))
+        XCTAssertTrue(s.contains("(patchFolder +/+ \"dependencies/pondside.scd\").load;"))
+        XCTAssertTrue(s.contains("// After the main block is ready: ~triggerCue.();"))
         XCTAssertTrue(s.contains("~stop.();"))
         XCTAssertFalse(s.contains("SoundIn"), "the engine is in its own file")
         let engine = HandlerSync.engine(name: "quartet")
@@ -77,7 +77,7 @@ final class HandlerSyncTests: XCTestCase {
         XCTAssertTrue(engine.contains("~triggerCue = { |cue|"))
         XCTAssertTrue(engine.contains("e[\\renders] = here +/+ \"../../renders\";\ne[\\name] = \"quartet\";"))
         XCTAssertTrue(s.contains("\(HandlerSync.cuesAnchor)\n// @pondside cue cue-1 · bar 1 beat 1 · 0.000 s\n~cue[\\cue1] = { |cue|\n\n};\n// @pondside end cue-1\n"))
-        XCTAssertTrue(s.contains("// @pondside end cue-2\n\n)\n"))
+        XCTAssertTrue(s.contains("// @pondside end cue-2\n"))
     }
 
     func testAPatchGainsStubsInItsOwnStyleEvenWhenItHasNone() {

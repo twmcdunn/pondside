@@ -119,7 +119,8 @@ struct MusicXMLLensWriter {
 
             let slot = PitchKey(step: pitch.step, octave: pitch.octave)
             let current = accidentals[slot] ?? key.alteration(for: pitch.step)
-            let accidental = !tiedIn && pitch.alteration != current ? accidentalName(pitch.alteration) : nil
+            let forced = tree.notes[noteIndex].accidentalMark != nil
+            let accidental = forced || (!tiedIn && pitch.alteration != current) ? accidentalName(pitch.alteration) : nil
             accidentals[slot] = pitch.alteration
 
             out += "      <note>"

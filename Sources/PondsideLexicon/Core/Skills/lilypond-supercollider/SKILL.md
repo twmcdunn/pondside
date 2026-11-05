@@ -18,6 +18,25 @@ out, no generated playback) and drift from the mockup. Older projects that
 include `timing.ily` keep working (it only writes `score.timing`); Pondside
 ignores that file.
 
+
+## Performance initialization contract
+
+Preserve `pondside://patch-contract` on every edit (full documentation:
+`docs/SUPERCOLLIDER.md`, “Performance initialization contract”). The main
+`.scd` starts with a usage comment: execute its main block once, then call
+`~triggerCue.()` to fire live cues. A single main block sets `s.options`,
+reboots the server, and puts ALL preparation in `s.waitForBoot`: `~mode`
+(`\live` or `\mockup`, respecting `~pondsideMode`), dependency execution,
+buffer loads, buses, SynthDefs, Pbinds, cue functions and startup synths.
+Finish required asynchronous server preparation with `s.sync` before the
+ready signal. Never add another required setup block or loose setup lines.
+All sounds except the score mockup live in `patch/resources/` or
+`Platform.userAppSupportDir +/+ "sounds"`, including child directories;
+reference them through `~resources` / `~sharedSounds`. No Qt requirement in
+the exported performance patch. Keep the fast edit → patch_check → patch_note
+workflow: use supplied numbered context, read more only when necessary,
+and repeat checks only to resolve a failure or an audible problem.
+
 ## What Pondside writes, and where
 
 `score` below stands for the root file's name (`quartet.ly` gives
@@ -41,10 +60,12 @@ Cue names: `\ecue "12"` → `cue 12` → handler `\cue12` (`"FxSwell"` →
 
 ## The patch (`patch/score.scd`)
 
-The composer's code, plus: a first block (`~mode = \mockup` or `\live`, and
-`"dependencies/pondside.scd".loadRelative;`, the engine), a cue block with
-one `~cue[\cue12] = { |cue| … };` per cue between Pondside's markers, and
-the run lines:
+The composer's code and cue handlers live in one main initialization block.
+Its `s.waitForBoot` prepares all dependencies and sound resources after
+options and reboot. The generated engine loads there using
+`(patchFolder +/+ "dependencies/pondside.scd").load;`. Each cue has one
+`~cue[\cue12] = { |cue| … };` between Pondside's existing markers. After
+executing the main block once:
 
 - `~triggerCue.()`: cue 1 starts the piece (mockup: the mockup plays and
   the cues fire on time; live: the mic is the live signal); after that, the
