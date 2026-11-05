@@ -84,8 +84,18 @@ public enum ScoreGraphic {
         }
         for id in second where helpers.count < 40 { add(id, full: false) }
         if !helpers.isEmpty { out["uses"] = .array(helpers) }
-        // The window recipe's prerequisites, so the agent never has to
-        // search the project just to learn whether they already exist.
+        out["section_support"] = sectionSupport(files: files, fallback: drawings.first, relative: relative)
+        let notes = comments(mentioning: "\\" + name, in: files)
+        if !notes.isEmpty { out["notes"] = .string(notes) }
+        return .object(out)
+    }
+
+    /// The window recipe's prerequisites, so the agent never has to search
+    /// the project just to learn whether they already exist; with the
+    /// helper that takes a drawing to its system's staff ends (the skill's
+    /// "Reach the system's ends"), separate from `ready`, which is about the
+    /// window recipe alone. Insert after `g-span`, or after `fallback`.
+    static func sectionSupport(files: [File], fallback: Found? = nil, relative: (String) -> String) -> JSONValue {
         var present: [JSONValue] = [], missing: [JSONValue] = []
         var span: Found?
         for id in ["g-span", "smoothstep", "system-moments", "section-window"] {
@@ -98,14 +108,12 @@ public enum ScoreGraphic {
         }
         var support: [String: JSONValue] = ["present": .array(present), "missing": .array(missing),
                                             "ready": .bool(missing.isEmpty)]
-        if let anchor = span ?? drawings.first {
+        support["staff_span"] = .bool(procedure("staff-span", in: files) ?? definition(of: "staff-span", in: files) != nil)
+        if let anchor = span ?? fallback {
             support["file"] = .string(relative(anchor.path))
             support["insert_after_line"] = .number(Double(anchor.endLine))
         }
-        out["section_support"] = .object(support)
-        let notes = comments(mentioning: "\\" + name, in: files)
-        if !notes.isEmpty { out["notes"] = .string(notes) }
-        return .object(out)
+        return .object(support)
     }
 
     // MARK: Definitions

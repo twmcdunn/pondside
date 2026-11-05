@@ -188,6 +188,44 @@ final class PaneTests: XCTestCase {
         XCTAssertEqual(m.contents, [.score], "the last pane stays")
     }
 
+    func testCollapsingFoldsToTheEdgeAndAlwaysKeepsOnePaneOpen() {
+        var l = PaneLayout(name: "W", contents: [.lilypond, .score], fractions: [0.4, 0.6], focused: 0)
+        XCTAssertEqual(l.collapseEdge(of: 0), .leading)
+        XCTAssertEqual(l.collapseEdge(of: 1), .trailing)
+        XCTAssertEqual(l.toggleCollapse(), [])
+        XCTAssertEqual(l.collapsed, [0])
+        XCTAssertEqual(l.focused, 1, "focus leaves the folded pane")
+        XCTAssertEqual(l.collapsedRuns, [.init(panes: [0], host: 1, side: .leading)])
+        XCTAssertFalse(l.canCollapse(1), "the last open pane stays")
+        l.collapse(1)
+        XCTAssertEqual(l.collapsed, [0])
+        XCTAssertEqual(l.toggleCollapse(), [0], "⌥C again opens it")
+        XCTAssertTrue(l.collapsed.isEmpty)
+        XCTAssertEqual(l.focused, 1, "opening never takes focus")
+        XCTAssertEqual(l.fractions, [0.4, 0.6])
+
+        var three = PaneLayout(name: "D", contents: [.lilypond, .score, .compilerOutput], focused: 2)
+        three.collapse(2)
+        XCTAssertEqual(three.collapsedRuns, [.init(panes: [2], host: 1, side: .trailing)])
+        XCTAssertEqual(three.focused, 1)
+        three.collapse(1)
+        XCTAssertEqual(three.collapsedRuns, [.init(panes: [1, 2], host: 0, side: .trailing)])
+        three.focusNext()
+        XCTAssertEqual(three.focused, 0, "focus skips folded panes")
+        three.toggle(.agentLog)
+        XCTAssertTrue(three.collapsed.isEmpty, "adding a pane opens them all")
+    }
+
+    func testLayoutsSavedBeforeCollapsingStillDecode() throws {
+        let old = #"{"name":"W","axis":"columns","contents":["lilypond","score"],"fractions":[0.4,0.6],"focused":1}"#
+        let l = try JSONDecoder().decode(PaneLayout.self, from: Data(old.utf8))
+        XCTAssertEqual(l.contents, [.lilypond, .score])
+        XCTAssertTrue(l.collapsed.isEmpty)
+        var c = l
+        c.collapse(0)
+        XCTAssertEqual(try JSONDecoder().decode(PaneLayout.self, from: JSONEncoder().encode(c)), c)
+    }
+
     func testWorkspacesAndShortcuts() {
         var w = Workspaces()
         w.save(PaneLayout.presets[0], as: "Mine")

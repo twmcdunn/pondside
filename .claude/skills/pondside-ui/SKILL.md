@@ -18,8 +18,9 @@ applies to Pondside, and `references/hig-macos.md` is the page-by-page digest
    choosing materials or sizes. Most look-and-feel problems are a wrong
    pattern (a modal look on a transient thing), not a wrong colour.
 2. **Check the editing loop.** Ask: does it steal key focus? cover the
-   caret or the music being edited? make the user wait on an animation?
-   force a dismissal? Any "yes" needs a strong reason.
+   caret or the music being edited? make the user wait on an animation,
+   or on work done before the frame that shows the change? force a
+   dismissal? Any "yes" needs a strong reason.
 3. **Check the system settings matrix** before calling it done: light and
    dark appearance (see the Theme note below), Reduce Motion, Reduce
    Transparency, Increase Contrast, and a non-default accent colour.
@@ -33,6 +34,19 @@ applies to Pondside, and `references/hig-macos.md` is the page-by-page digest
    HIG rule it follows or knowingly departs from.
 
 ## Principles as they apply to Pondside
+
+**All UI is instant** (DESIGN.md §0). A key, click or control shows its
+result in the same frame. Nothing it triggers may wait on LilyPond, the
+disk, a whole-project check or re-reading every file on the main thread:
+show the expected outcome first (flip the toggle, apply the edit, stop
+the progress the moment the outcome is known), do the slow work after
+that frame or off the main thread, and if it disagrees take the change
+back with the red edit-rejection notice (`EditRejectionFeedback`, or
+`showRejection` in the lens), never a dialog. A wait the user must see is
+a status activity (`statusBar.setActivities`), which only animates after
+300 ms and ends when nothing is pending. Measure suspect work on a real
+score in a release build before calling it cheap; tens of milliseconds
+per keystroke is already too slow.
 
 **Focus stays in the editor.** Overlays, previews and status views must not
 become key or first responder unless the user clicks into a control that
@@ -109,6 +123,9 @@ the lens: "Notation preview, bars 3–7, upper"). Contrast ≥ 4.5:1 for text,
   explicit-open mode (view.lens), which must dismiss on Esc, not a timer.
 
 ## Review checklist
+
+- [ ] Instant: the result shows in the same frame; slow work is after it or
+      off the main thread, with optimistic display and a red take-back
 
 - [ ] Pattern named (popover / panel / inline / sheet) and its HIG rules met
 - [ ] Key focus and caret untouched; typing never waits on it

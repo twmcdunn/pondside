@@ -96,7 +96,7 @@ public actor MCPServer {
                 "protocolVersion": .string(version),
                 "capabilities": ["tools": [:], "resources": [:], "prompts": [:]],
                 "serverInfo": ["name": .string(Self.serverName), "version": .string(Self.serverVersion)],
-                "instructions": .string(role == .patch ? Self.patchInstructions : Self.instructions),
+                "instructions": .string(role == .patch ? Self.patchInstructions : Self.instructions(for: role)),
             ]
         case "ping", "notifications/initialized", "notifications/cancelled":
             return [:]
@@ -202,8 +202,12 @@ public actor MCPServer {
     }
 
     /// What every client is told first. Short on purpose: the skills hold
-    /// the detail, and the user wants terse, fast turns.
-    static let instructions = """
+    /// the detail, and the user wants terse, fast turns. For the lens's
+    /// graphics agent the marked range binds until the user widens it; any
+    /// other agent asks for an example.
+    static func instructions(for role: Role?) -> String {
+        let scope = role == .graphics ? lensScope : exampleScope
+        return """
     \(ScoreContract.notice)
     \(PatchContract.notice)
     Pondside scores are plain LilyPond files: read and edit them directly; the running app re-engraves on \
@@ -213,6 +217,8 @@ public actor MCPServer {
     first (a request from the lens already includes it). It returns the selected event or graphic, its staff's music, bar and moment, \
     and for a graphic drawn by the score's own code its definition and drawing procedure. For a range \
     with no drawing it also returns the root layout and a short definition index.
+    \(scope)
+    A graphic that should reach its system's end: lexicon://guide/graphics, "Reach the system's ends".
     For graphic notation follow lexicon://guide/graphics. Graphics are always edited from the marked range \
     (selection.kind "graphic-section", made by ⌥-drag in the score): window the drawing so only the marked \
     box changes. A new graphic goes in the same marked range. If the marked range has no drawing and the \
@@ -228,6 +234,25 @@ public actor MCPServer {
     skill://lilypond-contemporary-notation, skill://lilypond-electronics-staff; lexicon://guide/entries only \
     when no existing entry or combination will do. Lexicon: lexicon://index, lexicon://entry/{id}, \
     lexicon://impl/{id}; a skill's files are skill://<skill>/<path>.
+    """
+    }
+
+    /// Started from the lens: the marked range is the request's range.
+    static let lensScope = """
+    The marked range is the only range. If a request sounds as if it reaches past it ("all of them", \
+    "every system", "many graphics stop short of the system's end"), ask_user first whether to change \
+    only the marked range or every place it occurs (both as choices), and change only inside it until the \
+    user picks the wider one; then the mark is an example of the cause, fixed everywhere it occurs.
+    """
+
+    /// Started elsewhere (a terminal): ask for an example rather than search.
+    static let exampleScope = """
+    One example is the fastest context. When the request is about something you'd have to find in the \
+    engraving (a graphic, or a problem the user sees: "many graphics stop short of the system's end") and \
+    there is no selection, or it isn't on an example, ask the user to select one (click it, or ⌥-drag over \
+    it) and call score_context again: ask in your reply (ask_user, a dialog in the app, when no one is at \
+    your prompt). Don't search renders, measure pixels or read whole files to find it. The example shows the cause; \
+    a request about the whole score then fixes that cause everywhere it occurs, not just inside the example.
     """
 
     /// The patch agent's: short, the skill holds the detail.
@@ -352,7 +377,7 @@ public actor MCPServer {
                           "from_line": ["type": "integer", "description": "First source line to include"],
                           "to_line": ["type": "integer", "description": "Last source line to include"]],
              required: ["file"]),
-        Tool(name: "render", description: "Engrave a score for export (PDF, SVG or PNG) with point-and-click disabled. Returns the written files.",
+        Tool(name: "render", description: "Engrave a score for export (PDF, SVG or PNG) with point-and-click disabled. Returns the written files. To find where something is in the engraving, ask the user to select an example instead (score_context).",
              properties: ["file": file, "format": ["type": "string", "enum": ["pdf", "svg", "png"]],
                           "out": ["type": "string", "description": "Output directory (default: beside the score)"]],
              required: ["file"]),
@@ -380,7 +405,7 @@ public actor MCPServer {
              required: ["question"]),
         Tool(name: "lexicon_check", description: "Check a score's \\lexicon and \\startGraphic uses against the Lexicon: unknown entries, unknown params, values out of range.",
              properties: ["file": file], required: ["file"]),
-        Tool(name: "score_context", description: "What \"here\" means: the user's selection in the running app (no arguments), or a point. The event, its staff's .ly, bar, moment (whole notes from the staff's start), the graphic at or around it (a Lexicon entry's params; or a graphic drawn by the score's own code: its command, start/stop, definition, drawing procedure and what it uses), the marked graphics range when the user ⌥-dragged (selection.kind \"graphic-section\": from/to edges, their x fractions, page x, and the moment at each edge interpolated from the engraved notes, and the selected range on each system), every cue (bar, beat, moment, seconds), and the system's first, last and next events. With no drawing at the point, code gives the root layout and a short definition index; use skill://lilypond for a notation/layout change, lexicon://guide/graphics for a drawing. Call this first; the marked range is the only range.",
+        Tool(name: "score_context", description: "What \"here\" means: the user's selection in the running app (no arguments), or a point. The event, its staff's .ly, bar, moment (whole notes from the staff's start), the graphic at or around it (a Lexicon entry's params; or a graphic drawn by the score's own code: its command, start/stop, definition, drawing procedure and what it uses), the marked graphics range when the user ⌥-dragged (selection.kind \"graphic-section\": from/to edges, their x fractions, page x, and the moment at each edge interpolated from the engraved notes, and the selected range on each system), every cue (bar, beat, moment, seconds), and the system's first, last and next events. With no drawing at the point, code gives the root layout and a short definition index; use skill://lilypond for a notation/layout change, lexicon://guide/graphics for a drawing; section_support (the score's graphics helpers, staff_span for drawings that must reach the system's end) comes with a drawing and, in a score that draws its own graphics, everywhere. Call this first; the marked range is the only range. No example selected for a request about something in the engraving: ask the user to select one rather than searching.",
              properties: ["file": file,
                           "line": ["type": "integer", "description": "1-based line (omit to use the app's selection)"],
                           "character": ["type": "integer", "description": "0-based character on the line"]],
@@ -470,6 +495,10 @@ public actor MCPServer {
             var report: [String: JSONValue] = ["ok": .bool(ok), "pages": .number(Double(result.outputFiles.count)),
                                                "diagnostics": .array(diagnostics)]
             if !ok { report["log"] = .string(CompilerLog.tail(result.messages)) }
+            // The score's files, to tell whether automatic line breaks are off.
+            let sources = SourceGraph.load(root: source).files.map(\.text)
+            let overflows = SystemOverflow.json(svgs: result.outputFiles, sources: sources)
+            if !overflows.isEmpty { report["overflows"] = .array(overflows) }
             return JSONValue.object(report).jsonString(pretty: true)
         case "query":
             let source = try path(args)
@@ -708,6 +737,7 @@ public actor MCPServer {
                 var report: [String: JSONValue] = ["ok": .bool(ok), "status": .string(status), "diagnostics": .array(diagnostics),
                                                    "from": "the running app"]
                 if let new = doc["new_diagnostics"] { report["new_diagnostics"] = new }
+                if let overflows = doc["overflows"] { report["overflows"] = overflows }
                 if let verification = doc["verification"], verification != .null { report["verification"] = verification }
                 if !ok, let reply = try? RPCClient.call("document.log", ["path": .string(source.path)]),
                    let log = reply["log"]?.string, !log.isEmpty {

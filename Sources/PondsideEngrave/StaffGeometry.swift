@@ -214,11 +214,45 @@ extension EngravedPage {
         return bands
     }
 
+    /// The page's systems as vertical bands, top to bottom, the whole system
+    /// tall. A system of several staves starts with LilyPond's start
+    /// delimiter (SystemStartBar): a thin vertical line at the staves' left
+    /// edge from the top staff's top down to the bottom staff's bottom. It
+    /// spans staves the page shows no lines for too (an electronics staff
+    /// a graphic draws), which the staff gaps alone can't see. Staves no
+    /// delimiter covers are systems of their own; a page with no delimiter
+    /// at all falls back to `systems(of:)`.
+    public var systems: [ClosedRange<Double>] { Self.systems(of: staves, graphics: graphics) }
+
+    public static func systems(of staves: [Staff], graphics: [Graphic]) -> [ClosedRange<Double>] {
+        let sorted = systemStaves(of: staves)
+        guard let space = sorted.first?.space, space > 0 else { return systems(of: staves) }
+        var bands: [ClosedRange<Double>] = []
+        for g in graphics where g.link == nil && g.bounds.width < 0.6 * space && g.bounds.height > 5 * space {
+            guard let top = sorted.first(where: { abs($0.top - g.bounds.minY) < 0.5 * space && abs($0.minX - g.bounds.minX) < space })
+            else { continue }
+            bands.append(top.top...max(top.bottom, g.bounds.maxY))
+        }
+        guard !bands.isEmpty else { return systems(of: staves) }
+        for staff in sorted where !bands.contains(where: { $0.lowerBound - 0.5 <= staff.top && staff.bottom <= $0.upperBound + 0.5 }) {
+            bands.append(staff.top...staff.bottom)
+        }
+        var merged: [ClosedRange<Double>] = []
+        for band in bands.sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            if let last = merged.last, band.lowerBound <= last.upperBound {
+                merged[merged.count - 1] = last.lowerBound...max(last.upperBound, band.upperBound)
+            } else {
+                merged.append(band)
+            }
+        }
+        return merged
+    }
+
     /// Every linked graphic on the system holding height `y`, with its
     /// ledger-line reach above and below.
     public func links(onSystemAt y: Double) -> [PointAndClickLocation] {
         let s = staves
-        guard let band = Self.systems(of: s).first(where: { ($0.lowerBound - 6)...($0.upperBound + 6) ~= y }) else { return [] }
+        guard let band = systems.first(where: { ($0.lowerBound - 6)...($0.upperBound + 6) ~= y }) else { return [] }
         let space = s.first?.space ?? 1
         let reach = (band.lowerBound - 4 * space)...(band.upperBound + 4 * space)
         return graphics.compactMap { g in

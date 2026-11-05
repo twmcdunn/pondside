@@ -12,6 +12,12 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     /// Builds (once) the view for a content type.
     private let make: (PaneContent) -> NSView
     private var views: [PaneContent: NSView] = [:]
+    /// The collapse/expand buttons, in the title bar strip above the panes.
+    let collapseBar = PaneCollapseBar()
+    /// The pane the keyboard is in, for the ⌥C hint.
+    var focusedPane: () -> Int? = { nil }
+    /// A collapse button was clicked: the layout to apply.
+    var onCollapseChange: ((PaneLayout) -> Void)?
 
     init(layout: PaneLayout, make: @escaping (PaneContent) -> NSView) {
         self.layout = layout
@@ -19,7 +25,17 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
         super.init()
         split.dividerStyle = .thin
         split.delegate = self
+        collapseBar.host = self
         rebuildSlots()
+        NotificationCenter.default.addObserver(forName: NSSplitView.didResizeSubviewsNotification, object: split,
+                                               queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.collapseBar.needsLayout = true }
+        }
+    }
+
+    /// The slot frames in `view`'s coordinates, nil for collapsed panes.
+    func slotFrames(in view: NSView) -> [NSRect?] {
+        slots.map { $0.isHidden ? nil : $0.convert($0.bounds, to: view) }
     }
 
     func view(for content: PaneContent) -> NSView {
@@ -34,9 +50,25 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     func apply(_ new: PaneLayout) {
         let geometryChanged = new.contents.count != layout.contents.count || new.axis != layout.axis
         let fractionsChanged = new.fractions != layout.fractions
-        layout = new
+        let collapseChanged = new.collapsed != layout.collapsed
+        // Fractions record the open arrangement: capture them before folding.
+        if collapseChanged, layout.collapsed.isEmpty, !geometryChanged, !fractionsChanged {
+            captureFractions()
+            var n = new
+            n.fractions = layout.fractions
+            layout = n
+        } else {
+            layout = new
+        }
         if geometryChanged { rebuildSlots() } else { fill() }
-        if geometryChanged || fractionsChanged { applyFractions() }
+        if collapseChanged || geometryChanged { applyCollapsed() }
+        if geometryChanged || fractionsChanged || (collapseChanged && layout.collapsed.isEmpty) { applyFractions() }
+        collapseBar.refresh()
+    }
+
+    private func applyCollapsed() {
+        for (i, slot) in slots.enumerated() { slot.isHidden = layout.collapsed.contains(i) }
+        split.adjustSubviews()
     }
 
     /// The pane holding `view` (e.g. the first responder), if any.
@@ -52,12 +84,22 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     /// Records the dividers' positions in the layout (before saving it).
     func captureFractions() {
         let total = split.isVertical ? split.bounds.width : split.bounds.height
-        guard total > 0, slots.count == layout.contents.count else { return }
+        guard total > 0, slots.count == layout.contents.count, layout.collapsed.isEmpty else { return }
         layout.fractions = slots.map { (split.isVertical ? $0.frame.width : $0.frame.height) / total }
     }
 
     func setFocused(_ i: Int) {
         layout.focused = min(max(i, 0), layout.contents.count - 1)
+    }
+
+    /// A click on a pane's collapse or expand button.
+    fileprivate func clicked(_ action: PaneCollapseBar.Action) {
+        var l = layout
+        switch action {
+        case .collapse(let i): l.collapse(i)
+        case .expand(let panes): l.expand(panes)
+        }
+        onCollapseChange?(l)
     }
 
     private func rebuildSlots() {
@@ -70,6 +112,8 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
         split.isVertical = layout.axis == .columns
         for s in slots { split.addArrangedSubview(s) }
         fill()
+        for (i, slot) in slots.enumerated() { slot.isHidden = layout.collapsed.contains(i) }
+        collapseBar.refresh()
     }
 
     private func fill() {
@@ -92,7 +136,7 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     func applyFractions() {
         split.layoutSubtreeIfNeeded()
         let total = split.isVertical ? split.bounds.width : split.bounds.height
-        guard total > 0 else { return }
+        guard total > 0, layout.collapsed.isEmpty else { return }
         var position: CGFloat = 0
         for (i, f) in layout.fractions.dropLast().enumerated() {
             position += (total * f).rounded()
@@ -107,6 +151,179 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt i: Int) -> CGFloat {
         proposedMaximumPosition - 200
     }
+}
+
+/// The strip under the transparent title bar, above the panes: one small
+/// button per open pane at the corner on the side it folds toward (arrow to
+/// the edge), and where panes are folded, one at that edge of the open
+/// neighbour (arrow away from the edge). The button ⌥C would press shows
+/// the key. Nothing here covers code or music (DESIGN.md, Pane collapse).
+@MainActor
+final class PaneCollapseBar: NSView {
+    enum Action: Equatable { case collapse(Int), expand([Int]) }
+
+    weak var host: PaneHost?
+    private var buttons: [PaneCollapseButton] = []
+    /// Room the traffic lights take at the window's leading corner.
+    private static let trafficLights: CGFloat = 78
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    /// Rebuilds the buttons for the host's layout and focus.
+    func refresh() {
+        guard let host else { return }
+        let l = host.layout
+        var wanted: [(Action, PaneLayout.Edge, Int, PaneContent)] = []
+        for i in l.contents.indices where l.canCollapse(i) {
+            wanted.append((.collapse(i), l.collapseEdge(of: i), i, l.contents[i]))
+        }
+        for run in l.collapsedRuns {
+            wanted.append((.expand(run.panes), run.side, run.host, l.contents[run.panes[0]]))
+        }
+        // ⌥C opens what is folded, else folds the focused pane.
+        let keyed: Action? = l.collapsed.isEmpty ? host.focusedPane().map { .collapse($0) } : wanted.first {
+            if case .expand = $0.0 { return true } else { return false }
+        }?.0
+        while buttons.count > wanted.count { buttons.removeLast().removeFromSuperview() }
+        while buttons.count < wanted.count {
+            let b = PaneCollapseButton()
+            b.onClick = { [weak self, weak b] in
+                guard let self, let b, let action = b.action else { return }
+                self.host?.clicked(action)
+            }
+            addSubview(b)
+            buttons.append(b)
+        }
+        for (b, w) in zip(buttons, wanted) {
+            let expandPanes: [Int]
+            if case .expand(let p) = w.0 { expandPanes = p } else { expandPanes = [] }
+            b.configure(action: w.0, edge: w.1, host: w.2, rows: l.axis == .rows,
+                        title: expandPanes.count > 1 ? "\(expandPanes.count) panes" : w.3.title,
+                        showsKey: w.0 == keyed)
+        }
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard let host else { return }
+        let frames = host.slotFrames(in: self)
+        let rows = host.layout.axis == .rows
+        var trailingX = bounds.maxX - 8
+        for b in buttons {
+            let size = b.fittingSize
+            let y = ((bounds.height - size.height) / 2).rounded()
+            if rows {
+                // Stacked panes: their buttons line up at the trailing end.
+                b.frame = NSRect(x: trailingX - size.width, y: y, width: size.width, height: size.height)
+                trailingX -= size.width + 4
+                continue
+            }
+            guard frames.indices.contains(b.hostPane), let f = frames[b.hostPane] else { b.isHidden = true; continue }
+            b.isHidden = false
+            let x: CGFloat
+            if b.edge == .leading {
+                x = max(f.minX + 6, f.minX < 1 ? Self.trafficLights : 0)
+            } else {
+                x = f.maxX - 6 - size.width
+            }
+            b.frame = NSRect(x: x.rounded(), y: y, width: size.width, height: size.height)
+        }
+    }
+}
+
+/// A borderless icon button with an optional key hint.
+@MainActor
+final class PaneCollapseButton: NSView {
+    private(set) var action: PaneCollapseBar.Action?
+    private(set) var edge: PaneLayout.Edge = .leading
+    private(set) var hostPane = 0
+    var onClick: (() -> Void)?
+    private let icon = NSImageView()
+    private let key = NSTextField(labelWithString: "⌥C")
+    private let stack = NSStackView()
+    private var hovering = false { didSet { restyle() } }
+    private var pressed = false { didSet { restyle() } }
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 5
+        key.font = .systemFont(ofSize: 10, weight: .medium)
+        icon.symbolConfiguration = .init(pointSize: 11, weight: .medium)
+        stack.orientation = .horizontal
+        stack.spacing = 3
+        stack.edgeInsets = NSEdgeInsets(top: 2, left: 5, bottom: 2, right: 5)
+        stack.addArrangedSubview(icon)
+        stack.addArrangedSubview(key)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            heightAnchor.constraint(equalToConstant: 20),
+        ])
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.restyle() }
+        }
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(action: PaneCollapseBar.Action, edge: PaneLayout.Edge, host: Int, rows: Bool, title: String, showsKey: Bool) {
+        self.action = action
+        self.edge = edge
+        self.hostPane = host
+        let symbol: String
+        let label: String
+        switch action {
+        case .collapse:
+            // Arrow to the edge the pane folds into.
+            symbol = rows ? (edge == .leading ? "arrow.up.to.line.compact" : "arrow.down.to.line.compact")
+                          : (edge == .leading ? "arrow.left.to.line.compact" : "arrow.right.to.line.compact")
+            label = "Collapse \(title)"
+        case .expand:
+            // Arrow away from the edge the pane comes back from.
+            symbol = rows ? (edge == .leading ? "arrow.down" : "arrow.up")
+                          : (edge == .leading ? "arrow.right" : "arrow.left")
+            label = "Expand \(title)"
+        }
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+        key.isHidden = !showsKey
+        toolTip = label + (showsKey ? "  ⌥C" : "")
+        setAccessibilityLabel(label)
+        restyle()
+    }
+
+    private func restyle() {
+        let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        let tint = hovering || contrast ? Theme.text : Theme.secondaryText
+        icon.contentTintColor = tint
+        key.textColor = contrast ? Theme.text : Theme.secondaryText
+        let fill: CGFloat = pressed ? 0.14 : hovering ? 0.08 : 0
+        layer?.backgroundColor = NSColor(white: 1, alpha: fill).cgColor
+        layer?.borderWidth = contrast ? 1 : 0
+        layer?.borderColor = Theme.secondaryText.cgColor
+    }
+
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) { pressed = true }
+    override func mouseUp(with event: NSEvent) {
+        pressed = false
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick?() }
+    }
+    override func accessibilityPerformPress() -> Bool { onClick?(); return true }
 }
 
 /// What a pane shows for content that hasn't been built yet: say which

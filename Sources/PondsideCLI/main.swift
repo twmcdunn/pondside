@@ -211,21 +211,39 @@ func check(_ args: Arguments) async throws -> Int32 {
     let scratch = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: scratch) }
     let result = try await engraver.engrave(source, purpose: .canvas, outputDirectory: scratch)
+    // Systems running into the right margin while automatic line breaks are off.
+    let overflows = SystemOverflow.applies(toSources: SourceGraph.load(root: source).files.map(\.text))
+        ? SystemOverflow.detect(in: result.outputFiles.compactMap { try? Data(contentsOf: $0) }.map(EngravedPage.init(svg:)))
+        : []
     if args.flags.contains("json") {
+        struct OverflowJSON: Encodable {
+            var page: Int
+            var mm_past_margin: Double
+            var file: String?
+            var line: Int?
+        }
         struct Report: Encodable {
             var ok: Bool
             var pages: Int
             var milliseconds: Int
             var diagnostics: [DiagnosticJSON]
+            var overflows: [OverflowJSON]
             var log: String?
         }
         let ms = Int(result.duration.components.seconds * 1000 + result.duration.components.attoseconds / 1_000_000_000_000_000)
         let ok = result.errors.isEmpty && result.succeeded
         try printJSON(Report(ok: ok, pages: result.outputFiles.count,
                              milliseconds: ms, diagnostics: result.diagnostics.map(DiagnosticJSON.init),
+                             overflows: overflows.map { OverflowJSON(page: $0.page + 1, mm_past_margin: ($0.amountMM * 10).rounded() / 10,
+                                                                     file: $0.first?.path, line: $0.first?.line) },
                              log: ok ? nil : CompilerLog.tail(result.messages)))
     } else {
         for d in result.diagnostics { print(DiagnosticFormatter.line(d)) }
+        for o in overflows {
+            let at = o.first.map { "\($0.path):\($0.line): " } ?? ""
+            print(String(format: "%@warning: system on page %d runs %.1f mm into the right margin (line breaks are off: move a bar or narrow it)",
+                         at, o.page + 1, o.amountMM))
+        }
         let ok = result.errors.isEmpty && result.succeeded
         if !ok {
             let tail = CompilerLog.tail(result.messages)
@@ -725,7 +743,7 @@ let rest = argv.dropFirst(2)
 
 do {
     let args = try Arguments(rest, valued: ["format", "out", "on-change", "rate", "scd", "project", "from", "agent", "renderer", "soundfont",
-                                            "to", "show", "file", "restore", "timing"])
+                                            "to", "show", "file", "restore", "timing", "role"])
     let status: Int32
     switch command {
     case "render": status = try await render(args)

@@ -14,8 +14,12 @@ enum LensScoreAdapter {
     static func score(for lens: LensScoreWindow) throws -> Score {
         var score = try MusicXMLParser.parse(Data(lens.xml.utf8))
         preserveWrittenAccidentals(lens, in: &score)
+        // Before anything that records element indices (tuplets): each
+        // dynamic is a voice element of its own, just before its chord.
+        attachDynamics(lens, to: &score)
         trim(&score, reachesEnd: lens.reachesEnd)
         attachSlurs(lens, to: &score)
+        attachHairpins(lens, to: &score)
         attachTuplets(lens, to: &score)
         attachTremolos(lens, to: &score)
         return score
@@ -75,6 +79,14 @@ enum LensScoreAdapter {
         return nil
     }
 
+    /// The lens event whose chord is at `anchor` (a clicked mark's owner).
+    static func event(at anchor: VoiceElementID, in lens: LensScoreWindow, score: Score) -> LensEvent? {
+        lens.events.first { event in
+            guard event.measureIndex == anchor.measureIndex, let at = element(of: event, in: lens, score: score) else { return false }
+            return at.slot == anchor.voiceIndex && at.index == anchor.elementIndex
+        }
+    }
+
     /// The parsed score's address for the lens target.
     static func target(of lens: LensScoreWindow, in score: Score) -> (VoiceElementID, ScoreItemID)? {
         guard let event = lens.target, let (slot, index, chord) = chord(of: event, in: lens, score: score)
@@ -118,11 +130,44 @@ enum LensScoreAdapter {
         return (slot, index, chord)
     }
 
-    /// Slurs hang on their start chord with the distance to their end, in
-    /// measures plus time from the start chord's place in its bar, counted
-    /// the way the layout counts (chord durations, not `<forward>` gaps).
+    /// Dynamics go into the voice just before their chord, where the layout
+    /// looks for them (a dynamic on a rest has no anchor and is left out).
+    static func attachDynamics(_ lens: LensScoreWindow, to score: inout Score) {
+        for mark in lens.dynamics {
+            let event = lens.events[mark.event]
+            guard !event.notes.isEmpty, let at = element(of: event, in: lens, score: score) else { continue }
+            updateVoice(in: &score, measure: event.measureIndex, slot: at.slot) { voice in
+                var elements = Array(voice.elements)
+                elements.insert(.dynamic(Dynamic(subtype: mark.text, velocity: velocity(mark.text))), at: at.index)
+                voice.elements = IdentifiedArray(elements)
+            }
+        }
+    }
+
+    /// MuseScore's velocities for the common dynamics; playback in the lens
+    /// is not the score's, so the rest share mezzo-forte's.
+    private static func velocity(_ text: String) -> Int {
+        ["pppp": 10, "ppp": 16, "pp": 33, "p": 49, "mp": 64, "mf": 80, "f": 96, "ff": 112, "fff": 126, "ffff": 127][text] ?? 80
+    }
+
     static func attachSlurs(_ lens: LensScoreWindow, to score: inout Score) {
-        guard !lens.slurs.isEmpty, let staffValue = score[staff] else { return }
+        attachSpanners(lens.slurs.map { ($0.start, $0.end, Spanner(kind: .slur, rawType: "Slur")) }, lens: lens, to: &score)
+    }
+
+    static func attachHairpins(_ lens: LensScoreWindow, to score: inout Score) {
+        attachSpanners(lens.hairpins.map { hairpin in
+            (hairpin.start, hairpin.end, Spanner(kind: .hairpin, rawType: "HairPin",
+                                                 hairpin: .init(subtype: hairpin.crescendo ? .crescendo : .decrescendo)))
+        }, lens: lens, to: &score)
+    }
+
+    /// Slurs and hairpins hang on their start chord with the distance to
+    /// their end, in measures plus time from the start chord's place in its
+    /// bar, counted the way the layout counts (chord durations, not
+    /// `<forward>` gaps).
+    private static func attachSpanners(_ spans: [(start: Int, end: Int, spanner: Spanner)], lens: LensScoreWindow,
+                                       to score: inout Score) {
+        guard !spans.isEmpty, let staffValue = score[staff] else { return }
         let durations = score.effectiveMeasureDurations()
         let division = score.division
 
@@ -139,20 +184,44 @@ enum LensScoreAdapter {
             return ticks
         }
 
-        for slur in lens.slurs {
-            let first = lens.events[slur.start], last = lens.events[slur.end]
+        for span in spans {
+            let first = lens.events[span.start], last = lens.events[span.end]
             guard let start = element(of: first, in: lens, score: score),
                   let end = element(of: last, in: lens, score: score),
                   start.slot == end.slot else { continue }
             let distance = tick(measure: last.measureIndex, slot: end.slot, before: end.index)
                 - tick(measure: first.measureIndex, slot: start.slot, before: start.index)
-            let spanner = Spanner(kind: .slur, rawType: "Slur",
-                                  nextMeasuresOffset: last.measureIndex - first.measureIndex,
-                                  nextFractionsOffset: Fraction(numerator: distance, denominator: 4 * division))
+            var spanner = span.spanner
+            spanner.nextMeasuresOffset = last.measureIndex - first.measureIndex
+            spanner.nextFractionsOffset = Fraction(numerator: distance, denominator: 4 * division)
             updateChord(in: &score, measure: first.measureIndex, slot: start.slot, index: start.index) {
                 $0.spanners.append(spanner)
             }
         }
+    }
+
+    /// The renderer's address for lens slur `index`: its start chord and its
+    /// place among the slurs `attachSlurs` hung there (nil if it was left
+    /// out, its ends in different voice slots).
+    static func slurID(of index: Int, in lens: LensScoreWindow, score: Score) -> SlurID? {
+        func attached(_ slur: LensSlur) -> (slot: Int, index: Int)? {
+            guard let start = element(of: lens.events[slur.start], in: lens, score: score),
+                  let end = element(of: lens.events[slur.end], in: lens, score: score),
+                  start.slot == end.slot else { return nil }
+            return start
+        }
+        guard lens.slurs.indices.contains(index) else { return nil }
+        let slur = lens.slurs[index]
+        guard let start = attached(slur) else { return nil }
+        let ordinal = lens.slurs[..<index].filter { $0.start == slur.start && attached($0) != nil }.count
+        let anchor = VoiceElementID(staff: staff, measureIndex: lens.events[slur.start].measureIndex,
+                                    voiceIndex: start.slot, elementIndex: start.index)
+        return .chord(anchor: anchor, ordinal: ordinal)
+    }
+
+    /// The lens slur the renderer drew as `id`.
+    static func slur(for id: SlurID, in lens: LensScoreWindow, score: Score) -> LensSlur? {
+        lens.slurs.indices.first { slurID(of: $0, in: lens, score: score) == id }.map { lens.slurs[$0] }
     }
 
     /// Tuplet brackets and numbers, from each span's first to last chord.

@@ -17,6 +17,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var models: [String]?
     private var loadingModels = false
     private let lightsOut = NSButton(checkboxWithTitle: "Lights Out: dim the paper for night work", target: nil, action: nil)
+    private let followPlayback = NSButton(checkboxWithTitle: "Follow playback: glide each new system to the middle (⌥F)", target: nil, action: nil)
+    private let hearNotes = NSButton(checkboxWithTitle: "Hear selected notes: play each new selection's pitch (⌥N)", target: nil, action: nil)
     private let cliStatus = NSTextField(wrappingLabelWithString: "")
     private var found: [(AgentHarness, String?)] = []
     private var modelRows: [NSGridRow] = []
@@ -57,6 +59,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let declined = NSButton(title: "Ask Again About Declined Patches", target: self, action: #selector(resetDeclined))
         lightsOut.target = self
         lightsOut.action = #selector(lightsOutChanged)
+        followPlayback.target = self
+        followPlayback.action = #selector(followPlaybackChanged)
+        hearNotes.target = self
+        hearNotes.action = #selector(hearNotesChanged)
         cliStatus.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
         cliStatus.textColor = .secondaryLabelColor
         cliStatus.preferredMaxLayoutWidth = 340
@@ -74,6 +80,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             [NSGridCell.emptyContentView, agentDetail],
             [NSGridCell.emptyContentView, declined],
             [label("Appearance:"), lightsOut],
+            [label("Playback:"), followPlayback],
+            [NSGridCell.emptyContentView, hearNotes],
             [label("Command-line tool:"), install],
             [NSGridCell.emptyContentView, cliStatus],
         ])
@@ -81,7 +89,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         grid.rowAlignment = .firstBaseline
         grid.rowSpacing = 8
         grid.columnSpacing = 8
-        for row in [4, 5, 6] { grid.row(at: row).topPadding = 10 }
+        for row in [4, 5, 6, 8] { grid.row(at: row).topPadding = 10 }
         modelRows = [grid.row(at: 1), grid.row(at: 2)]
         grid.translatesAutoresizingMaskIntoConstraints = false
         let content = NSView()
@@ -99,6 +107,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     /// login shell for its PATH).
     private func refresh() {
         lightsOut.state = UserDefaults.standard.bool(forKey: "Pondside.lightsOut") ? .on : .off
+        followPlayback.state = (NSApp.delegate as? PondsideAppDelegate)?.followPlayback ?? true ? .on : .off
+        hearNotes.state = NoteAudition.shared.isEnabled ? .on : .off
         let link = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/pondside")
         cliStatus.stringValue = (try? FileManager.default.destinationOfSymbolicLink(atPath: link.path)).map { "Installed: \(link.path) → \($0)" }
             ?? "Links pondside (the CLI, and the MCP server agents use) into ~/.local/bin. No admin rights needed."
@@ -246,6 +256,22 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         if want != UserDefaults.standard.bool(forKey: "Pondside.lightsOut") {
             (NSApp.delegate as? PondsideAppDelegate)?.toggleLightsOut(nil)
         }
+    }
+
+    @objc private func followPlaybackChanged() {
+        guard let app = NSApp.delegate as? PondsideAppDelegate else { return }
+        if (followPlayback.state == .on) != app.followPlayback { app.toggleFollowPlayback(nil) }
+    }
+
+    /// Keeps the checkboxes true when a shortcut toggles them while open.
+    func refreshToggles() {
+        hearNotes.state = NoteAudition.shared.isEnabled ? .on : .off
+        followPlayback.state = (NSApp.delegate as? PondsideAppDelegate)?.followPlayback ?? true ? .on : .off
+    }
+
+    @objc private func hearNotesChanged() {
+        guard let app = NSApp.delegate as? PondsideAppDelegate else { return }
+        if (hearNotes.state == .on) != app.hearNotes { app.toggleHearNotes(nil) }
     }
 
     @objc private func installCLI() {

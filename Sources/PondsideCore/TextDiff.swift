@@ -29,7 +29,80 @@ public struct UTF16Replacement: Hashable, Sendable {
     }
 }
 
+/// One changed span: `oldLength` UTF-16 units at `oldLocation` in the old
+/// text became `newLength` units.
+public struct TextHunk: Hashable, Sendable {
+    public var oldLocation: Int
+    public var oldLength: Int
+    public var newLength: Int
+
+    public init(oldLocation: Int, oldLength: Int, newLength: Int) {
+        self.oldLocation = oldLocation
+        self.oldLength = oldLength
+        self.newLength = newLength
+    }
+}
+
 public enum TextDiff {
+    /// Every changed span between the texts, in order, so edits made in
+    /// two places stay two spans and the text between them maps exactly.
+    /// A shortest edit script (Myers) over what lies between the common
+    /// prefix and suffix; past `maxEdits` changed units it gives up and
+    /// returns the single span `minimalReplacement` would, so a large
+    /// rewrite costs no more than before. Empty when the texts are equal.
+    public static func hunks(from old: String, to new: String, maxEdits: Int = 256) -> [TextHunk] {
+        let a = Array(old.utf16), b = Array(new.utf16)
+        if a == b { return [] }
+        var prefix = 0
+        let maxPrefix = min(a.count, b.count)
+        while prefix < maxPrefix, a[prefix] == b[prefix] { prefix += 1 }
+        var suffix = 0
+        let maxSuffix = min(a.count, b.count) - prefix
+        while suffix < maxSuffix, a[a.count - 1 - suffix] == b[b.count - 1 - suffix] { suffix += 1 }
+        let n = a.count - prefix - suffix, m = b.count - prefix - suffix
+        let whole = [TextHunk(oldLocation: prefix, oldLength: n, newLength: m)]
+        if n == 0 || m == 0 { return whole }
+        let limit = min(n + m, maxEdits)
+        let off = limit + 1
+        var v = [Int](repeating: 0, count: 2 * limit + 3)
+        var trace: [[Int]] = []
+        var end: Int?
+        search: for d in 0...limit {
+            trace.append(v)
+            for k in stride(from: -d, through: d, by: 2) {
+                var x = (k == -d || (k != d && v[k - 1 + off] < v[k + 1 + off])) ? v[k + 1 + off] : v[k - 1 + off] + 1
+                var y = x - k
+                while x < n, y < m, a[prefix + x] == b[prefix + y] { x += 1; y += 1 }
+                v[k + off] = x
+                if x >= n, y >= m { end = d; break search }
+            }
+        }
+        guard let depth = end else { return whole }
+        // Walk back: each step is one deleted old unit or one inserted new
+        // unit, at an old position.
+        var edits: [(at: Int, deletes: Bool)] = []
+        var x = n, y = m
+        for d in stride(from: depth, to: 0, by: -1) {
+            let v = trace[d]
+            let k = x - y
+            let down = k == -d || (k != d && v[k - 1 + off] < v[k + 1 + off])
+            let prevK = down ? k + 1 : k - 1
+            let prevX = v[prevK + off], prevY = prevX - prevK
+            edits.append(down ? (prevX, false) : (prevX, true))
+            x = prevX; y = prevY
+        }
+        var out: [TextHunk] = []
+        for e in edits.reversed() {
+            let at = prefix + e.at
+            if let last = out.last, last.oldLocation + last.oldLength == at {
+                if e.deletes { out[out.count - 1].oldLength += 1 } else { out[out.count - 1].newLength += 1 }
+            } else {
+                out.append(TextHunk(oldLocation: at, oldLength: e.deletes ? 1 : 0, newLength: e.deletes ? 0 : 1))
+            }
+        }
+        return out
+    }
+
     /// The smallest single replacement turning `old` into `new`, found by
     /// trimming the common prefix and suffix. Never splits a surrogate pair.
     ///

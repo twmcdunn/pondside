@@ -11,7 +11,13 @@
 %% Coordinates: u runs along the whole span in staff spaces, 0 at its start,
 %% as if the span were one strip; y is in staff spaces from the staff's
 %% middle line (the lines of a five-line staff are at -2 ... 2). The kit
-%% cuts the strip at each line break and shifts every piece into place.
+%% cuts the strip at each line break, clips each shape to its piece and
+%% shifts every piece into place.
+%%
+%% A span reaches the end of its system wherever it goes on past it: a
+%% piece broken by a line break ends where the system's staff lines end,
+%% not at the last note. A span that stops on the first note of a system
+%% ends at the end of the system before (no sliver on the next one).
 %%
 %% Use: \startGraphic "grain-cloud" #'((density . 0.7)) on a skip, then
 %% \stopGraphic where it ends, in a voice of skips on the staff.
@@ -56,6 +62,20 @@
 
 %% ------------------------------------------------------------- the context
 
+% The system's staff lines, as (left . right) in the system's x: from the
+% first staff's start to the last staff's end, whichever staves are shown.
+#(define pg-system-staff-spans (make-weak-key-hash-table))
+#(define (pg-system-staff-span sys)
+   (or (hash-ref pg-system-staff-spans sys #f)
+       (let* ((exts (filter-map
+                     (lambda (g)
+                       (and (grob::has-interface g 'staff-symbol-interface)
+                            (let ((e (ly:grob-extent g sys X))) (and (interval-sane? e) e))))
+                     (ly:grob-array->list (ly:grob-object sys 'all-elements))))
+              (span (and (pair? exts) (cons (apply min (map car exts)) (apply max (map cdr exts))))))
+         (if span (hash-set! pg-system-staff-spans sys span))
+         span)))
+
 % One piece of the span (a line of it): its x range relative to the
 % spanner, its columns as (x . moment), and where it sits on the strip.
 #(define (pg-piece-info grob)
@@ -76,8 +96,9 @@
           ; a piece after a line break starts at its first note, after the clef
           (continued (let ((o (ly:grob-original grob)))
                        (and o (pair? (ly:spanner-broken-into o)) (not (eq? grob (car (ly:spanner-broken-into o)))))))
-          (left (if (and continued (pair? cols)) (max bound-left (- (caar cols) 0.8)) bound-left)))
-     (list left right cols)))
+          (left (if (and continued (pair? cols)) (max bound-left (- (caar cols) 0.8)) bound-left))
+          (staff (let ((sp (pg-system-staff-span sys))) (and sp (cons (- (car sp) me) (- (cdr sp) me))))))
+     (list left right cols continued staff)))
 
 #(define (pg-pieces grob)
    (let ((orig (ly:grob-original grob)))
@@ -85,11 +106,34 @@
          (ly:spanner-broken-into orig)
          (list grob))))
 
-% Build g for `grob`. The strip is the pieces laid end to end.
+% A last piece with no note of its own: the span stops on the first note
+% of a system, so it really ends at the end of the system before.
+#(define (pg-sliver? info)
+   (and (cadddr info) (not (any (lambda (c) (< (car c) (- (cadr info) 0.5))) (caddr info)))))
+
+% Pieces and their infos, the sliver dropped and every piece that goes on
+% past its system reaching that system's staff end.
+#(define (pg-layout grob)
+   (let* ((all (pg-pieces grob))
+          (all-infos (map pg-piece-info all))
+          (keep (if (and (> (length all) 1) (pg-sliver? (last all-infos))) (1- (length all)) (length all)))
+          (pieces (take all keep))
+          (infos (map (lambda (i k)
+                        (let ((staff (list-ref i 4)))
+                          (if (and (< k (1- (length all))) staff)
+                              (list (car i) (max (car i) (cdr staff)) (caddr i) (cadddr i) staff)
+                              i)))
+                      (take all-infos keep) (iota keep))))
+     (cons pieces infos)))
+
+% Build g for `grob`, or #f for a dropped sliver. The strip is the pieces
+% laid end to end.
 #(define (pg-make-context grob params)
-   (let* ((pieces (pg-pieces grob))
-          (infos (map pg-piece-info pieces))
-          (widths (map (lambda (i) (- (cadr i) (car i))) infos))
+   (let* ((layout (pg-layout grob))
+          (pieces (car layout))
+          (infos (cdr layout)))
+    (and (memq grob pieces)
+     (let* ((widths (map (lambda (i) (- (cadr i) (car i))) infos))
           (starts (let loop ((ws widths) (acc 0) (out '()))
                     (if (null? ws) (reverse out) (loop (cdr ws) (+ acc (car ws)) (cons acc out)))))
           (index (or (list-index (lambda (p) (eq? p grob)) pieces) 0))
@@ -102,7 +146,9 @@
        (left . ,(car info)) (right . ,(cadr info)) (u0 . ,(list-ref starts index))
        (width . ,(apply + widths)) (piece-width . ,(list-ref widths index))
        (columns . ,(delete-duplicates columns (lambda (a b) (equal? (cdr a) (cdr b)))))
-       (piece-starts . ,starts) (seed . ,seed))))
+       (piece-starts . ,starts) (seed . ,seed)
+       (continued . ,(and (> index 0) #t)) (broken . ,(< index (1- (length pieces))))
+       (staff . ,(list-ref info 4)))))))
 
 #(define (g-ref g key) (assq-ref g key))
 
@@ -113,6 +159,18 @@
 #(define (g-breaks g) (cdr (g-ref g 'piece-starts)))
 % q, 0..1 along the strip, for u.
 #(define (g-q g u) (if (> (g-width g) 0) (/ u (g-width g)) 0))
+
+% Whether this piece goes on from the system before / on past its system.
+#(define (g-continued? g) (g-ref g 'continued))
+#(define (g-broken? g) (g-ref g 'broken))
+
+% Where the system's staff lines run on this piece, as (u-left . u-right):
+% from the start of the system (under its clef) to its end, the whole
+% system wide. A drawing that stands in for a staff reaches these ends; the
+% `staff-lines` shape does it by itself. #f when the system has no staff.
+#(define (g-staff-span g)
+   (let ((staff (g-ref g 'staff)) (shift (- (g-ref g 'u0) (g-ref g 'left))))
+     (and staff (cons (+ shift (car staff)) (+ shift (cdr staff))))))
 
 % Columns as (u . moment), in order.
 #(define (g-columns g) (g-ref g 'columns))
@@ -226,6 +284,12 @@
 %   (wedge u0 u1 h0 h1 y)           a filled wedge, half-heights h0 -> h1, centred on y
 %   (text u y markup)               a markup, its left edge at u
 %   (gray g shape)                  shape in grey: 0 black .. 1 white
+%   (staff-lines (y ...) thick)     horizontal lines, like a staff's, across
+%                                   the whole span and, where it goes on past
+%                                   a line break, to the system's staff ends
+%
+% Every shape is clipped at the line breaks, so a stroke or fill crossing
+% one is drawn in two parts, each on its own system.
 #(define (pg-path pts closed thick)
    (if (< (length pts) 2) empty-stencil
        (make-path-stencil
@@ -267,6 +331,68 @@
                (if (<= v 0.001) st (stencil-with-color st (list v v v)))))
      (else empty-stencil)))
 
+% Clipping to the piece [a, b] (#f: open on that side) along u.
+#(define (pg-in? u a b) (and (or (not a) (>= u a)) (or (not b) (<= u b))))
+#(define (pg-cross p q x)
+   (let ((du (- (car q) (car p))))
+     (if (< (abs du) 1e-12) (cons x (cdr p))
+         (cons x (+ (cdr p) (* (/ (- x (car p)) du) (- (cdr q) (cdr p))))))))
+% A polyline: the runs inside [a, b], each a list of points.
+#(define (pg-clip-line pts a b)
+   (let ((lo (or a -1e12)) (hi (or b 1e12)))
+     (define (close run runs) (if (> (length run) 1) (cons (reverse run) runs) runs))
+     (let loop ((ps pts) (prev #f) (run '()) (runs '()))
+       (cond
+        ((null? ps) (reverse (close run runs)))
+        ((not prev) (loop (cdr ps) (car ps) (if (<= lo (caar ps) hi) (list (car ps)) '()) runs))
+        (else
+         ; the part of the segment prev -> p inside, as t0 .. t1 along it
+         (let* ((p (car ps)) (x0 (car prev)) (dx (- (car p) x0))
+                (inside (<= lo x0 hi))
+                (ta (if (zero? dx) (if inside 0 2) (/ (- lo x0) dx)))
+                (tb (if (zero? dx) (if inside 1 2) (/ (- hi x0) dx)))
+                (t0 (max 0 (min ta tb))) (t1 (min 1 (max ta tb)))
+                (at (lambda (t) (cons (+ x0 (* t dx)) (+ (cdr prev) (* t (- (cdr p) (cdr prev))))))))
+           (if (> t0 t1)
+               (loop (cdr ps) p '() (close run runs))
+               (let* ((entered (or (> t0 0) (null? run)))
+                      (runs (if entered (close run runs) runs))
+                      (run (cons (at t1) (if entered (list (at t0)) run))))
+                 (if (< t1 1)
+                     (loop (cdr ps) p '() (close run runs))
+                     (loop (cdr ps) p run runs))))))))))
+% A polygon against one side (Sutherland-Hodgman): keep u >= x (keep-right)
+% or u <= x.
+#(define (pg-clip-side poly x keep-right)
+   (if (null? poly) '()
+       (let* ((inside (lambda (p) (if keep-right (>= (car p) x) (<= (car p) x))))
+              (n (length poly)))
+         (append-map
+          (lambda (i)
+            (let ((p (list-ref poly i)) (q (list-ref poly (modulo (1+ i) n))))
+              (cond ((and (inside p) (inside q)) (list q))
+                    ((inside p) (list (pg-cross p q x)))
+                    ((inside q) (list (pg-cross p q x) q))
+                    (else '()))))
+          (iota n)))))
+#(define (pg-clip-fill pts a b)
+   (let* ((l (if a (pg-clip-side pts a #t) pts)) (r (if b (pg-clip-side l b #f) l)))
+     (if (< (length r) 3) '() (list r))))
+% A shape clipped to the piece: a list of shapes, maybe empty. Dots and
+% text belong to the piece their u falls in.
+#(define (pg-clip shape a b)
+   (if (and (not a) (not b)) (list shape)
+       (case (car shape)
+         ((stroke) (map (lambda (r) (list 'stroke r (caddr shape))) (pg-clip-line (cadr shape) a b)))
+         ((curve) (map (lambda (r) (list 'stroke r (caddr shape))) (pg-clip-line (pg-smooth (cadr shape)) a b)))
+         ((fill) (map (lambda (r) (list 'fill r)) (pg-clip-fill (cadr shape) a b)))
+         ((wedge)
+          (let ((u0 (list-ref shape 1)) (u1 (list-ref shape 2)) (h0 (list-ref shape 3)) (h1 (list-ref shape 4)) (y (list-ref shape 5)))
+            (pg-clip (list 'fill (list (cons u0 (+ y h0)) (cons u1 (+ y h1)) (cons u1 (- y h1)) (cons u0 (- y h0)))) a b)))
+         ((dot text) (if (and (or (not a) (>= (cadr shape) a)) (or (not b) (< (cadr shape) b))) (list shape) '()))
+         ((gray) (map (lambda (s) (list 'gray (cadr shape) s)) (pg-clip (caddr shape) a b)))
+         (else (list shape)))))
+
 % The u range a shape covers, to drop the ones on other pieces.
 #(define (pg-shape-range shape)
    (case (car shape)
@@ -275,6 +401,7 @@
      ((wedge) (cons (min (list-ref shape 1) (list-ref shape 2)) (max (list-ref shape 1) (list-ref shape 2))))
      ((text) (cons (cadr shape) (+ (cadr shape) 1)))
      ((gray) (pg-shape-range (caddr shape)))
+     ((staff-lines) (cons -1e9 1e9))
      (else (cons 0 0))))
 
 %% ------------------------------------------------------------- the spanner
@@ -286,16 +413,32 @@
      (let ((proc (hash-ref pondside-graphics id #f)))
        (if (not proc)
            (begin (ly:warning "Pondside graphics: no entry ~a" id) empty-stencil)
-           (let* ((g (pg-make-context grob params))
-                  (piece (g-piece g))
-                  (shift (- (g-ref g 'left) (car piece)))
-                  (shapes (filter (lambda (s)
-                                    (let ((r (pg-shape-range s)))
-                                      (and (< (car r) (+ (cdr piece) 0.5)) (> (cdr r) (- (car piece) 0.5)))))
-                                  (proc g params))))
-             (ly:stencil-translate-axis
-              (apply ly:stencil-add (cons empty-stencil (map (lambda (s) (pg-stencil grob s)) shapes)))
-              shift X))))))
+           (let ((g (pg-make-context grob params)))
+             (if (not g)
+                 empty-stencil    ; a sliver: the span ended with the system before
+                 (let* ((piece (g-piece g))
+                        (shift (- (g-ref g 'left) (car piece)))
+                        ; clip only at line breaks: the span's own ends stay open
+                        (a (and (g-continued? g) (car piece)))
+                        (b (and (g-broken? g) (cdr piece)))
+                        (shapes (append-map
+                                 (lambda (s) (if (eq? (car s) 'staff-lines) (pg-staff-lines g s) (pg-clip s a b)))
+                                 (filter (lambda (s)
+                                           (let ((r (pg-shape-range s)))
+                                             (and (< (car r) (+ (cdr piece) 0.5)) (> (cdr r) (- (car piece) 0.5)))))
+                                         (proc g params)))))
+                   (ly:stencil-translate-axis
+                    (apply ly:stencil-add (cons empty-stencil (map (lambda (s) (pg-stencil grob s)) shapes)))
+                    shift X))))))))
+
+% (staff-lines (y ...) thick) on this piece: from the span's start, or the
+% system's staff start where it goes on from the system before, to its end,
+% or the system's staff end where it goes on past this system.
+#(define (pg-staff-lines g shape)
+   (let* ((piece (g-piece g)) (staff (g-staff-span g))
+          (u0 (if (and (g-continued? g) staff) (car staff) (car piece)))
+          (u1 (if (and (g-broken? g) staff) (cdr staff) (cdr piece))))
+     (map (lambda (y) (list 'stroke (list (cons u0 y) (cons u1 y)) (caddr shape))) (cadr shape))))
 
 % Draws but takes no room: it neither pushes other things nor reserves space.
 #(define pg-no-skylines

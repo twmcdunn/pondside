@@ -104,6 +104,13 @@ final class AgentRequestPopover: NSObject, NSPopoverDelegate, NSTextFieldDelegat
         if agent != nil { p.contentViewController?.view.window?.makeFirstResponder(field) }
     }
 
+    /// Background preparation may refine the scope text without resetting
+    /// the request field or moving keyboard focus.
+    func updateDetail(_ value: String) {
+        detail = value
+        detailLabel.stringValue = value
+    }
+
     func close() {
         popover?.close()
     }

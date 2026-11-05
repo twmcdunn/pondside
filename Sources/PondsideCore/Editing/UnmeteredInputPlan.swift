@@ -47,6 +47,7 @@ public enum UnmeteredInputPlan {
                 case .toggleAccidental(let alteration): edit = editor.toggleAccidental(alteration, events: [anchor], structure: files.first { $0.id == root }?.tree)
                 case .delete: edit = editor.delete(events: [anchor])
                 case .togglePostEvent(let text): edit = editor.togglePostEvent(text, events: [anchor])
+                case .toggleSlur: edit = editor.toggleSpan(open: "(", close: ")", events: [anchor], name: "Slur")
                 default: throw StructuralEditing.Failure("This command is not a draft content edit.")
                 }
                 actionName = edit?.name

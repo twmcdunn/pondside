@@ -419,6 +419,15 @@ public enum StructuralEditing {
         return prefix + suffix
     }
 
+    /// The inverse of `name(_:)`. Names identify bars; the definitions'
+    /// order, not their names, is the score's order.
+    static func index(of name: String) -> Int? {
+        guard name.hasPrefix(prefix) else { return nil }
+        let suffix = name.unicodeScalars.dropFirst(prefix.unicodeScalars.count)
+        guard !suffix.isEmpty, suffix.count <= 8, suffix.allSatisfy({ $0.value >= 65 && $0.value <= 90 }) else { return nil }
+        return suffix.reduce(0) { $0 * 26 + Int($1.value) - 64 } - 1
+    }
+
     private static func definition(name: String, time: LensTime, breakCommand: String?) -> String {
         "\(name) = { \\time \(time.beats)/\(time.beatType) s1*\(time.beats)/\(time.beatType)\(breakCommand.map { " " + $0 } ?? "") }"
     }
@@ -458,12 +467,12 @@ public enum StructuralEditing {
               source.tree.text.contains(runtime) else { throw Failure("The shared-measure helper is missing or modified. Restore its definition before structural editing.") }
         let all = definitions(in: source.tree)
         guard !all.isEmpty else { throw Failure("No shared measure definitions were found.") }
-        for (i, pair) in all.enumerated() {
-            let (id, node) = pair
-            guard id == name(i), let meter = time(in: source.tree, name: id),
+        var seen: Set<String> = []
+        for (id, node) in all {
+            guard index(of: id) != nil, seen.insert(id).inserted, let meter = time(in: source.tree, name: id),
                   meter.beats > 0, meter.beatType > 0, meter.beats <= 1024, meter.beatType <= 1024,
                   source.tree.string(node.range) == String(definition(name: id, time: meter, breakCommand: breakIn(source.tree, node: node)).dropFirst(id.utf8.count + 3)) else {
-                throw Failure("\(id): shared definitions must contain one literal meter, its matching skip length, and an optional final break.")
+                throw Failure("\(id): shared definitions need a unique name and must contain one literal meter, its matching skip length, and an optional final break.")
             }
             if !managesBreaks(source.tree), breakIn(source.tree, node: node) != nil {
                 throw Failure("A shared break was added while shared breaks are disabled.")
@@ -699,31 +708,88 @@ public enum StructuralEditing {
 
     /// Every use is checked before modifying the shared definition. Music is
     /// preserved; only pure spacer bodies automatically follow a new length.
+    /// Function-generated music in a shorter bar can't be measured here: the
+    /// GUI measures it with `MeterProbe`; this entry point refuses it.
     public static func changeMeter(_ time: LensTime, measure name: String, files: [File], root: String, validatingContract: Bool = true) throws -> [Change] {
+        let plan = try planMeterChange(time, measure: name, files: files, root: root, validatingContract: validatingContract)
+        if !validatingContract, !plan.unverified.isEmpty {
+            throw Failure("Cannot shorten function-generated music without measuring it. Edit its timing in Source first.")
+        }
+        return plan.changes
+    }
+
+    /// The meter edit plus what only LilyPond can check: the bodies whose
+    /// length comes from functions, when the bar gets shorter. Their
+    /// statically visible notes are `knownFits`, a lower bound, never proof.
+    public static func planMeterChange(_ time: LensTime, measure name: String, files: [File], root: String, validatingContract: Bool = true) throws -> MeterPlan {
         if validatingContract { try validate(files, root: root) }
         guard time.beats > 0, time.beatType > 0, time.beats <= 1024, time.beatType <= 1024,
               let file = files.first(where: { $0.id == root }), isManaged(file.tree),
               let (_, node) = definitions(in: file.tree).first(where: { $0.0 == name }) else { throw Failure("The shared measure definition is missing or invalid.") }
+        let previous = self.time(in: file.tree, name: name)
+        let shortening = previous.map { time.wholeNotes < $0.wholeNotes } ?? true
+        var unverified: [ProbeSite] = []
+        var knownFits = true
         for source in files {
             for measure in measures(in: source.tree) where measure.name == name {
                 let context = LensContextScanner.scan(source.tree, block: measure.body)
                 guard isInterpreted(file.tree) || (context.unsupported.allSatisfy({ $0 == "markup" }) && context.custom.isEmpty) else {
                     throw Failure("\(source.id): this measure contains timing that needs LilyPond validation.")
                 }
+                let length = contentLength(source.tree, body: measure.body, context: context)
                 if isInterpreted(file.tree), needsInterpreter(in: source.tree, body: measure.body) {
-                    if !validatingContract, let old = self.time(in: file.tree, name: name), time.wholeNotes < old.wholeNotes {
-                        throw Failure("Cannot shorten function-generated music without measuring it. Edit its timing in Source first.")
-                    }
+                    guard shortening else { continue }
+                    unverified.append(probeSite(source, measure))
+                    if length > time.wholeNotes { knownFits = false }
                     continue
                 }
-                let length = contentLength(source.tree, body: measure.body, context: context)
                 guard length <= time.wholeNotes else {
                     throw Overflow(file: source.id, measure: name, meter: time)
                 }
             }
         }
         let command = breakIn(file.tree, node: node)
-        return [Change(file: root, edits: [TextEdit(node.range, String(definition(name: name, time: time, breakCommand: command).dropFirst(name.utf8.count + 3)))])]
+        let changes = [Change(file: root, edits: [TextEdit(node.range, String(definition(name: name, time: time, breakCommand: command).dropFirst(name.utf8.count + 3)))])]
+        return MeterPlan(changes: changes, measure: name, meter: time, previous: previous, unverified: unverified, knownFits: knownFits)
+    }
+
+    /// Removing the meter change that bar `name` begins: it and the bars
+    /// after it in the same meter (up to the next change) take the meter
+    /// before it, so the change disappears rather than moving one bar on.
+    /// `previous` in the plan is the meter removed; `measures` lists the bars.
+    public static func planMeterRemoval(measure name: String, files: [File], root: String,
+                                        validatingContract: Bool = true) throws -> MeterPlan {
+        guard let file = files.first(where: { $0.id == root }), isManaged(file.tree) else {
+            throw Failure("The shared measure definition is missing or invalid.")
+        }
+        let order = names(in: file.tree)
+        let meters = times(in: file.tree)
+        guard let i = order.firstIndex(of: name), let removed = meters[name] else {
+            throw Failure("The shared measure definition is missing or invalid.")
+        }
+        guard i > 0, let previous = meters[order[i - 1]] else {
+            throw Failure("The first bar's meter has no meter before it to return to. Choose a new one with Add Time Signature.")
+        }
+        guard previous != removed else { throw Failure("This bar continues the meter before it; there is no change to remove.") }
+        var run = [name]
+        for next in order[(i + 1)...] {
+            guard meters[next] == removed else { break }
+            run.append(next)
+        }
+        var edits: [TextEdit] = []
+        var unverified: [ProbeSite] = []
+        var knownFits = true
+        for (k, bar) in run.enumerated() {
+            let plan = try planMeterChange(previous, measure: bar, files: files, root: root,
+                                           validatingContract: validatingContract && k == 0)
+            edits += plan.changes.flatMap(\.edits)
+            unverified += plan.unverified
+            knownFits = knownFits && plan.knownFits
+        }
+        var plan = MeterPlan(changes: [Change(file: root, edits: edits.normalized)], measure: name, meter: previous,
+                             previous: removed, unverified: unverified, knownFits: knownFits)
+        plan.measures = run
+        return plan
     }
 
     private static func contentLength(_ tree: SyntaxTree, body: Range<Int>, context: LensContext) -> LensFraction {
@@ -763,6 +829,17 @@ public enum StructuralEditing {
         })
     }
 
+    /// The break state `toggleBreak(before:kind:)` would leave, for showing
+    /// its outcome before the edit is made.
+    public static func breakStateAfterToggle(before measure: String, kind: BreakKind, in tree: SyntaxTree) -> [String: BreakKind]? {
+        let all = definitions(in: tree)
+        guard let index = all.firstIndex(where: { $0.0 == measure }), index > 0 else { return nil }
+        var state = breakState(in: tree)
+        let previous = all[index - 1].0
+        state[previous] = state[previous] == kind ? nil : kind
+        return state
+    }
+
     public static func breakBefore(_ measure: String, in tree: SyntaxTree) -> BreakKind? {
         let all = definitions(in: tree)
         guard let index = all.firstIndex(where: { $0.0 == measure }), index > 0,
@@ -771,8 +848,12 @@ public enum StructuralEditing {
     }
 
     /// A boundary before a selected measure belongs to its predecessor's end.
-    public static func toggleBreak(before measure: String, files: [File], root: String, kind: BreakKind = .system) throws -> [Change] {
-        try validate(files, root: root)
+    /// `validatingContract: false` only when the caller knows the project
+    /// already passes `validate` (the GUI's audited revision): this edit
+    /// keeps it valid, but can't detect damage made before it.
+    public static func toggleBreak(before measure: String, files: [File], root: String, kind: BreakKind = .system,
+                                   validatingContract: Bool = true) throws -> [Change] {
+        if validatingContract { try validate(files, root: root) }
         guard let file = files.first(where: { $0.id == root }), managesBreaks(file.tree) else { throw Failure("Shared breaks are not enabled in Restore Defaults.") }
         let all = definitions(in: file.tree)
         guard let index = all.firstIndex(where: { $0.0 == measure }), index > 0 else { throw Failure("There is no system boundary before the first measure.") }
@@ -888,32 +969,105 @@ public enum StructuralEditing {
         return result
     }
 
-    public static func appendMeasure(after name: String, time: LensTime, files: [File], root: String) throws -> [Change] {
-        try validate(files, root: root)
+    /// `validatingContract: false` only when the caller knows the project
+    /// already passes `validate` (the GUI's audited revision).
+    public static func appendMeasure(after name: String, time: LensTime, files: [File], root: String,
+                                     validatingContract: Bool = true) throws -> [Change] {
+        if validatingContract { try validate(files, root: root) }
         guard let source = files.first(where: { $0.id == root }),
               let last = definitions(in: source.tree).last, last.0 == name else { throw Failure("Finish this measure by selecting the next existing measure.") }
-        let next = self.name(definitions(in: source.tree).count)
+        return try insertMeasures(after: name, count: 1, time: time, files: files, root: root, validatingContract: false)
+    }
+
+    /// The bar whose shared definition in the root holds `offset`: where
+    /// its `\\time`, and so the link of the time signature it prints, is.
+    public static func definition(in root: SyntaxTree, containing offset: Int) -> String? {
+        definitions(in: root).first { $0.1.range.contains(offset) }?.0
+    }
+
+    /// The shared bars in score order, as the root defines them.
+    public static func names(in root: SyntaxTree) -> [String] {
+        definitions(in: root).map { $0.0 }
+    }
+
+    /// `count` empty bars of `time` after `name`, in every voice. New bars
+    /// take fresh names; no existing bar is renamed. A break after `name`
+    /// moves to the last new bar, so it stays before the bar that followed.
+    /// `validatingContract` as in `appendMeasure`.
+    public static func insertMeasures(after name: String, count: Int, time: LensTime, files: [File], root: String,
+                                      validatingContract: Bool = true) throws -> [Change] {
+        if validatingContract { try validate(files, root: root) }
+        guard count > 0 else { return [] }
+        guard count <= 999 else { throw Failure("Add at most 999 bars at once.") }
+        guard let source = files.first(where: { $0.id == root }) else { throw Failure("The root score is missing.") }
+        let all = definitions(in: source.tree)
+        guard let position = all.firstIndex(where: { $0.0 == name }) else { throw Failure("\(name) has no shared definition.") }
+        let first = (all.compactMap { index(of: $0.0) }.max() ?? -1) + 1
+        let added = (0..<count).map { self.name(first + $0) }
+        let successor = all.indices.contains(position + 1) ? all[position + 1].0 : nil
+        let ordered = all[...position].map { $0.0 } + added + all[(position + 1)...].map { $0.0 }
+
         var result: [Change] = []
         for file in files {
             var edits: [TextEdit] = []
             for measure in measures(in: file.tree) where measure.name == name {
-                let finalBars = trailingBars(in: file.tree, body: measure.body).filter { $0.text == "\\bar \"|.\"" }
+                let finalBars = successor == nil ? trailingBars(in: file.tree, body: measure.body).filter { $0.text == "\\bar \"|.\"" } : []
                 for bar in finalBars { edits.append(TextEdit(bar.range, "")) }
                 let ending = finalBars.map { " " + $0.text }.joined()
-                edits.append(.insert(" | \\pondsideMeasure \\\(next) { s1*0" + ending + " } ", at: measure.invocation.upperBound))
+                let bars = added.enumerated().map { i, next in
+                    "| \\pondsideMeasure \\\(next) { s1*0" + (i == added.count - 1 ? ending : "") + " }"
+                }
+                edits.append(.insert(" " + bars.joined(separator: " ") + " ", at: measure.invocation.upperBound))
+            }
+            // Layout anchors find bars by name, so a slot spanning the new
+            // bars stretches over them. A slot ending exactly here, followed
+            // by one starting at the next bar, would leave a gap: it ends at
+            // the last new bar instead.
+            if let successor {
+                for region in layoutRegions(in: file.tree) {
+                    let span = region.invocation.lowerBound..<region.body.lowerBound
+                    guard anchors(to: successor, in: file.tree.bytes, within: span).contains(where: { $0.at == .zero }) else { continue }
+                    for anchor in anchors(to: name, in: file.tree.bytes, within: span) where anchor.at == .one {
+                        edits.append(TextEdit(anchor.range, "(\(added.last!) . 1)"))
+                    }
+                }
             }
             if file.id == root {
-                edits.append(.insert("\n" + definition(name: next, time: time, breakCommand: nil), at: last.1.range.upperBound))
+                let anchor = all[position].1
+                let moved = successor == nil ? nil : breakIn(source.tree, node: anchor)
+                var kept = source.tree.string(anchor.range)
+                if moved != nil, let meter = self.time(in: source.tree, name: name) {
+                    kept = String(definition(name: name, time: meter, breakCommand: nil).dropFirst(name.utf8.count + 3))
+                }
+                let definitions = added.enumerated().map { i, next in
+                    "\n" + definition(name: next, time: time, breakCommand: i == added.count - 1 ? moved : nil)
+                }
+                edits.append(TextEdit(anchor.range, kept + definitions.joined()))
                 if isInterpreted(source.tree) {
                     let children = source.tree.root.children
                     if let index = children.firstIndex(where: { $0.kind == .assignment && $0.children.first.map({ source.tree.string($0.range) }) == "pondsideTimeline" }),
                        let value = children.dropFirst(index + 1).first(where: { !$0.kind.isTrivia }) {
-                        let names = definitions(in: source.tree).map { $0.0 } + [next]
-                        edits.append(TextEdit(children[index].range.lowerBound..<value.range.upperBound, timelineDefinition(names: names)))
+                        edits.append(TextEdit(children[index].range.lowerBound..<value.range.upperBound, timelineDefinition(names: ordered)))
                     }
                 }
             }
             if !edits.isEmpty { result.append(Change(file: file.id, edits: edits)) }
+        }
+        return result
+    }
+
+    /// The layout anchors `(bar . fraction)` naming `bar`, as LilyPond
+    /// reads them: `0`, `0/1` and `2/2` are all rationals.
+    private static func anchors(to bar: String, in bytes: [UInt8], within range: Range<Int>) -> [(range: Range<Int>, at: LensFraction)] {
+        let pattern = Array("(\(bar) . ".utf8)
+        guard range.count >= pattern.count else { return [] }
+        var result: [(Range<Int>, LensFraction)] = []
+        for start in range.lowerBound...(range.upperBound - pattern.count) where bytes[start..<(start + pattern.count)].elementsEqual(pattern) {
+            guard let close = bytes[(start + pattern.count)..<range.upperBound].firstIndex(of: UInt8(ascii: ")")) else { continue }
+            let parts = String(decoding: bytes[(start + pattern.count)..<close], as: UTF8.self).split(separator: "/", omittingEmptySubsequences: false)
+            guard (1...2).contains(parts.count), let numerator = Int(parts[0]),
+                  let denominator = parts.count == 2 ? Int(parts[1]) : 1, denominator > 0 else { continue }
+            result.append((start..<(close + 1), LensFraction(numerator, denominator)))
         }
         return result
     }
@@ -930,7 +1084,7 @@ pondsideSpace =
                           (/ numerator denominator))))))
 """#
 
-    private static let runtime = #"""
+    static let runtime = #"""
 #(define (pondside-break-music? music)
    (or (memq (ly:music-property music 'name) '(LineBreakEvent PageBreakEvent))
        (ly:music-property music 'page-marker #f)))

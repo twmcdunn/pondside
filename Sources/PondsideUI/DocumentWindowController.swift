@@ -37,6 +37,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         return pane
     }()
     private var panes: PaneHost!
+    private var firstResponderObservation: NSKeyValueObservation?
     private lazy var agentLogView = AgentLogView()
     /// The SuperCollider pane, once something has shown it.
     private var scPane: SuperColliderPane?
@@ -45,8 +46,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// The unattended agent finishing a patch migration, while it runs.
     private var agentHandle: AgentRun.Handle?
     private var agentNote: String?
+    /// Meter probes still running (`MeterProbe`), shown as a status activity.
+    private var meterProbes = 0
+    /// The latest meter request: an older probe never applies its edit.
+    private var meterRequest = 0
+    /// The texts before and after the last `applyStructural` that changed
+    /// anything, for a caller that registers its undo later.
+    private var lastStructuralCommit: (expected: [URL: String], replacements: [URL: String])?
+    /// An agent undo is checking the project before it restores files.
+    private var agentUndoRunning = false
     private var agentProgress: AgentProgress?
     private let requestPopover = AgentRequestPopover()
+    private var graphicsContextSnapshot: GraphicsRequestContext?
+    private var graphicsContextTask: Task<JSONValue, Never>?
+    private(set) var graphicsContextBuilds = 0
+
     private var generalAgentSheet: GeneralAgentSheet?
     private var deploymentRunning = false
     /// The agent conversation for requests from the lens, kept between them.
@@ -109,7 +123,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         if next == nil {
             do {
-                guard applyStructural(try StructuralEditing.appendMeasure(after: measure.name, time: unmeteredOriginal, files: structuralFiles, root: score.root.url.path), name: "Finish Unmetered Bar") else { return }
+                guard applyStructural(try StructuralEditing.appendMeasure(after: measure.name, time: unmeteredOriginal, files: structuralFiles, root: score.root.url.path, validatingContract: !score.contractAudited), name: "Finish Unmetered Bar") else { return }
                 // The structural definitions may have shifted the active root.
                 if let current = StructuralEditing.measures(in: tree).first(where: { $0.name == measure.name }) {
                     next = StructuralEditing.measures(in: tree).first { $0.invocation.lowerBound >= current.invocation.upperBound }
@@ -166,6 +180,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             cached.window.targetEvent = target
             cached.window.selected = selected.isEmpty ? [target] : selected
             for i in cached.window.events.indices { cached.window.events[i].isTarget = cached.window.events[i].sourceEvent == target }
+            cached.window.updateSelectedSlur(selection: selection, tree: tree)
             cachedLens = cached
             return cached.window
         }
@@ -209,6 +224,39 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     var lightsOut: Bool {
         get { canvas.lightsOut }
         set { canvas.lightsOut = newValue }
+    }
+    /// While playing, each new system glides to the middle of the view (⌥F).
+    var followsPlayback = true
+
+    func flash(_ message: String) { statusBar.flash(message) }
+
+    // MARK: Hearing selected notes
+
+    /// The score's `[audio] soundfont`, read once (pondside.toml).
+    private lazy var auditionSoundFont: URL? = (try? ProjectConfig.find(from: score.url))?.soundFont
+    /// What was last selected: the file and each pitched event's start and
+    /// MIDI pitches, so only a newly selected note or a changed pitch sounds.
+    private var auditioned: (file: URL, pitches: [Int: [Int]])?
+
+    func prepareNoteAudition() { NoteAudition.shared.prepare(soundFont: auditionSoundFont) }
+
+    private func auditionSelection(_ selected: (events: [Int], notes: [Int])) {
+        guard NoteAudition.shared.isEnabled, selected.events.count <= 64 else { auditioned = nil; return }
+        var pitches: [Int: [Int]] = [:]
+        if selected.events.isEmpty {
+            for n in selected.notes { pitches[tree.notes[n].spelledRange.lowerBound] = [NoteAudition.midi(tree.notes[n].absolute)] }
+        } else {
+            for e in selected.events where tree.events[e].isPitched {
+                pitches[tree.events[e].range.lowerBound] = tree.events[e].notes.map { NoteAudition.midi(tree.notes[$0].absolute) }
+            }
+        }
+        defer { auditioned = (activeFile.url, pitches) }
+        if let last = auditioned, last.file != activeFile.url { return }
+        let fresh = pitches.filter { auditioned?.pitches[$0.key] != $0.value }
+        // One newly selected note or chord (a click, ←→, ⇧→, a new pitch).
+        if fresh.count == 1, let notes = fresh.first?.value {
+            NoteAudition.shared.play(notes, soundFont: auditionSoundFont)
+        }
     }
 
     init(document: ScoreDocument) {
@@ -316,6 +364,15 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         statusBar.onStopAgent = { [weak self] in self?.stopAgent() }
         content.addSubview(split)
         content.addSubview(statusBar)
+        // The pane collapse buttons sit in the title bar strip, over no content.
+        let collapseBar = panes.collapseBar
+        collapseBar.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(collapseBar)
+        panes.focusedPane = { [unowned self] in self.panes.paneIndex(containing: self.window?.firstResponder as? NSView) }
+        panes.onCollapseChange = { [unowned self] l in self.applyCollapse(l) }
+        firstResponderObservation = window?.observe(\.firstResponder, options: [.new]) { [weak self] _, _ in
+            MainActor.assumeIsolated { self?.panes.collapseBar.refresh() }
+        }
 
         // Content starts below the transparent title bar, so neither code
         // nor music ever sits under the traffic lights.
@@ -328,6 +385,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             statusBar.heightAnchor.constraint(equalToConstant: 26),
+            collapseBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            collapseBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            collapseBar.topAnchor.constraint(equalTo: content.topAnchor),
+            collapseBar.bottomAnchor.constraint(equalTo: split.topAnchor),
         ])
         content.layoutSubtreeIfNeeded()
         panes.applyFractions()
@@ -460,6 +521,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 return
             }
             let session = NotationLensController()
+            session.onEscape = { [weak self] in self?.escapeNotationLens(event: NSApp.currentEvent) ?? false }
             session.onFailure = { [weak self] message in
                 self?.statusBar.flash(message)
             }
@@ -467,6 +529,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 self?.lensCloseTask?.cancel()
                 self?.lensClosesOnRender = false
                 self?.lensWasExplicit = false
+                if self?.hasPendingNoteInput == true { self?.inputLensDismissed = true }
             }
             lens = session
         }
@@ -518,6 +581,36 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             self.lensSelectionAnchor = anchor
             self.selectEvents([min(anchor, index), max(anchor, index)])
             self.showLens(closesOnRender: false, navigating: true)
+            self.window?.makeFirstResponder(self.canvas)
+        }
+        lens.onSelectSlur = { [weak self] index, phrasing in
+            guard let self else { return }
+            guard !self.hasPendingNoteInput, self.activeFile.url == displayedFile, self.tree.text == displayedText,
+                  self.tree.events.indices.contains(index) else {
+                self.showLens(closesOnRender: false, navigating: true)
+                return
+            }
+            let editor = ScoreEditor(self.tree)
+            guard let mark = self.tree.events[index].postEvents.lazy
+                .compactMap({ editor.slurMark(at: $0.lowerBound) })
+                .first(where: { $0.opens && $0.phrasing == phrasing }) else { return }
+            self.mouseInsertion = nil
+            self.selectSlur(mark)
+            self.window?.makeFirstResponder(self.canvas)
+        }
+        lens.onSelectMark = { [weak self] index, kind in
+            guard let self else { return }
+            guard !self.hasPendingNoteInput, self.activeFile.url == displayedFile, self.tree.text == displayedText,
+                  self.tree.events.indices.contains(index) else {
+                self.showLens(closesOnRender: false, navigating: true)
+                return
+            }
+            let editor = ScoreEditor(self.tree)
+            guard let mark = self.tree.events[index].postEvents.lazy
+                .compactMap({ editor.mark(at: $0.lowerBound) })
+                .first(where: { kind.matches($0.kind) }) else { return }
+            self.mouseInsertion = nil
+            self.selectMark(mark.range, event: mark.event, name: mark.name)
             self.window?.makeFirstResponder(self.canvas)
         }
         lens.available = modes.available
@@ -591,7 +684,51 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         showLens(closesOnRender: false, navigating: true)
     }
 
+    /// First Escape leaves note selection for cursor entry; the next dismisses.
+    /// This touches only presentation and selection, never source or engraving.
+    private var lastLensEscapeTime: TimeInterval?
+
+    @discardableResult
+    func escapeNotationLens(event: NSEvent? = nil) -> Bool {
+        guard lens?.isOpen == true else { return false }
+        // AppKit's popover delegate and the window monitor can see the same
+        // Escape. It must advance exactly one stage for that physical event.
+        if let event {
+            if lastLensEscapeTime == event.timestamp { return true }
+            lastLensEscapeTime = event.timestamp
+        }
+        noteInput.cancelPendingInput()
+        chord.cancel()
+        statusBar.endChord()
+        guard !enteringNotes, mouseInsertion == nil, let content = lensContent() else {
+            closeLens()
+            return true
+        }
+        let displayed = inputProvisional?.value.tree ?? tree
+        let anchor = content.selected.max() ?? content.targetEvent
+        guard displayed.events.indices.contains(anchor) else { closeLens(); return true }
+        enteringNotes = true
+        lensWasExplicit = true
+        lensClosesOnRender = false
+        lensCloseTask?.cancel()
+        lensCloseTask = nil
+        let offset = displayed.events[anchor].range.lowerBound
+        if var proposal = inputProvisional {
+            pointInputCursor(&proposal.value, at: anchor)
+            inputProvisional = proposal
+            if inputReady?.sequence == proposal.sequence { inputReady = proposal }
+            inputAnchor = anchor
+            inputDraftSelection = NoteSelection(file: activeFile.url, range: offset..<offset, entering: true)
+        } else {
+            setSelection(utf8: offset..<offset, scroll: false)
+        }
+        updateInputStatus()
+        window?.makeFirstResponder(canvas)
+        return true
+    }
+
     private func closeLens(animated: Bool = false, _ why: StaticString = #function) {
+        if hasPendingNoteInput { inputLensDismissed = true }
         if lens?.isOpen == true { lensLog.debug("close (\(why)), animated: \(animated)") }
         lensCloseTask?.cancel()
         lensCloseTask = nil
@@ -712,6 +849,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         mouseInsertion = nil
         let selected = targets()
         hasSelection = !selected.events.isEmpty || !selected.notes.isEmpty
+        // A selected time signature (in a shared bar's definition, say)
+        // holds no event, yet ⌫ deletes it.
+        if !hasSelection, selectedTimeSignature() != nil { hasSelection = true }
+        auditionSelection(selected)
         guard let map = engraving else {
             highlighted = []
             canvas.highlight([], path: activeFile.url.path, reveal: false)
@@ -748,6 +889,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private var hasSelection = false
+    /// The overflowing systems last announced (page and first glyph).
+    private var announcedOverflows: [String] = []
     /// The engraved positions currently highlighted (the selection's glyphs).
     private var highlighted = Set<SourcePosition>()
 
@@ -949,6 +1092,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         var value: UnmeteredInputTransaction.Proposal
     }
     private var pendingNotes: [(UnmeteredInputPlan.Request, String)] = []
+    private var inputLensDismissed = false
     private var inputTask: Task<Void, Never>?
     private var inputCommitTask: Task<Void, Never>?
     // Injectable persistence boundary; draft preparation never waits for it.
@@ -992,6 +1136,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func beginInputDraft(anchor override: Int? = nil) -> Bool {
+        inputLensDismissed = false
         if inputBase == nil {
             guard let anchor = override ?? targets().events.max(), tree.events.indices.contains(anchor) else { return false }
             inputAnchor = anchor
@@ -1027,6 +1172,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         startInputPreparation()
     }
 
+    private func pointInputCursor(_ proposal: inout UnmeteredInputTransaction.Proposal, at anchor: Int) {
+        let offset = proposal.tree.events[anchor].range.lowerBound
+        proposal.plan.selection = offset
+        proposal.plan.selectionRange = offset..<offset
+        proposal.lens.targetEvent = anchor
+        proposal.lens.selected = [anchor]
+        for index in proposal.lens.events.indices {
+            proposal.lens.events[index].isTarget = proposal.lens.events[index].sourceEvent == anchor
+        }
+    }
+
     /// Every keystroke gets a new proposed CST and real lens model. This
     /// task never waits for file writes or LilyPond, even during a slow commit.
     private func startInputPreparation() {
@@ -1048,10 +1204,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 let active = self.activeFile.url.path, root = self.score.root.url.path
                 guard let anchor = self.inputAnchor else { break }
                 do {
-                    let value = try await Task.detached(priority: .userInitiated) {
+                    var value = try await Task.detached(priority: .userInitiated) {
                         try UnmeteredInputTransaction.propose(request, files: files, root: root, active: active, anchor: anchor)
                     }.value
                     guard !Task.isCancelled, !self.inputWriteFailed else { break }
+                    if self.enteringNotes, let last = value.lens.selected.max() { self.pointInputCursor(&value, at: last) }
                     self.inputPreparedCount += 1
                     let newSelection = NoteSelection(file: self.activeFile.url, range: value.plan.selectionRange, entering: self.enteringNotes)
                     if case .restore = request { /* inverse was registered synchronously by NSUndoManager */ }
@@ -1073,7 +1230,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                     let proposal = InputProposal(sequence: self.inputPreparedCount, value: value)
                     self.inputProvisional = proposal
                     self.inputReady = proposal
-                    self.showLens(closesOnRender: false)
+                    if !self.inputLensDismissed { self.showLens(closesOnRender: false) }
                     self.startInputCommit()
                 } catch {
                     self.keepInputRecovery()
@@ -1142,6 +1299,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         inputUndoTokens = []
         inputDraftSelection = nil
         if !inputWriteFailed, let final = inputProvisional {
+            if selectionUTF8() != final.value.plan.selectionRange { setSelection(utf8: final.value.plan.selectionRange, scroll: false) }
             cachedLens = (tree.text, score.root.text, final.value.lens)
         }
         inputBase = nil
@@ -1155,7 +1313,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         inputHistory = nil
         inputWriteFailed = false
         editor.textView.isEditable = true
-        showLens(closesOnRender: false)
+        if !inputLensDismissed { showLens(closesOnRender: false) }
         let actions = inputBarriers
         inputBarriers = []
         for action in actions { action() }
@@ -1178,8 +1336,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         if hasPendingNoteInput, unmeteredStart != nil, !enteringNotes,
            inputProvisional?.value.lens.selected.count == 1 {
             switch action {
-            case .move, .setDuration, .toggleDot, .toggleAccidental, .delete, .togglePostEvent:
+            case .move, .setDuration, .toggleDot, .toggleAccidental, .delete, .togglePostEvent, .toggleSlur:
                 if case .toggleAccidental = action { noteInput.clearAccidental() }
+                inputLensDismissed = false
                 pendingNotes.append((.action(action), ""))
                 startInputPreparation()
                 return
@@ -1255,6 +1414,30 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 statusBar.flash("Insertion point cleared")
                 return
             }
+            if let mark = selectedSlurMark() {
+                let gone = highlighted
+                let edit = scoreEditor.removeSlur(at: mark.range.lowerBound)
+                apply(edit)
+                if edit != nil {
+                    canvas.provisionalDelete(gone, path: activeFile.url.path)
+                    refreshHighlight(reveal: false)
+                }
+                return
+            }
+            if let time = selectedTimeSignature() {
+                removeTimeSignature(at: time)
+                return
+            }
+            if let mark = selectedMark() {
+                let gone = highlighted
+                let edit = scoreEditor.removeMark(at: mark.range.lowerBound)
+                apply(edit)
+                if edit != nil {
+                    canvas.provisionalDelete(gone, path: activeFile.url.path)
+                    refreshHighlight(reveal: false)
+                }
+                return
+            }
             let gone = events.allSatisfy { isEngraved($0) } ? highlighted : []
             let edit = scoreEditor.delete(events: events)
             apply(edit)
@@ -1262,6 +1445,9 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 canvas.provisionalDelete(gone, path: activeFile.url.path)
                 refreshHighlight(reveal: false)
             }
+        case .toggleSlur:
+            let pitched = events.filter { !tree.events[$0].notes.isEmpty }
+            apply(scoreEditor.toggleSpan(open: "(", close: ")", events: pitched, name: "Slur"))
         case .togglePostEvent(let text):
             let eligible = events.filter { tree.events[$0].acceptsNoteEntry }
             apply(scoreEditor.togglePostEvent(text, events: eligible))
@@ -1416,7 +1602,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             // Never fail silently: say which music can't be clicked, and why.
             note = "\(f.displayName) has notes but no point-and-click links"
         }
-        statusBar.setActivities(score.activities + (agentNote.map { [$0] } ?? []))
+        statusBar.setActivities(score.activities + (meterProbes > 0 ? ["Measuring bar..."] : []) + (agentNote.map { [$0] } ?? []))
         statusBar.setAgentWorking(agentWorking)
         statusBar.set(status: score.status, detail: firstErrorText(), zoom: canvas.zoom, toolchain: lily, note: note,
                       stale: score.showingCachedRender)
@@ -1529,6 +1715,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         structureTask?.cancel()
+        graphicsContextTask?.cancel()
         navigationFollowTask?.cancel()
         breakEditTask?.cancel()
         canvas.clearBreakFeedback()
@@ -1553,6 +1740,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         score.revalidate()
+        prepareNoteAudition()
     }
 
     /// ⌘Z from either pane undoes the visible file's edits, score and text alike.
@@ -1603,6 +1791,27 @@ extension DocumentWindowController: ScoreCanvasDelegate {
                 statusBar.flash("Editing \(file.displayName)")
             }
             guard let offset = currentOffset(of: link) else { return }
+            // LilyPond links a slur to its `(`, a time signature to its
+            // `\time`, an articulation, dynamic or hairpin to its own
+            // post-event: the click selects that, and ⌫ deletes it.
+            if !extending, file === activeFile {
+                let scoreEditor = ScoreEditor(tree)
+                if let mark = scoreEditor.slurMark(at: offset) {
+                    selectSlur(mark)
+                    window?.makeFirstResponder(canvas)
+                    return
+                }
+                if let time = scoreEditor.timeSignature(at: offset) {
+                    selectMark(time, event: nil, name: "Time signature")
+                    window?.makeFirstResponder(canvas)
+                    return
+                }
+                if let mark = scoreEditor.mark(at: offset) {
+                    selectMark(mark.range, event: mark.event, name: mark.name)
+                    window?.makeFirstResponder(canvas)
+                    return
+                }
+            }
             // A chord member selects just that note, so ↑↓ move it alone.
             var range: Range<Int>
             if let n = tree.noteIndex(startingAt: offset), let e = tree.notes[n].event, tree.events[e].kind == .chord {
@@ -1631,6 +1840,55 @@ extension DocumentWindowController: ScoreCanvasDelegate {
 
     func canvas(_ canvas: ScoreCanvasView, isGraphicLink link: PointAndClickLocation) -> Bool {
         isGraphicLink(link)
+    }
+
+    func canvas(_ canvas: ScoreCanvasView, hitsByOutline link: PointAndClickLocation) -> Bool {
+        guard PathMatching.same(link.path, activeFile.url.path), let offset = currentOffset(of: link) else { return false }
+        return ScoreEditor(tree).slurMark(at: offset) != nil
+    }
+
+    // MARK: Slurs
+
+    /// The slur the selection is: exactly one of its marks (`(`, `\(`, or
+    /// their `)`), as a click on the slur or the source selects it.
+    private func selectedSlurMark() -> ScoreEditor.SlurMark? {
+        let r = selectionUTF8()
+        guard !r.isEmpty, let mark = ScoreEditor(tree).slurMark(at: r.lowerBound), mark.range == r else { return nil }
+        return mark
+    }
+
+    /// Selects a slur by its mark; the page and the lens outline the slur,
+    /// and Delete removes both its ends.
+    private func selectSlur(_ mark: ScoreEditor.SlurMark) {
+        enteringNotes = false
+        setSelection(utf8: mark.range)
+        lensSelectionAnchor = mark.event
+        if lens?.isOpen == true { showLens(closesOnRender: false, navigating: true) }
+        statusBar.flash(mark.phrasing ? "Phrasing slur selected · ⌫ deletes it" : "Slur selected · ⌫ deletes it")
+    }
+
+    /// The articulation, dynamic, hairpin or other mark the selection is,
+    /// exactly, as a click on it selects it.
+    private func selectedMark() -> ScoreEditor.Mark? {
+        let r = selectionUTF8()
+        guard !r.isEmpty, let mark = ScoreEditor(tree).mark(at: r.lowerBound), mark.range == r else { return nil }
+        return mark
+    }
+
+    /// The time signature (`\time n/d`) the selection is, exactly.
+    private func selectedTimeSignature() -> Range<Int>? {
+        let r = selectionUTF8()
+        guard !r.isEmpty, let time = ScoreEditor(tree).timeSignature(at: r.lowerBound), time == r else { return nil }
+        return time
+    }
+
+    /// Selects one mark by its source; the page outlines its grob.
+    private func selectMark(_ range: Range<Int>, event: Int?, name: String) {
+        enteringNotes = false
+        setSelection(utf8: range)
+        if let event { lensSelectionAnchor = event }
+        if lens?.isOpen == true, event != nil { showLens(closesOnRender: false, navigating: true) }
+        statusBar.flash("\(name) selected · ⌫ deletes it")
     }
 
     func canvas(_ canvas: ScoreCanvasView, didClickGraphic link: PointAndClickLocation) {
@@ -1855,6 +2113,20 @@ extension DocumentWindowController: ScoreDocumentDelegate {
         }
     }
 
+    /// Systems running into the margin, said once when they change: with
+    /// automatic line breaks off LilyPond can't move a bar, and no spacing
+    /// setting narrows a line already at its notes' minimum distances.
+    private func announceOverflows(_ overflows: [SystemOverflow]) {
+        let key = overflows.map { "\($0.page):\($0.first?.description ?? "")" }
+        defer { announcedOverflows = key }
+        guard !overflows.isEmpty, key != announcedOverflows, let o = overflows.first else { return }
+        let page = canvas.pages.indices.contains(o.page) ? canvas.pages[o.page].page : nil
+        let ordinal = page.map { p in p.systems.filter { $0.upperBound < o.band.lowerBound }.count + 1 }
+        let which = ordinal.map { "System \($0) on page \(o.page + 1)" } ?? "A system on page \(o.page + 1)"
+        let more = overflows.count > 1 ? " (and \(overflows.count - 1) more)" : ""
+        statusBar.flash(String(format: "%@ runs %.1f mm into the margin%@ — line breaks are yours: move a bar or narrow it",
+                               which, o.amountMM, more))
+    }
     func documentDidLoadCachedRender(_ document: ScoreDocument) {
         canvas.setPages(score.pages)
         canvas.fitWidth()
@@ -1866,6 +2138,8 @@ extension DocumentWindowController: ScoreDocumentDelegate {
     func documentDidEngrave(_ document: ScoreDocument) {
         let first = canvas.pages.isEmpty
         canvas.setPages(score.pages)
+        canvas.setOverflows(score.overflows)
+        announceOverflows(score.overflows)
         if let generation = breakAwaitingGeneration, score.completedRenderGeneration >= generation {
             canvas.clearBreakFeedback()
             breakAwaitingGeneration = nil
@@ -1902,11 +2176,24 @@ private final class Box<T> {
     init(_ value: T) { self.value = value }
 }
 
-extension DocumentWindowController: CommandResponder {
+extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
     @objc func performCommand(_ sender: Any?) {
         guard let id = (sender as? NSMenuItem)?.commandID else { return }
         run(id)
     }
+
+    /// Only Revert to Checkpoint… greys out: without a working git there
+    /// are no checkpoints, and an enabled item would promise a safety net
+    /// that isn't there. The tool tip says why.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        guard item.commandID == "file.revert", let spec = CommandCenter.shared.spec("file.revert") else { return true }
+        let kept = ScoreDocument.checkpointGit != nil
+        item.toolTip = kept ? CommandCenter.shared.tip(for: spec) : Self.noCheckpointsMessage
+        return kept
+    }
+
+    static let noCheckpointsMessage = "No checkpoints are being kept: they need git. "
+        + "Install Apple's Command Line Tools (xcode-select --install in Terminal), then restart Pondside."
 
     var commandContext: CommandContext {
         let responder = window?.firstResponder
@@ -1915,7 +2202,8 @@ extension DocumentWindowController: CommandResponder {
         var errors = false
         if case .errors = score.status { errors = true }
         return CommandContext(focus: focus, hasSelection: hasSelection, durationArmed: noteInput.armedDuration != nil,
-                              hasErrors: errors, fileCount: score.files.count, agentWorking: agentWorking)
+                              hasErrors: errors, fileCount: score.files.count, agentWorking: agentWorking,
+                              checkpointsKept: ScoreDocument.checkpointGit != nil)
     }
 
     /// Runs a catalog command. Menus, chords and the palette all end here.
@@ -1938,6 +2226,7 @@ extension DocumentWindowController: CommandResponder {
         case "file.migratePatch": offerPatchMigration(asked: true)
         case "file.migrateScore": runScoreMigration()
         case "file.close": window?.performClose(nil)
+        case "file.revert": showCheckpointPicker()
 
         case "go.file": showFilePicker()
         case "go.line": showLinePicker()
@@ -1955,9 +2244,11 @@ extension DocumentWindowController: CommandResponder {
         case "edit.unmetered": toggleUnmetered()
         case "add.armAccidental": statusBar.flash("= sharp · - flat · 0 natural · toggle selection or arm next note")
         case "add.barline": finishUnmeteredBar()
+        case "add.bar": addBars(1, events: selected)
+        case "add.bars": showBarCountPicker(events: selected)
         case "add.systemBreak":
             if let first = selected.min() { toggleStructuralBreak(before: first) }
-        case "add.slur": apply(editor.toggleSpan(open: "(", close: ")", events: pitched, name: "Slur"))
+        case "add.slur": perform(.toggleSlur)
         case "add.beam": apply(editor.toggleSpan(open: "[", close: "]", events: pitched, name: "Beam"))
         case "add.crescendo": apply(editor.toggleSpan(open: "\\<", close: "\\!", events: selected, name: "Crescendo"))
         case "add.decrescendo": apply(editor.toggleSpan(open: "\\>", close: "\\!", events: selected, name: "Decrescendo"))
@@ -2008,6 +2299,7 @@ extension DocumentWindowController: CommandResponder {
         case "view.play": togglePlayback()
         case "view.playMix": togglePlayback(electronics: true)
         case "view.lens":
+            inputLensDismissed = false
             if canvas.graphicSectionSelection != nil { showRequest(fromLens: false) }
             else {
                 let selected = targets().events
@@ -2038,6 +2330,15 @@ extension DocumentWindowController: CommandResponder {
             var l = panes.layout
             l.focusNext()
             focusPane(l.focused)
+        case "pane.collapse":
+            syncFocusedPane()
+            var l = panes.layout
+            guard l.contents.count > 1 else {
+                statusBar.flash("Only one pane: nothing to collapse")
+                return
+            }
+            l.toggleCollapse()
+            applyCollapse(l)
         case "pane.cycleNext": cyclePane(forward: true)
         case "pane.cyclePrevious": cyclePane(forward: false)
         case "workspace.save": saveWorkspace()
@@ -2095,6 +2396,7 @@ extension DocumentWindowController: CommandResponder {
         case .scoreFocus: return "\(spec.title) works in the score: ⌘J to focus it"
         case .supercollider: return "\(spec.title) works in the SuperCollider pane: ␣ p c shows it"
         case .agentWorking: return "No agent is working"
+        case .checkpoints: return Self.noCheckpointsMessage
         case .always: return spec.title
         }
     }
@@ -2131,10 +2433,13 @@ extension DocumentWindowController: CommandResponder {
             editFeedback?.dismiss()
             editFeedback = nil
         }
-        if event.keyCode == 53, lens?.isOpen == true {
-            closeLens()
-            return true
-        }
+        // ⎋ stops playback before it does anything else.
+        if event.keyCode == 53, flags.subtracting([.numericPad, .function]).isEmpty, stopPlayback() { return true }
+        // Then it closes a settings panel floating over the score.
+        if event.keyCode == 53, flags.subtracting([.numericPad, .function]).isEmpty,
+           window.attachedSheet == nil, SettingsPanels.closeFloating() { return true }
+        if event.keyCode == 53, requestPopover.isOpen { requestPopover.close(); return true }
+        if event.keyCode == 53, escapeNotationLens(event: event) { return true }
         if event.keyCode == 53, canvas.graphicSectionSelection != nil, !canvas.legendArranging {
             canvas.clearGraphicSection()
             statusBar.flash("Section cleared")
@@ -2377,7 +2682,7 @@ extension DocumentWindowController: CommandResponder {
         let files = score.files.map { (path: $0.url.path, text: $0 === point.file ? point.text : $0.text) }
         let context = ScoreContext.describe(text: point.text, file: point.file.url.path,
                                             line: point.position.line, character: point.position.character,
-                                            files: files, cues: score.cueSheet)
+                                            files: files, cues: score.cueSheet, includeGraphic: false)
         guard let bar = context["bar"]?.int, let moment = context["moment"]?.string else { return nil }
         return MusicalHit(bar: bar, moment: moment, event: context["event"]?["text"]?.string,
                           source: ["file": .string(point.file.url.path),
@@ -2396,9 +2701,9 @@ extension DocumentWindowController: CommandResponder {
     /// edges (`from`/`to`), what each edge is in the music, the fraction of
     /// each broken piece, and every system's selected x range.
     private func sectionSelection(_ section: GraphicSection, timing: SectionTimeMap?,
-                                  staffName: String?) -> JSONValue {
-        let from = sectionEndpoint(section.from, timing: timing, staffName: staffName)
-        let to = sectionEndpoint(section.to, timing: timing, staffName: staffName)
+                                  staffName: String?, resolvingMusic: Bool = true) -> JSONValue {
+        let from = sectionEndpoint(section.from, timing: timing, staffName: staffName, resolvingMusic: resolvingMusic)
+        let to = sectionEndpoint(section.to, timing: timing, staffName: staffName, resolvingMusic: resolvingMusic)
         let systems = section.systems.map { s -> JSONValue in
             let staffX = staffLineFraction(s.pageX, of: s.staff)
             var item: [String: JSONValue] = ["page": .number(Double(s.page + 1)),
@@ -2439,13 +2744,14 @@ extension DocumentWindowController: CommandResponder {
     }
 
     private func sectionEndpoint(_ end: GraphicSection.Endpoint, timing: SectionTimeMap?,
-                                 staffName: String?) -> [String: JSONValue] {
+                                 staffName: String?, resolvingMusic: Bool = true) -> [String: JSONValue] {
         var out: [String: JSONValue] = [
             "page": .number(Double(end.page + 1)),
             "x": .number(end.fraction),
             "page_x": .number(end.pageX),
             "spanner_x": .array([.number(end.piece.minX), .number(end.piece.maxX)]),
         ]
+        guard resolvingMusic else { return out }
         if let edge = timing?.edge(at: end, staffName: staffName) {
             var at: [String: JSONValue] = ["bar": .number(Double(edge.bar)), "moment": .string(edge.moment.description)]
             if let source = edge.source {
@@ -2521,6 +2827,77 @@ extension DocumentWindowController: CommandResponder {
 
     /// Every LilyPond found, the one in use marked; choosing one pins it in
     /// the project's pondside.toml (a file, like everything else).
+    // MARK: Checkpoints
+
+    /// Lists the shadow history's checkpoints; the chosen one replaces the
+    /// score's files after a confirmation, as one undoable edit.
+    private func showCheckpointPicker() {
+        guard let history = score.history else { statusBar.flash(Self.noCheckpointsMessage); return }
+        Task {
+            await score.checkpointNow(message: "before reverting")
+            let checkpoints = (try? await history.checkpoints()) ?? []
+            // The newest is the state on disk now: nothing to revert to.
+            let older = Array(checkpoints.dropFirst())
+            guard !older.isEmpty else {
+                statusBar.flash("No earlier checkpoints yet: Pondside makes one half a minute after you stop editing")
+                return
+            }
+            let parse = DateFormatter()  // git's %ci: 2026-11-05 14:03:22 -0800
+            parse.locale = Locale(identifier: "en_US_POSIX")
+            parse.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+            let relative = RelativeDateTimeFormatter()
+            let absolute = DateFormatter()
+            absolute.dateStyle = .medium
+            absolute.timeStyle = .short
+            let choices = older.map { c -> (title: String, detail: String?) in
+                guard let date = parse.date(from: c.date) else { return (c.date, c.message) }
+                return (relative.localizedString(for: date, relativeTo: Date()), absolute.string(from: date) + " · " + c.message)
+            }
+            showPicker(placeholder: "Revert to checkpoint", choices: choices) { [weak self] i in
+                guard let self, older.indices.contains(i) else { return }
+                self.confirmRevert(to: older[i], label: choices[i].title, history: history)
+            }
+        }
+    }
+
+    private func confirmRevert(to checkpoint: ShadowHistory.Checkpoint, label: String, history: ShadowHistory) {
+        Task {
+            var replacements: [URL: String] = [:]
+            for file in score.files {
+                // A file that didn't exist then is left as it is.
+                guard let text = try? await history.text(of: file.url, at: checkpoint.revision), text != file.text else { continue }
+                replacements[file.url] = text
+            }
+            guard !replacements.isEmpty else {
+                statusBar.flash("The score is already as it was \(label)")
+                return
+            }
+            let names = score.files.filter { replacements[$0.url] != nil }.map(\.displayName)
+            let alert = NSAlert()
+            alert.messageText = "Revert to the checkpoint from \(label)?"
+            alert.informativeText = "This replaces \(names.joined(separator: ", ")). "
+                + "The current version was just checkpointed, and Undo brings it back."
+            alert.addButton(withTitle: "Revert")
+            alert.addButton(withTitle: "Cancel")
+            guard let window else { return }
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard response == .alertFirstButtonReturn, let self else { return }
+                self.revert(to: replacements, label: label)
+            }
+        }
+    }
+
+    private func revert(to replacements: [URL: String], label: String) {
+        let expected = Dictionary(uniqueKeysWithValues: score.files.filter { replacements[$0.url] != nil }.map { ($0.url, $0.text) })
+        do {
+            try commitStructuralTexts(expected: expected, replacements: replacements, manager: activeFile.undoManager,
+                                      name: "Revert to Checkpoint", preservesContract: false)
+            statusBar.flash("Reverted to the checkpoint from \(label)")
+        } catch {
+            statusBar.flash("Couldn't revert: \(error)")
+        }
+    }
+
     private func showLilyPondPicker() {
         Task {
             let installs = await ToolchainStore.shared.installs()
@@ -2567,13 +2944,7 @@ extension DocumentWindowController: CommandResponder {
     /// Plays the mockup, or with `electronics` the mix, from the selection's
     /// bar; either command stops whatever is playing.
     private func togglePlayback(electronics: Bool = false) {
-        if let player, player.isPlaying {
-            player.stop()
-            self.player = nil
-            stopPlayhead()
-            statusBar.flash("Stopped")
-            return
-        }
+        if stopPlayback() { return }
         let found = electronics ? mixURL : mockupURL
         guard let url = found else {
             if !electronics {
@@ -2606,10 +2977,22 @@ extension DocumentWindowController: CommandResponder {
             }
             player = p
             startPlayhead(from: p.currentTime)
-            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", p.currentTime)) s — \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
+            statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", p.currentTime)) s — ⎋ or \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
         } catch {
             statusBar.flash("Can't play \(url.lastPathComponent): \(error.localizedDescription)")
         }
+    }
+
+    /// Stops the mockup or the mix if one is playing (either play command
+    /// again, or ⎋). False when nothing was playing.
+    @discardableResult
+    private func stopPlayback() -> Bool {
+        guard let player, player.isPlaying else { return false }
+        player.stop()
+        self.player = nil
+        stopPlayhead()
+        statusBar.flash("Stopped")
+        return true
     }
 
     // MARK: Playback head
@@ -2652,15 +3035,16 @@ extension DocumentWindowController: CommandResponder {
             return
         }
         canvas.setPlayhead(position)
-        // A new system: bring it into view. Between systems the head moves
-        // on its own, so the page never creeps under the user.
+        // A new system: following, glide it to the middle of the view.
+        // Between systems the head moves on its own, so the page never
+        // creeps under the user, who can scroll freely meanwhile.
         let system = (page: position.page, top: position.top, bottom: position.bottom)
         let changed = playheadSystem.map {
             $0.page != system.page || abs($0.top - system.top) > 0.5
         } ?? true
         if changed {
             playheadSystem = system
-            canvas.revealPlayhead()
+            if followsPlayback { canvas.centerPlayheadSystem() }
         }
     }
 
@@ -2682,11 +3066,20 @@ extension DocumentWindowController: CommandResponder {
     private func showEngravingSettings() {
         let panel = settingsPanel ?? {
             let panel = EngravingSettingsPanel()
-            panel.model.onChange = { [weak self] setting, value in
-                guard let self else { return }
-                self.applyText(self.settingsDocument.edits(setting: setting, to: value), to: self.score.root,
-                               name: setting.title)
-                self.refreshEngravingSettings()
+            panel.model.onChange = { [weak panel, weak self] setting, value in
+                // The control shows the new value this frame; the source edit
+                // (and the engraving it starts) follows on the next turn.
+                if let model = panel?.model {
+                    var found = model.values[setting.id] ?? .init(value: value, inRoot: true, elsewhere: [])
+                    found.value = value
+                    model.values[setting.id] = found
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.applyText(self.settingsDocument.edits(setting: setting, to: value), to: self.score.root,
+                                   name: setting.title)
+                    self.refreshEngravingSettings()
+                }
             }
             panel.model.onRestoreAll = { [weak self] in self?.restoreEngravingDefaults() }
             panel.model.onMigrateStructure = { [weak self] in self?.runScoreMigration() }
@@ -2775,18 +3168,22 @@ extension DocumentWindowController: CommandResponder {
     /// Both the command and its undo replace the project in one transaction.
     /// Buffer revisions and disk ownership are checked before any file changes.
     private func commitStructuralTexts(expected: [URL: String], replacements: [URL: String],
-                                       manager: UndoManager, name: String) throws {
+                                       manager: UndoManager, name: String, registeringUndo: Bool = true,
+                                       preservesContract: Bool = true) throws {
         let breakEdit = name == "System Break" || name == "Page Break"
         if breakEdit {
             if breakProgressBaseline == nil {
                 breakProgressBaseline = StructuralEditing.breakState(in: SyntaxTree(score.root.engravedText ?? score.root.text))
             }
-            canvas.showBreakFeedback(kind: name == "Page Break" ? .page : .system)
+            // Only an edit that will change the page waits on its engraving.
+            let after = replacements[score.root.url].map { StructuralEditing.breakState(in: SyntaxTree($0)) }
+            if after == nil || after == breakProgressBaseline { canvas.clearBreakFeedback() }
+            else { canvas.showBreakFeedback(kind: name == "Page Break" ? .page : .system) }
         }
         do {
             // Built-in structural operations and their exact inverse edits
             // preserve the contract; disk revision checks still run below.
-            try score.replaceProjectSources(expected: expected, replacements: replacements)
+            try score.replaceProjectSources(expected: expected, replacements: replacements, preservesContract: preservesContract)
         }
         catch {
             if breakEdit { canvas.clearBreakFeedback() }
@@ -2807,7 +3204,7 @@ extension DocumentWindowController: CommandResponder {
             AppRPC.shared.publish("score.changed", ["path": .string(url.path), "by": .string("app")])
         }
         applyingStructuralEdit = false
-        registerProjectUndo(expected: expected, replacements: replacements, manager: manager, name: name)
+        if registeringUndo { registerProjectUndo(expected: expected, replacements: replacements, manager: manager, name: name) }
         rebuildEngravingMap()
         refreshHighlight(reveal: false)
     }
@@ -2882,7 +3279,7 @@ extension DocumentWindowController: CommandResponder {
 
     @discardableResult
     private func applyStructural(_ changes: [StructuralEditing.Change], name: String,
-                                 local: ScoreEdit? = nil) -> Bool {
+                                 local: ScoreEdit? = nil, registeringUndo: Bool = true) -> Bool {
         do {
             let before = Dictionary(uniqueKeysWithValues: score.files.map { ($0.url, $0.text) })
             var after = before
@@ -2897,8 +3294,11 @@ extension DocumentWindowController: CommandResponder {
                 if url == activeFile.url { selection = selection.map { change.edits.mapOffset($0) } }
             }
             let replacements = after.filter { before[$0.key] != $0.value }
+            lastStructuralCommit = nil
             guard !replacements.isEmpty else { return true }
-            try commitStructuralTexts(expected: before, replacements: replacements, manager: activeFile.undoManager, name: name)
+            try commitStructuralTexts(expected: before, replacements: replacements, manager: activeFile.undoManager, name: name,
+                                      registeringUndo: registeringUndo)
+            lastStructuralCommit = (before, replacements)
             let indices = selection.compactMap { tree.eventIndex(at: $0) }
             if !indices.isEmpty { selectEvents(indices) }
             statusBar.flash(name)
@@ -3080,6 +3480,24 @@ extension DocumentWindowController: CommandResponder {
     /// history, showing it in the source pane while it happens.
     private func applyText(_ edits: [TextEdit], to file: SourceFile, name: String) {
         guard !edits.isEmpty else { return }
+        if file !== activeFile, editor.hasView(for: file.url) {
+            // Edit the file's own view in place: showing it and switching
+            // back (re-laying out and recolouring both files) made every
+            // settings toggle wait.
+            let old = file.text
+            let lo = edits.map(\.range.lowerBound).min()!
+            let hi = edits.map(\.range.upperBound).max()!
+            let newBytes = edits.apply(to: Array(old.utf8))
+            let replacement = String(decoding: newBytes[lo..<(hi + newBytes.count - old.utf8.count)], as: UTF8.self)
+            let a = OffsetConversion.utf16(fromUTF8: lo, in: old)
+            let b = OffsetConversion.utf16(fromUTF8: hi, in: old)
+            if let text = editor.replace(NSRange(location: a, length: b - a), with: replacement, actionName: name, in: file.url) {
+                score.userEdited(file, text: text)
+                AppRPC.shared.publish("score.changed", ["path": .string(file.url.path), "by": "app"])
+                rebuildEngravingMap()
+                return
+            }
+        }
         let previous = activeFile
         if file !== activeFile { showFile(file) }
         let old = editor.text
@@ -3372,38 +3790,90 @@ extension DocumentWindowController: CommandResponder {
             patches: SuperColliderPane.scdFiles(near: score.url), target: window.firstResponder === scPane?.editor ? .patch : .score)
     }
 
+    private func captureGraphicsContext() -> GraphicsRequestContext? {
+        guard let section = canvas.graphicSectionSelection else { return nil }
+        func source(_ link: PointAndClickLocation?) -> GraphicsRequestContext.Source? {
+            guard let link, let point = linkPoint(link) else { return nil }
+            return .init(file: point.file.url.path, text: point.text, position: point.position)
+        }
+        let from = source(sectionAnchor(section.from)?.link)
+        let to = source(sectionAnchor(section.to)?.link)
+        let fallback = SourceText(editor.text).position(of: editor.text.utf8.index(editor.text.utf8.startIndex,
+            offsetBy: min(selectionUTF8().lowerBound, editor.text.utf8.count)))
+        let base = source(section.link) ?? from ?? .init(file: activeFile.url.path, text: editor.text, position: fallback)
+        return GraphicsRequestContext(source: base, files: score.files.map { (path: $0.url.path, text: $0.url.path == base.file ? base.text : $0.text) },
+            root: (path: score.root.url.path, text: score.root.text), cues: score.cueSheet,
+            section: section, geometry: sectionSelection(section, timing: nil, staffName: nil, resolvingMusic: false),
+            timing: score.timingLog, pages: canvas.pages.map(\.page), from: from, to: to, generation: score.completedRenderGeneration)
+    }
+
+    private func prepareGraphicsContext(_ snapshot: GraphicsRequestContext) -> Task<JSONValue, Never> {
+        if let known = graphicsContextSnapshot, known.matches(snapshot), let task = graphicsContextTask, !task.isCancelled { return task }
+        graphicsContextTask?.cancel()
+        graphicsContextSnapshot = snapshot
+        graphicsContextBuilds += 1
+        let task = Task.detached(priority: .userInitiated) { snapshot.describe() }
+        graphicsContextTask = task
+        return task
+    }
+
+    private static func graphicsRequestDetail(_ context: JSONValue) -> String {
+        context["graphic"] == nil
+            ? "No drawing starts here. Ask for a new drawing, or for a notation change (barlines, spacing, clefs)."
+                + "\nTry: a grainy swell over this bar · make the barlines wavy · wider spacing"
+            : "The score's agent changes only the marked section."
+                + "\nTry: taller · denser · thin out the bottom · a grainy swell over it"
+    }
+
     private func showRequest(fromLens: Bool) {
         guard canvas.graphicSectionSelection != nil else {
             statusBar.flash("⌥drag across the staff to mark a graphics range")
             return
         }
         closeLens()
-        guard let anchor = lensAnchor() else { return }
-        let context = rpcContext
-        let section = canvas.graphicSectionSelection
-        let anchored = section.flatMap { $0.link ?? sectionAnchor($0.from)?.link }
-        let target: AgentRun.RequestTarget = (anchored != nil && context["graphic"] != nil)
-            ? .existingGraphic : .emptySection
+        guard let anchor = lensAnchor(), let snapshot = captureGraphicsContext() else { return }
         let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
         requestPopover.placeholder = nil
         requestPopover.mode = .graphics
         configureLensModes(requestPopover)
-        requestPopover.detail = target == .emptySection
-            ? "No drawing starts here. Ask for a new drawing, or for a notation change (barlines, spacing, clefs)."
-                + "\nTry: a grainy swell over this bar · make the barlines wavy · wider spacing"
-            : "The score's agent changes only the marked section."
-                + "\nTry: taller · denser · thin out the bottom · a grainy swell over it"
+        requestPopover.detail = "The score's agent edits the marked section."
+            + "\nTry: taller · denser · a grainy swell · wavy barlines · wider spacing"
         requestPopover.onSubmit = { [weak self] request in
             guard let self else { return }
+            guard let snapshot = self.captureGraphicsContext() else {
+                self.statusBar.flash("Mark the section again before sending the request.")
+                return
+            }
             guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
                 self.statusBar.flash("No agent: choose one in Settings (⌘,)")
                 return
             }
-            self.runRequest(request, agent: agent, context: self.rpcContext, target: target)
+            let task = self.prepareGraphicsContext(snapshot)
+            self.statusBar.flash("Preparing request…")
+            Task { @MainActor [weak self] in
+                let context = await task.value
+                guard let self, !task.isCancelled else { return }
+                guard let current = self.captureGraphicsContext(), current.matches(snapshot) else {
+                    self.statusBar.flash("The score or selection changed. Open the request again.")
+                    return
+                }
+                let anchored = snapshot.section.link != nil || snapshot.from != nil
+                let target: AgentRun.RequestTarget = anchored && context["graphic"] != nil ? .existingGraphic : .emptySection
+                self.runRequest(request, agent: agent, context: context, target: target)
+            }
         }
         let turns = requestSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
         let who = agent.map { $0.harness.title + (turns > 0 ? " (continuing, ␣ e n new)" : "") } ?? "the agent"
         requestPopover.present(title: "the marked section", agent: who, anchor: anchor.rect, in: anchor.view)
+        // The editable field is visible before drawing dependencies or timing
+        // are expanded. Reopening the same source/section reuses this task.
+        let task = prepareGraphicsContext(snapshot)
+        Task { @MainActor [weak self] in
+            let context = await task.value
+            guard let self, !task.isCancelled, self.requestPopover.isOpen, self.requestPopover.mode == .graphics,
+                  let current = self.captureGraphicsContext(), current.matches(snapshot) else { return }
+            self.requestPopover.updateDetail(Self.graphicsRequestDetail(context))
+        }
     }
 
     /// The request line for the patch agent: a change to the SuperCollider
@@ -3445,7 +3915,7 @@ extension DocumentWindowController: CommandResponder {
         var unavailable: [LensMode: String] = [:]
         if canvas.graphicSectionSelection != nil { available.insert(.graphics) }
         else { unavailable[.graphics] = "⌥drag across the staff to mark a graphics range" }
-        if inputProvisional != nil || lensContent() != nil { available.insert(.notation) }
+        if inputProvisional != nil || LensScoreBuilder.hasTarget(tree: tree, selection: selectionUTF8()) { available.insert(.notation) }
         else { unavailable[.notation] = "No notes here to show (a graphic, or a part the lens can't draw)" }
         if score.patchURL != nil { available.insert(.patch) }
         else { unavailable[.patch] = "This score has no Pondside patch yet: File › Make Patch Pondside-Ready… (␣ f m)" }
@@ -3803,12 +4273,17 @@ extension DocumentWindowController: CommandResponder {
 
     /// Puts back the files the agent's last request changed. Files changed
     /// since (by the user or another program) are left alone.
+    /// The project check before restoring (two graph reads and the contract
+    /// audit, a few hundred ms) runs off the main thread; the restore then
+    /// happens only if neither buffers nor disk changed meanwhile.
     private func undoAgentChange(fromUndoManager: Bool = false) {
+        guard !agentUndoRunning else { return }
         guard let snapshot = agentUndo else { statusBar.flash("No agent change to undo"); return }
         let after = agentAfter
         var kept = 0
         var replacements: [URL: String] = [:]
         var revisions: [URL: ContentHash] = [:]
+        var buffers: [URL: String] = [:]
         for (url, text) in snapshot where after[url] != nil {
             let current = try? String(contentsOf: url, encoding: .utf8)
             guard current != text else { continue }
@@ -3823,15 +4298,36 @@ extension DocumentWindowController: CommandResponder {
             guard let current else { kept += 1; continue }
             replacements[url] = text
             revisions[url] = ContentHash(current)
+            buffers[url] = current
         }
-        do {
-            let removing = snapshot[score.root.url].map { !StructuralEditing.isManaged(SyntaxTree($0)) } ?? false
-            try ScoreContract.validateEdits(replacements, root: score.root.url, allowingContractRemoval: removing)
-            try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements)
-        } catch {
-            structuralError(error)
-            return
+        let removing = snapshot[score.root.url].map { !StructuralEditing.isManaged(SyntaxTree($0)) } ?? false
+        let root = score.root.url
+        let pending = replacements
+        agentUndoRunning = true
+        Task { [weak self] in
+            let problem = await Task.detached(priority: .userInitiated) { () -> String? in
+                do { try ScoreContract.validateEdits(pending, root: root, allowingContractRemoval: removing); return nil }
+                catch { return String(describing: error) }
+            }.value
+            guard let self else { return }
+            self.agentUndoRunning = false
+            do {
+                if let problem { throw StructuralEditing.Failure(problem) }
+                guard self.agentUndo == snapshot,
+                      buffers.allSatisfy({ url, text in self.score.file(for: url.path).map { $0.text == text } ?? true }) else {
+                    throw StructuralEditing.Failure("The score changed while undoing the agent's change. Try again.")
+                }
+                // Checks the disk revisions itself.
+                try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements)
+            } catch {
+                self.structuralError(error)
+                return
+            }
+            self.finishAgentUndo(restored: replacements, kept: kept, fromUndoManager: fromUndoManager)
         }
+    }
+
+    private func finishAgentUndo(restored replacements: [URL: String], kept: Int, fromUndoManager: Bool) {
         let restored = replacements.count
         let restoredURLs = Set(replacements.keys)
         // The reloads these writes cause are part of this undo, not new edits.
@@ -3991,7 +4487,15 @@ extension DocumentWindowController: CommandResponder {
         pendingBreak = (measure.name, kind)
         let removing = StructuralEditing.breakBefore(measure.name, in: score.root.tree) == kind
         let revision = Dictionary(uniqueKeysWithValues: score.files.map { ($0.url, $0.text) })
-        canvas.showBreakFeedback(kind: kind, removing: removing)
+        // Back to what the page already shows (a second ↩ taking the first
+        // back): nothing will change on it, so the progress stops now, not
+        // when the source edit and engraving are done.
+        if let baseline = breakProgressBaseline,
+           StructuralEditing.breakStateAfterToggle(before: measure.name, kind: kind, in: score.root.tree) == baseline {
+            canvas.clearBreakFeedback()
+        } else {
+            canvas.showBreakFeedback(kind: kind, removing: removing)
+        }
         breakEditTask = Task { @MainActor [weak self] in
             // Let the render server display the indicator before validation,
             // filesystem transactions, and the new engraving begin.
@@ -4004,7 +4508,7 @@ extension DocumentWindowController: CommandResponder {
             }
             do {
                 let changes = try StructuralEditing.toggleBreak(before: measure.name, files: self.structuralFiles,
-                    root: self.score.root.url.path, kind: kind)
+                    root: self.score.root.url.path, kind: kind, validatingContract: !self.score.contractAudited)
                 if !self.applyStructural(changes, name: kind == .page ? "Page Break" : "System Break") {
                     self.canvas.clearBreakFeedback()
                 }
@@ -4015,6 +4519,10 @@ extension DocumentWindowController: CommandResponder {
         }
     }
 
+    /// A shorter bar with function-generated music needs LilyPond's measure
+    /// (`MeterProbe`, about 0.4 s). If what the source shows already fits,
+    /// the edit lands at once and the probe confirms it or takes it back;
+    /// otherwise it lands when the probe says it fits.
     private func changeStructuralMeter(_ meter: String, events: [Int]) {
         guard let event = events.min() else { return }
         guard StructuralEditing.isManaged(score.root.tree),
@@ -4024,14 +4532,137 @@ extension DocumentWindowController: CommandResponder {
         }
         let numbers = meter.split(separator: "/").compactMap { Int($0) }
         guard numbers.count == 2 else { return }
+        let files = structuralFiles
+        let root = score.root.url.path
+        let plan: StructuralEditing.MeterPlan
         do {
-            let changes = try StructuralEditing.changeMeter(LensTime(beats: numbers[0], beatType: numbers[1]), measure: measure.name,
-                files: structuralFiles, root: score.root.url.path, validatingContract: false)
-            _ = applyStructural(changes, name: "Time Signature")
+            plan = try StructuralEditing.planMeterChange(LensTime(beats: numbers[0], beatType: numbers[1]), measure: measure.name,
+                files: files, root: root, validatingContract: !score.contractAudited)
         } catch let overflow as StructuralEditing.Overflow {
             let file = URL(fileURLWithPath: overflow.file).lastPathComponent
             rejectEdit("\(meter) is too short for the music in \(file)")
-        } catch { rejectEdit(String(describing: error)) }
+            return
+        } catch { rejectEdit(String(describing: error)); return }
+        runMeterPlan(plan, files: files, root: root, name: "Time Signature")
+    }
+
+    /// Deletes the time signature the selection is. With shared measures the
+    /// bars it began return to the meter before it (their definitions say
+    /// so); otherwise its `\time` leaves the music.
+    private func removeTimeSignature(at range: Range<Int>) {
+        guard StructuralEditing.isManaged(score.root.tree), activeFile === score.root,
+              let measure = StructuralEditing.definition(in: tree, containing: range.lowerBound) else {
+            let gone = highlighted
+            let edit = ScoreEditor(tree).removeTimeSignature(at: range.lowerBound)
+            apply(edit)
+            if edit != nil {
+                canvas.provisionalDelete(gone, path: activeFile.url.path)
+                refreshHighlight(reveal: false)
+            }
+            return
+        }
+        let files = structuralFiles
+        let root = score.root.url.path
+        let plan: StructuralEditing.MeterPlan
+        do {
+            plan = try StructuralEditing.planMeterRemoval(measure: measure, files: files, root: root,
+                                                          validatingContract: !score.contractAudited)
+        } catch let overflow as StructuralEditing.Overflow {
+            let file = URL(fileURLWithPath: overflow.file).lastPathComponent
+            rejectEdit("\(overflow.meter.beats)/\(overflow.meter.beatType) is too short for the music in \(file)")
+            return
+        } catch { rejectEdit(String(describing: error)); return }
+        runMeterPlan(plan, files: files, root: root, name: "Delete Time Signature")
+    }
+
+    /// Applies a meter plan; one that shortens function-generated bars is
+    /// first measured by LilyPond (`MeterProbe`).
+    private func runMeterPlan(_ plan: StructuralEditing.MeterPlan, files: [StructuralEditing.File], root: String, name: String) {
+        meterRequest += 1
+        let request = meterRequest
+        guard !plan.unverified.isEmpty else { applyStructural(plan.changes, name: name); return }
+        let snapshot = projectTexts
+        let manager = activeFile.undoManager
+        // An optimistic edit enters the history only once the probe accepts
+        // it, so one it refuses leaves neither an Undo nor a Redo behind.
+        let applied = plan.knownFits && applyStructural(plan.changes, name: name, registeringUndo: false)
+        if plan.knownFits && !applied { return }
+        let commit = applied ? lastStructuralCommit : nil
+        meterProbes += 1
+        updateStatus()
+        let installation = score.installation
+        Task { [weak self] in
+            let verdict = await MeterProbe.verify(plan, files: files, root: root, installation: installation)
+            guard let self else { return }
+            self.meterProbes -= 1
+            self.updateStatus()
+            let latest = request == self.meterRequest
+            switch verdict {
+            case .fits:
+                if let commit { self.registerMeterUndo(commit, manager: manager, name: name); return }
+                // Superseded by a newer request or edit.
+                guard !applied, latest, self.projectTexts == snapshot else { return }
+                self.applyStructural(plan.changes, name: name)
+            case .overflow:
+                if let commit { self.revertMeter(plan, commit: commit, manager: manager, name: name) }
+                if applied || latest { self.rejectMeter() }
+            case .unknown:
+                // An applied edit stays (the engraving reports a real
+                // overflow), with its undo; a waiting one is refused.
+                if let commit { self.registerMeterUndo(commit, manager: manager, name: name); return }
+                guard latest else { return }
+                self.rejectEdit("Couldn't measure this bar's music. Check the score in Source.")
+            }
+        }
+    }
+
+    private var projectTexts: [String: String] {
+        Dictionary(uniqueKeysWithValues: score.files.map { ($0.url.path, $0.text) })
+    }
+
+    /// Puts an accepted optimistic meter edit on the history, as its own
+    /// "Time Signature" step; its undo checks the texts it replaced, as
+    /// every structural undo does.
+    private func registerMeterUndo(_ commit: (expected: [URL: String], replacements: [URL: String]), manager: UndoManager,
+                                   name: String = "Time Signature") {
+        registerProjectUndo(expected: commit.expected, replacements: commit.replacements, manager: manager, name: name)
+    }
+
+    /// Takes back an optimistic meter edit the probe refused, outside the
+    /// history (it never entered it): the replaced texts when nothing changed
+    /// them since, else the old meter; nothing when the bar's meter has been
+    /// changed again meanwhile.
+    private func revertMeter(_ plan: StructuralEditing.MeterPlan, commit: (expected: [URL: String], replacements: [URL: String]),
+                             manager: UndoManager, name: String = "Time Signature") {
+        guard let previous = plan.previous,
+              plan.measures.allSatisfy({ StructuralEditing.time(in: score.root.tree, name: $0) == plan.meter }) else { return }
+        let current = Dictionary(uniqueKeysWithValues: score.files.map { ($0.url, $0.text) })
+        do {
+            if commit.replacements.allSatisfy({ current[$0.key] == $0.value }) {
+                let restore = commit.expected.filter { commit.replacements[$0.key] != nil }
+                try commitStructuralTexts(expected: current, replacements: restore, manager: manager,
+                                          name: name, registeringUndo: false)
+            } else {
+                // Each bar's edit replaces only its own definition.
+                let files = structuralFiles
+                let edits = try plan.measures.flatMap { bar in
+                    try StructuralEditing.changeMeter(previous, measure: bar, files: files,
+                                                      root: score.root.url.path, validatingContract: false).flatMap(\.edits)
+                }
+                applyStructural([StructuralEditing.Change(file: score.root.url.path, edits: edits.normalized)], name: name, registeringUndo: false)
+            }
+        } catch { structuralError(error) }
+    }
+
+    /// In the lens while it is open (the edit was made there), else on the page.
+    private func rejectMeter() {
+        let message = "Meter too short for content"
+        if let lens, lens.isOpen {
+            statusBar.flash(message)
+            lens.showRejection(message)
+        } else {
+            rejectEdit(message)
+        }
     }
 
     private func showTimePicker(events: [Int]) {
@@ -4040,6 +4671,42 @@ extension DocumentWindowController: CommandResponder {
                         custom: Self.ratio) { [weak self] meter in
             self?.changeStructuralMeter(meter, events: events)
         }
+    }
+
+    private func showBarCountPicker(events: [Int]) {
+        showEntryPicker(placeholder: "How many bars? — or type a number", presets: ["2", "4", "8", "16", "32"].map { ("\($0) bars", $0, nil) },
+                        custom: { Int($0).flatMap { (1...999).contains($0) ? String($0) : nil } }) { [weak self] count in
+            self?.addBars(Int(count) ?? 1, events: events)
+        }
+    }
+
+    /// Empty bars after the selection's bar, in its meter; with nothing
+    /// selected, after the last bar. Entry continues in the first new bar.
+    private func addBars(_ count: Int, events: [Int]) {
+        guard StructuralEditing.isManaged(score.root.tree) else {
+            structuralError(StructuralEditing.Failure("Enable shared measures in File → Make Score Pondside-Ready… before adding bars from the score."))
+            return
+        }
+        let anchor = events.max().flatMap { StructuralEditing.measure(in: tree, at: tree.events[$0].range.lowerBound) }
+        guard let name = anchor?.name ?? StructuralEditing.names(in: score.root.tree).last,
+              let time = StructuralEditing.time(in: score.root.tree, name: name) else {
+            structuralError(StructuralEditing.Failure("Select a note in a shared measure to add bars after it."))
+            return
+        }
+        let changes: [StructuralEditing.Change]
+        do {
+            changes = try StructuralEditing.insertMeasures(after: name, count: count, time: time, files: structuralFiles,
+                                                           root: score.root.url.path, validatingContract: !score.contractAudited)
+        } catch { structuralError(error); return }
+        guard applyStructural(changes, name: count == 1 ? "Add Bar" : "Add \(count) Bars"), anchor != nil,
+              let last = targets().events.max(),
+              let current = StructuralEditing.measure(in: tree, at: tree.events[last].range.lowerBound),
+              let block = LensBlockFinder.block(in: tree, at: tree.events[last].range.lowerBound),
+              let next = StructuralEditing.measures(in: tree).first(where: {
+                  $0.invocation.lowerBound >= current.invocation.upperBound && block.range.contains($0.invocation.lowerBound)
+              }),
+              let first = tree.events.indices.first(where: { next.body.contains(tree.events[$0].range.lowerBound) }) else { return }
+        selectEvents([first])
     }
 
     private func showKeyPicker(events: [Int]) {
@@ -4218,6 +4885,25 @@ extension DocumentWindowController: CommandResponder {
         panes.apply(layout)
         focusPane(layout.focused)
         saveLayout()
+    }
+
+    /// Folds or opens panes. Focus leaves a pane only when it folds away
+    /// (it moves to the nearest open pane); opening one never takes focus.
+    private func applyCollapse(_ layout: PaneLayout) {
+        syncFocusedPane()
+        let focusedBefore = panes.layout.focused
+        var l = layout
+        l.focused = l.collapsed.contains(focusedBefore) ? l.nearestOpen(to: focusedBefore) : focusedBefore
+        let folded = l.collapsed.subtracting(panes.layout.collapsed)
+        panes.apply(l)
+        if l.focused != focusedBefore || panes.paneIndex(containing: window?.firstResponder as? NSView) == nil {
+            focusPane(l.focused)
+        }
+        saveLayout()
+        panes.collapseBar.refresh()
+        if let i = folded.first, folded.count == 1 {
+            statusBar.flash("\(l.contents[i].title) collapsed · ⌥C expands it")
+        }
     }
 
     private func cyclePane(forward: Bool) {

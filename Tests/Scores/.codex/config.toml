@@ -1,0 +1,3 @@
+[mcp_servers.pondside]
+command = "pondside"
+args = ["mcp"]

@@ -186,6 +186,11 @@ extension DocumentWindowController {
                                         "active": .string(activeFile.url.path), "status": status,
                                         "started": score.compileStarted.map { .number($0.timeIntervalSince1970) } ?? .null,
                                         "diagnostics": .array(diagnostics)]
+        // Systems running into the right margin (automatic line breaks off):
+        // a layout problem LilyPond doesn't report.
+        if !score.overflows.isEmpty {
+            out["overflows"] = .array(score.overflows.map(\.json))
+        }
         if hasAgentBaseline {
             out["new_diagnostics"] = .array(newDiagnostics)
             out["verification"] = rpcGraphicVerification ?? .null

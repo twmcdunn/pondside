@@ -54,6 +54,36 @@ final class StructuralMigrationTests: XCTestCase {
         try unchanged(files)
     }
 
+    func testBarsAddedMidScoreKeepLayoutAnchorsAlignedAndEngrave() async throws {
+        let lily = try await installation()
+        let definitions = #"""
+        improv = #(define-music-function (n music) (index? ly:music?)
+          #{ << \tag #'printed #music \tag #'played #(skip-of-length music) >> #})
+        """#
+        let score = "\\score { << \\new Staff \\removeWithTag #'played \\flute \\new Devnull \\structure >> }"
+        let (root, files) = try fixture("flute = \\relative c' { \\time 4/4 \\improv 1 { c4 d e f } | g1 | a1 | b1 }\nstructure = { \\autoLineBreaksOff s1 | s1 \\break | \\mark \\default s1*2 }",
+                                        definitions: definitions, score: score)
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let migrated = apply(try await StructuralMigration.plan(files: files, root: root.path, installation: lily), to: files)
+        XCTAssertFalse(StructuralEditing.layoutRegions(in: migrated[1].tree).isEmpty)
+        let changes = try StructuralEditing.insertMeasures(after: "pondsideBarA", count: 2, time: .init(beats: 3, beatType: 4),
+                                                           files: migrated, root: root.path)
+        let after = migrated.map { file in
+            var result = file
+            result.tree = file.parse(changes.filter { $0.file == file.id }.flatMap(\.edits).apply(to: file.tree.text))
+            return result
+        }
+        try StructuralEditing.validate(after, root: root.path)
+        XCTAssertEqual(StructuralEditing.names(in: after[0].tree),
+                       ["pondsideBarA", "pondsideBarE", "pondsideBarF", "pondsideBarB", "pondsideBarC", "pondsideBarD"])
+        // The slot that ended at bar A now covers the new bars too.
+        XCTAssertTrue(after[1].tree.text.contains("(pondsideBarA . 0) (pondsideBarF . 1)"))
+        for file in after { try Data(file.tree.text.utf8).write(to: URL(fileURLWithPath: file.id)) }
+        let output = try await ProcessRunner.run(lily.executable, ["-dno-print-pages", "-o", root.deletingLastPathComponent().appendingPathComponent("out").path, root.path])
+        XCTAssertEqual(output.status, 0, output.stderrString)
+        XCTAssertFalse(output.stderrString.contains("Pondside:"), output.stderrString)
+    }
+
     func testGeneratedFrontMatterLegendIsPreservedWithoutMigration() async throws {
         let lily = try await installation()
         let (root, _) = try fixture("flute = { c'1 | d'1 }\nstructure = { s1 \\break | s1 }")

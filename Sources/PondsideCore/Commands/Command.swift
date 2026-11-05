@@ -95,10 +95,13 @@ public struct CommandContext: Hashable, Sendable {
     public var fileCount: Int
     /// An agent is carrying out a request or finishing a patch.
     public var agentWorking: Bool
+    /// Checkpoints are being kept: a working git was found.
+    public var checkpointsKept: Bool
 
     public init(focus: Focus = .score, hasSelection: Bool = false, durationArmed: Bool = false,
-                hasErrors: Bool = false, fileCount: Int = 1, agentWorking: Bool = false) {
+                hasErrors: Bool = false, fileCount: Int = 1, agentWorking: Bool = false, checkpointsKept: Bool = false) {
         self.agentWorking = agentWorking
+        self.checkpointsKept = checkpointsKept
         self.focus = focus
         self.hasSelection = hasSelection
         self.durationArmed = durationArmed
@@ -118,6 +121,8 @@ public enum CommandRequirement: Hashable, Sendable {
     case supercollider
     /// An agent is working in the background.
     case agentWorking
+    /// The checkpoint history works (git is installed and runs).
+    case checkpoints
 
     public func isMet(in c: CommandContext) -> Bool {
         switch self {
@@ -128,6 +133,7 @@ public enum CommandRequirement: Hashable, Sendable {
         case .severalFiles: return c.fileCount > 1
         case .supercollider: return c.focus == .supercollider
         case .agentWorking: return c.agentWorking
+        case .checkpoints: return c.checkpointsKept
         }
     }
 }

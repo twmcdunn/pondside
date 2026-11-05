@@ -16,6 +16,9 @@ public struct EngravingSettingsDocument: Sendable {
         public var inRoot: Bool
         /// Where something else sets it: a file label and 1-based line.
         public var elsewhere: [Where]
+        public init(value: EngravingValue, inRoot: Bool, elsewhere: [Where]) {
+            self.value = value; self.inRoot = inRoot; self.elsewhere = elsewhere
+        }
     }
 
     public struct Where: Sendable, Hashable {
@@ -28,12 +31,47 @@ public struct EngravingSettingsDocument: Sendable {
     private let bytes: [UInt8]
     private let blocks: [Block]
     private let others: [(file: String, text: String)]
+    /// The other files' statement lines, trimmed and without comments, read
+    /// once: every setting searches them, and re-splitting each file per
+    /// setting made reading the panel's values take a third of a second.
+    private let otherLines: [(file: String, line: Int, text: String)]
+    /// Each word of those lines to the lines holding it: a key can only be
+    /// on a line that has its first word.
+    private let otherWords: [Substring: [Int]]
 
     public init(root text: String, others: [(file: String, text: String)] = []) {
         self.text = text
         bytes = Array(text.utf8)
         blocks = Self.findBlocks(in: SyntaxTree(text))
         self.others = others
+        var lines: [(file: String, line: Int, text: String)] = []
+        for other in others {
+            var line = 0
+            for raw in other.text.split(separator: "\n", omittingEmptySubsequences: false) {
+                line += 1
+                var text = raw.trimmedSpaces
+                if let comment = text.firstIndex(of: "%"), !text.hasPrefix("#(") { text = String(text[..<comment]).trimmedSpaces }
+                if !text.isEmpty { lines.append((other.file, line, text)) }
+            }
+        }
+        otherLines = lines
+        var words: [Substring: [Int]] = [:]
+        for (index, line) in lines.enumerated() {
+            for word in Set(Self.words(line.text)) { words[word, default: []].append(index) }
+        }
+        otherWords = words
+    }
+
+    /// Words as `starts(_:with:)` delimits a key: split at blanks, `=` and
+    /// braces, and without the `)` that can close a Scheme key.
+    private static func words(_ text: String) -> [Substring] {
+        text.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" || $0 == "{" || $0 == "}" })
+            .map { word in
+                var word = word[...]
+                while word.last == ")" { word = word.dropLast() }
+                return word
+            }
+            .filter { !$0.isEmpty }
     }
 
     // MARK: Reading
@@ -328,21 +366,21 @@ public struct EngravingSettingsDocument: Sendable {
     private func elsewhereStatements(for setting: EngravingSetting) -> [Where] {
         let keys = setting.keys + setting.readKeys
         var result: [Where] = []
-        for other in others {
-            var line = 0
-            for raw in other.text.split(separator: "\n", omittingEmptySubsequences: false) {
-                line += 1
-                var text = raw.trimmedSpaces
-                if let comment = text.firstIndex(of: "%"), !text.hasPrefix("#(") { text = String(text[..<comment]).trimmedSpaces }
-                // `\context { \Score autoBeaming = ##f }` on one line, too.
-                for key in keys {
-                    if Self.starts(text, with: key) {
-                        result.append(Where(file: other.file, line: line, statement: text))
-                    } else if let range = text.firstRange(of: key), range.lowerBound > text.startIndex,
-                              text[text.index(before: range.lowerBound)] == " ",
-                              Self.starts(String(text[range.lowerBound...]), with: key) {
-                        result.append(Where(file: other.file, line: line, statement: String(text[range.lowerBound...])))
-                    }
+        var candidates = Set<Int>()
+        for key in keys {
+            guard let first = Self.words(key).first else { continue }
+            candidates.formUnion(otherWords[first] ?? [])
+        }
+        for index in candidates.sorted() {
+            let (file, line, text) = otherLines[index]
+            // `\context { \Score autoBeaming = ##f }` on one line, too.
+            for key in keys {
+                if Self.starts(text, with: key) {
+                    result.append(Where(file: file, line: line, statement: text))
+                } else if let range = text.firstRange(of: key), range.lowerBound > text.startIndex,
+                          text[text.index(before: range.lowerBound)] == " ",
+                          Self.starts(String(text[range.lowerBound...]), with: key) {
+                    result.append(Where(file: file, line: line, statement: String(text[range.lowerBound...])))
                 }
             }
         }

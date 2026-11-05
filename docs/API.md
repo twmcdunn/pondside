@@ -12,7 +12,7 @@ run on Linux.
 ## The CLI
 
 ```
-pondside check   score.ly [--json]                 compile; diagnostics; exit 1 on errors
+pondside check   score.ly [--json]                 compile; diagnostics, overflowing systems; exit 1 on errors
 pondside render  score.ly [--format pdf|svg|png] [--out dir] [--json]
 pondside cues    score.ly [--format json|cues|marks|ec] [--rate 48000] [--out file]
 pondside timeline score.ly [--json]                tempo steps: moment, seconds, quarters/min
@@ -156,7 +156,10 @@ flute = {
 }
 ```
 
-These definitions are the authority. A meter belongs to the beginning of
+These definitions are the authority, and their order is the score's
+order. Bar names are identities, not positions: a bar added mid-score
+(Add Bar ⌥B, Add Bars… ⌥⇧B) takes the next unused name, so no existing bar,
+layout anchor or `\pondsideSpace` reference is ever renamed. A meter belongs to the beginning of
 its measure, even when the selected note is inside a tuplet or tremolo.
 A break before the selected measure belongs to the preceding definition's
 end. Do not add competing local `\time`, `\break` or `\pageBreak`
@@ -323,7 +326,7 @@ offered.
 | Tool | Arguments | Returns |
 |---|---|---|
 | `edit` | `file`, `edits: [{ old?, new, from_line?, to_line? }]`, `root?` | applies every edit or none: `old` is exact text, unique in the file (the contexts' `412| ` prefixes are stripped if copied); `from_line`…`to_line` replaces whole lines as the contexts number them, and with `old` too checks they still say it (else says where `old` is now). No reading the file first. For `.ly`/`.ily` it then returns `check`'s result (the app's engraving; `root` for an `.ily` when the app isn't open); for `.scd`, a pointer to `patch_check`. Pondside's own `pondside.scd` and `sc-lexicon.scd` are refused |
-| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }], log? }`. On failure, `log` is the bounded tail of LilyPond's own log, including Guile backtraces the parser cannot locate. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
+| `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }], overflows?, log? }`. `overflows`: with `\autoLineBreaksOff`, the systems that run into the right margin, `[{ page, mm_past_margin, first: { file, line, column }, message }]` (no spacing setting narrows them: move a bar or narrow the content). On failure, `log` is the bounded tail of LilyPond's own log, including Guile backtraces the parser cannot locate. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
 | `query` | `file`, `from_line?`, `to_line?` | events in order: `{ kind, text, line, character, pitches, duration, explicitDuration }` |
 | `render` | `file`, `format?` (`pdf`·`svg`·`png`), `out?` | `{ files }` |
 | `cues` | `file`, `rate?` | cues.json (below) |

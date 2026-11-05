@@ -50,6 +50,30 @@ final class PatchAgentTests: XCTestCase {
         }
     }
 
+    func testALineGuardCopiedWithTheContextsSpaceStillApplies() throws {
+        // old and new copied from "N| line" keeping the space after the bar.
+        let text = "a\n  (x 1)\n    (y 2)\nd\n"
+        let edited = try FileEdit.apply([.init(old: "   (x 1)\n     (y 2)", new: "   (x 3)\n     (y 4)",
+                                               fromLine: 2, toLine: 3)], to: text)
+        XCTAssertEqual(edited.text, "a\n  (x 3)\n    (y 4)\nd\n")
+    }
+
+    func testALineGuardWithMixedIndentationKeepsNewAsGiven() throws {
+        let text = "a\n  (x 1)\n    (y 2)\nd\n"
+        let edited = try FileEdit.apply([.init(old: "(x 1)\n      (y 2)", new: "  (x 3)\n    (y 4)",
+                                               fromLine: 2, toLine: 3)], to: text)
+        XCTAssertEqual(edited.text, "a\n  (x 3)\n    (y 4)\nd\n")
+    }
+
+    func testAStaleLineGuardNamesWhereOldNowIsWhateverItsIndentation() {
+        let text = "new\na\n  (x 1)\nd\n"
+        XCTAssertThrowsError(try FileEdit.apply([.init(old: "   (x 1)", new: "z", fromLine: 2)], to: text)) {
+            let message = "\($0)"
+            XCTAssertTrue(message.contains("old is at line 3–3 (indented differently)"), message)
+            XCTAssertFalse(message.contains("isn't anywhere"), message)
+        }
+    }
+
     // MARK: Patch context
 
     func scorePatch() throws -> (score: URL, patch: URL, sheet: CueSheet) {

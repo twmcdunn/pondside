@@ -12,6 +12,20 @@ struct LensAnchor {
     var view: NSView
 }
 
+/// The kinds of mark a lens click can select, besides notes and slurs.
+enum LensMarkKind: Sendable {
+    case dynamic, hairpin, articulation, fermata
+
+    func matches(_ kind: ScoreEditor.Mark.Kind) -> Bool {
+        switch self {
+        case .dynamic: kind == .dynamic
+        case .hairpin: kind == .hairpin
+        case .articulation: kind == .articulation
+        case .fermata: kind == .fermata
+        }
+    }
+}
+
 /// The Notation Lens as the window controller sees it. Available on every
 /// macOS the app runs on; the implementation needs macOS 15.
 @MainActor
@@ -22,7 +36,14 @@ protocol NotationLensSession: AnyObject {
     var armedDuration: String { get set }
     var armedAccidental: Int? { get set }
     var onSelectEvent: ((Int, Bool) -> Void)? { get set }
+    /// A slur in the lens was clicked: its opening event, and whether it is a phrasing slur.
+    var onSelectSlur: ((Int, Bool) -> Void)? { get set }
+    /// A dynamic, hairpin, articulation or fermata in the lens was clicked:
+    /// the event it belongs to, and which kind of mark.
+    var onSelectMark: ((Int, LensMarkKind) -> Void)? { get set }
     func showFeedback(_ message: String)
+    /// An edit was refused or taken back: the red inline notice, in the lens.
+    func showRejection(_ message: String)
     var onClose: (() -> Void)? { get set }
     var onFailure: ((String) -> Void)? { get set }
     /// The mode bar was clicked: open that lens instead.

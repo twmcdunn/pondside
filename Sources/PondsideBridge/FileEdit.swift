@@ -39,17 +39,26 @@ public enum FileEdit {
                 // The end of line `to`, before its newline.
                 let upper = text[starts[to - 1]...].firstIndex(of: "\n") ?? text.endIndex
                 // With old too, the lines must still say it: a context's line
-                // numbers go stale when an earlier edit added lines.
+                // numbers go stale when an earlier edit added lines. The guard
+                // only checks staleness, so indentation doesn't count; old copied
+                // with the space after the context's "N|" shifts new too, and
+                // that shift is taken back out of new.
+                var new = unnumbered(c.new) ?? c.new
                 if let old = c.old, !old.isEmpty {
                     let now = String(text[lower..<upper])
                     let expected = unnumbered(old) ?? old
-                    guard now.trimmingCharacters(in: .whitespacesAndNewlines) == expected.trimmingCharacters(in: .whitespacesAndNewlines) else {
-                        let found = occurrences(of: expected, in: text).map { String(line(of: $0.lowerBound, in: text, starts: starts)) }
+                    let nowLines = trimmedBlankLines(now), oldLines = trimmedBlankLines(expected)
+                    guard nowLines.map(normalizedLine) == oldLines.map(normalizedLine) else {
+                        var found = occurrences(of: expected, in: text).map { String(line(of: $0.lowerBound, in: text, starts: starts)) }
+                        if found.isEmpty, let near = whitespaceNormalizedMatch(of: expected, in: text, starts: starts) {
+                            found = ["\(near.lines.lowerBound)–\(near.lines.upperBound) (indented differently)"]
+                        }
                         throw Failure("\(label)lines \(from)–\(to) are now:\n\(now)\n" + (found.isEmpty ? "and old isn't anywhere in the file"
                             : "old is at line \(found.joined(separator: ", ")): the file has moved since the context; use those lines"))
                     }
+                    if let k = uniformExtraIndent(old: oldLines, now: nowLines) { new = dedented(new, by: k) }
                 }
-                ranges.append((lower..<upper, unnumbered(c.new) ?? c.new))
+                ranges.append((lower..<upper, new))
             } else if let old = c.old, !old.isEmpty {
                 var found = occurrences(of: old, in: text)
                 var new = c.new
@@ -118,16 +127,47 @@ public enum FileEdit {
         return out
     }
 
+    /// A line with its whitespace runs collapsed and its ends trimmed.
+    static func normalizedLine(_ line: String) -> String {
+        line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    /// The lines of `text` without blank lines at either end.
+    static func trimmedBlankLines(_ text: String) -> [String] {
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        while let f = lines.first, f.allSatisfy(\.isWhitespace) { lines.removeFirst() }
+        while let l = lines.last, l.allSatisfy(\.isWhitespace) { lines.removeLast() }
+        return lines
+    }
+
+    /// The k > 0 spaces every non-blank line of `old` has beyond the file's
+    /// indentation, when that is the same for all of them.
+    static func uniformExtraIndent(old: [String], now: [String]) -> Int? {
+        func indent(_ s: String) -> Int { s.prefix { $0 == " " }.count }
+        var k: Int?
+        for (o, n) in zip(old, now) where !n.allSatisfy(\.isWhitespace) {
+            let d = indent(o) - indent(n)
+            if k == nil { k = d } else if k != d { return nil }
+        }
+        guard let k, k > 0 else { return nil }
+        return k
+    }
+
+    /// `text` with k leading spaces taken off each line that has them.
+    static func dedented(_ text: String, by k: Int) -> String {
+        text.split(separator: "\n", omittingEmptySubsequences: false).map { l in
+            l.prefix { $0 == " " }.count >= k ? String(l.dropFirst(k)) : String(l)
+        }.joined(separator: "\n")
+    }
+
     /// A unique match whose only difference is whitespace, for an actionable
-    /// error. It is never applied implicitly: exact source edits stay exact.
+    /// error. Only a from_line guard accepts such a match (its lines are
+    /// already fixed); an edit placed by old alone stays exact.
     static func whitespaceNormalizedMatch(of needle: String, in text: String,
                                           starts: [String.Index]) -> (range: Range<String.Index>, lines: ClosedRange<Int>)? {
-        func normalized(_ line: String) -> String {
-            line.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        }
-        let expected = needle.split(separator: "\n", omittingEmptySubsequences: false).map { normalized(String($0)) }
+        let expected = needle.split(separator: "\n", omittingEmptySubsequences: false).map { normalizedLine(String($0)) }
         guard !expected.isEmpty, expected.contains(where: { !$0.isEmpty }) else { return nil }
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { normalized(String($0)) }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map { normalizedLine(String($0)) }
         guard starts.count >= expected.count else { return nil }
         var found: [(range: Range<String.Index>, lines: ClosedRange<Int>)] = []
         for i in 0...(starts.count - expected.count) where Array(lines[i..<(i + expected.count)]) == expected {

@@ -22,12 +22,18 @@ final class NotationLensOverlayView: NSView {
     private let meterKeys = NSTextField(labelWithString: "⌥U")
     private let host: LensScoreHostView
     private let footer = NSTextField(labelWithString: "")
+    private let paper = NSView()
+    /// Top-down coordinates for the rejection notice, which lays itself out
+    /// that way; it never takes clicks.
+    private let notices = PassthroughFlippedView()
+    private var rejection: EditRejectionFeedback?
     private let badge = NSTextField(labelWithString: "")
     /// The same switch as the request lines', so ⇥ between them only
     /// changes what is below it.
     let modes = LensModeBar()
     /// Where ⇥ goes, for the footer ("graphics"); nil when nowhere.
     var tabTarget: String?
+    var enteringNotes = false
 
     static let musicHeight: CGFloat = 136
 
@@ -41,7 +47,6 @@ final class NotationLensOverlayView: NSView {
         wantsLayer = true
         layer?.backgroundColor = Theme.chrome.withAlphaComponent(0.72).cgColor
 
-        let paper = NSView()
         paper.wantsLayer = true
         paper.layer?.backgroundColor = Theme.lensPaper.cgColor
         paper.layer?.cornerRadius = 6
@@ -136,6 +141,27 @@ final class NotationLensOverlayView: NSView {
         for hint in accidentalHints { hint.isArmed = hint.alteration == alteration }
     }
 
+    /// The same red notice as on the page: its caret marks the strip's
+    /// centre, where the lens keeps the selection, and the label sits above
+    /// it over the mode bar, leaving the music readable.
+    func showRejection(_ message: String) {
+        rejection?.dismiss()
+        if notices.superview == nil {
+            notices.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(notices)
+            NSLayoutConstraint.activate([
+                notices.leadingAnchor.constraint(equalTo: leadingAnchor),
+                notices.trailingAnchor.constraint(equalTo: trailingAnchor),
+                notices.topAnchor.constraint(equalTo: topAnchor),
+                notices.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
+        layoutSubtreeIfNeeded()
+        let strip = notices.convert(paper.bounds, from: paper)
+        let anchor = NSRect(x: strip.midX - 4, y: strip.minY + 28, width: 2, height: 36)
+        rejection = EditRejectionFeedback(message: message, anchor: anchor, in: notices)
+    }
+
     func showFeedback(_ message: String) {
         footer.stringValue = message
         footer.toolTip = message
@@ -152,7 +178,7 @@ final class NotationLensOverlayView: NSView {
         let bars = lens.bars.count == 1 ? "bar \(lens.bars.lowerBound)" : "bars \(lens.bars.lowerBound)–\(lens.bars.upperBound)"
         // An edit's lens closes on the next render; say how to keep it.
         let tab = tabTarget.map { "  ⇥ \($0)" } ?? ""
-        let keys = (explicit ? "←→ step" : "⌘L keep open  ←→ step") + tab + "  ⎋ close"
+        let keys = (explicit ? "←→ step" : "⌘L keep open  ←→ step") + tab + (enteringNotes ? "  ⎋ close" : "  ⎋ enter notes")
         footer.stringValue = "\(fileLabel)\(staff) · \(bars)    \(keys)"
         let unsupported = lens.unsupported
         badge.stringValue = unsupported.isEmpty ? "" : "ⓘ"
@@ -281,4 +307,11 @@ private final class ArmedDurationView: NSView {
             (label as NSString).draw(at: NSPoint(x: 8, y: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 9), .foregroundColor: Theme.glassSecondaryText])
         }
     }
+}
+
+/// A transparent overlay in top-down coordinates that lets every click through.
+@MainActor
+final class PassthroughFlippedView: NSView {
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

@@ -68,6 +68,85 @@ public struct Graphic: Hashable, Sendable {
     }
 }
 
+extension Graphic {
+    /// Whether `point` lies on what is drawn: inside a filled shape, or
+    /// within `tolerance` (plus half the stroke) of its outline. Text is
+    /// its bounds.
+    public func shapeContains(_ point: Point, tolerance: Double) -> Bool {
+        guard case .path(let path, let fill, let stroke, let style) = content else {
+            return bounds.insetBy(-tolerance).contains(point)
+        }
+        let polygons = path.flattened()
+        if fill != nil, polygons.contains(where: { Self.encloses($0, point) }) { return true }
+        let reach = tolerance + (stroke != nil ? style.width / 2 : 0)
+        for poly in polygons {
+            for (a, b) in zip(poly, poly.dropFirst() + [poly[0]]) where Self.distance(point, a, b) <= reach {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func encloses(_ poly: [Point], _ p: Point) -> Bool {
+        var inside = false
+        var j = poly.count - 1
+        for i in poly.indices {
+            let a = poly[i], b = poly[j]
+            if (a.y > p.y) != (b.y > p.y), p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x { inside.toggle() }
+            j = i
+        }
+        return inside
+    }
+
+    private static func distance(_ p: Point, _ a: Point, _ b: Point) -> Double {
+        let dx = b.x - a.x, dy = b.y - a.y
+        let length = dx * dx + dy * dy
+        let t = length == 0 ? 0 : max(0, min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / length))
+        let x = a.x + t * dx - p.x, y = a.y + t * dy - p.y
+        return (x * x + y * y).squareRoot()
+    }
+}
+
+extension VectorPath {
+    /// The path as polygons, one per subpath, curves sampled finely enough
+    /// for hit-testing.
+    public func flattened(segments: Int = 12) -> [[Point]] {
+        var out: [[Point]] = []
+        var current: [Point] = []
+        func finish() { if current.count > 1 { out.append(current) }; current = [] }
+        for element in elements {
+            let from = current.last ?? .zero
+            switch element {
+            case .move(let p):
+                finish()
+                current = [p]
+            case .line(let p):
+                current.append(p)
+            case .quad(let c, let p):
+                for i in 1...segments {
+                    let t = Double(i) / Double(segments), u = 1 - t
+                    current.append(Point(u * u * from.x + 2 * u * t * c.x + t * t * p.x,
+                                         u * u * from.y + 2 * u * t * c.y + t * t * p.y))
+                }
+            case .cubic(let c1, let c2, let p):
+                for i in 1...segments {
+                    let t = Double(i) / Double(segments), u = 1 - t
+                    let a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t
+                    current.append(Point(a * from.x + b * c1.x + c * c2.x + d * p.x,
+                                         a * from.y + b * c1.y + c * c2.y + d * p.y))
+                }
+            case .close:
+                // Polygons are taken as closed; drawing goes on from the start.
+                let start = current.first
+                finish()
+                if let start { current = [start] }
+            }
+        }
+        finish()
+        return out
+    }
+}
+
 /// An invisible named rectangle a front-matter markup leaves in the SVG
 /// (`pondside-legend:<name>` links): where a part of the legend is, so the
 /// canvas can arrange it. In document order.
@@ -117,11 +196,16 @@ public struct EngravedPage: Sendable {
 
     /// The linked graphic under `point` (page coordinates). When several
     /// overlap, the smallest wins, so a notehead beats the slur over it.
+    /// Graphics whose link passes `byOutline` (a slur) are hit only on their
+    /// drawn shape, not anywhere in their bounding box: a click on the
+    /// empty staff under a slur still means the staff.
     public func hitTest(_ point: Point, tolerance: Double = 0.25,
-                        excluding removed: Set<Graphic> = []) -> Graphic? {
+                        excluding removed: Set<Graphic> = [],
+                        byOutline: (PointAndClickLocation) -> Bool = { _ in false }) -> Graphic? {
         var best: Graphic?
         for g in graphics where g.link != nil && !removed.contains(g) {
             guard g.bounds.insetBy(-tolerance).contains(point) else { continue }
+            if byOutline(g.link!), !g.shapeContains(point, tolerance: tolerance) { continue }
             if best == nil || g.bounds.area < best!.bounds.area { best = g }
         }
         return best
@@ -227,9 +311,10 @@ public struct EngravedPage: Sendable {
     /// The linked drawing whose region holds `point`, for a click that
     /// landed between its parts (the gaps in a texture); the smallest
     /// region wins, so a drawing inside another is still reachable.
-    public func regionHit(_ point: Point, excluding removed: Set<Graphic> = []) -> Graphic? {
+    public func regionHit(_ point: Point, excluding removed: Set<Graphic> = [],
+                          byOutline: (PointAndClickLocation) -> Bool = { _ in false }) -> Graphic? {
         var groups: [PointAndClickLocation: [Graphic]] = [:]
-        for g in graphics where g.link != nil && !removed.contains(g) {
+        for g in graphics where g.link != nil && !removed.contains(g) && !byOutline(g.link!) {
             groups[g.link!, default: []].append(g)
         }
         let gap = Self.clusterGap * (staves.first?.space ?? 1)

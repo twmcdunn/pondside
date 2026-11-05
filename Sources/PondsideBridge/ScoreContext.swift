@@ -16,7 +16,7 @@ public enum ScoreContext {
     /// latest cue sheet, for requests that name a cue.
     public static func describe(text: String, file: String, line: Int, character: Int,
                                 files: [ScoreGraphic.File] = [], cues: CueSheet? = nil,
-                                root: ScoreGraphic.File? = nil) -> JSONValue {
+                                root: ScoreGraphic.File? = nil, includeGraphic: Bool = true) -> JSONValue {
         guard let offset = utf8Offset(in: text, line: line, character: character) else {
             return ["file": .string(file), "error": .string("no line \(line) in \(file)")]
         }
@@ -51,14 +51,28 @@ public enum ScoreContext {
         }
         // The clicked file first (its text as the caller has it), then the rest.
         let all = [(path: file, text: text)] + files.filter { $0.path != file }
-        if let custom = ScoreGraphic.describe(at: offset, in: text, files: all) {
-            out["graphic"] = custom
-        } else if let graphic = graphic(around: offset, in: text) {
-            out["graphic"] = graphic
-        } else if let root {
-            // No drawing here: a notation/layout request needs the layout and
-            // a map of the score's definitions, not the whole graphics file.
-            out["code"] = codeContext(root: root, files: all)
+        if includeGraphic {
+            if let custom = ScoreGraphic.describe(at: offset, in: text, files: all) {
+                out["graphic"] = custom
+            } else if let graphic = graphic(around: offset, in: text) {
+                out["graphic"] = graphic
+            } else {
+                if let root {
+                    // No drawing here: a notation/layout request needs the layout and
+                    // a map of the score's definitions, not the whole graphics file.
+                    out["code"] = codeContext(root: root, files: all)
+                }
+                // A score that draws its own graphics: whether its helpers
+                // (staff-span among them) exist, even away from a drawing, so a
+                // score-wide graphics request doesn't search for them.
+                if ScoreGraphic.procedure("g-span", in: all) ?? ScoreGraphic.definition(of: "g-span", in: all) != nil {
+                    let base = file.lastIndex(of: "/").map { String(file[...$0]) } ?? ""
+                    out["section_support"] = ScoreGraphic.sectionSupport(files: all) { path in
+                        !base.isEmpty && path.hasPrefix(base) ? String(path.dropFirst(base.count)) : path
+                    }
+                }
+                out["hint"] = .string(Self.noGraphicHint)
+            }
         }
         if let cues, !cues.cues.isEmpty {
             out["cues"] = .array(cues.cues.map { c in
@@ -68,6 +82,12 @@ public enum ScoreContext {
         }
         return .object(out)
     }
+
+    /// Said when the point holds no graphic: one example the user selects
+    /// is the fastest context for a request about something visible.
+    static let noGraphicHint = "No graphic at this point. If the request is about something you'd have to find in the "
+        + "engraving (a graphic, a problem the user sees) and this point isn't an example of it, ask the user to select "
+        + "one (click it, or ⌥-drag over it) and call score_context again, instead of searching renders or reading whole files."
 
     /// `text` with each line prefixed by its line number in the file
     /// (`412| …`), as the context quotes code: the agent edits by line

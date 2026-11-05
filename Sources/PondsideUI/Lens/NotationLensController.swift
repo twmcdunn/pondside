@@ -19,14 +19,20 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     var armedDuration = "4"
     var armedAccidental: Int?
     var onSelectEvent: ((Int, Bool) -> Void)?
+    var onSelectSlur: ((Int, Bool) -> Void)?
+    var onSelectMark: ((Int, LensMarkKind) -> Void)?
     func showFeedback(_ message: String) { card?.showFeedback(message) }
+    func showRejection(_ message: String) { card?.showRejection(message) }
     var onClose: (() -> Void)?
+    var onEscape: (() -> Bool)?
+    private var handlingEscape = false
     var onFailure: ((String) -> Void)?
     var onSwitch: ((LensMode) -> Void)?
     var available: Set<LensMode> = []
     var unavailable: [LensMode: String] = [:]
 
     private func configure(_ card: NotationLensOverlayView) {
+        card.enteringNotes = enteringNotes
         card.setUnmetered(unmetered)
         card.setDuration(armedDuration)
         card.setArmedAccidental(armedAccidental)
@@ -48,6 +54,8 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
             do {
                 host.enteringNotes = enteringNotes
                 host.onSelectEvent = onSelectEvent
+                host.onSelectSlur = onSelectSlur
+                host.onSelectMark = onSelectMark
                 try host.load(lens)
             } catch {
                 lensLog.error("refresh failed: \(String(describing: error), privacy: .public)")
@@ -83,6 +91,8 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
         do {
             host.enteringNotes = enteringNotes
             host.onSelectEvent = onSelectEvent
+                host.onSelectSlur = onSelectSlur
+                host.onSelectMark = onSelectMark
             try host.load(lens)
         } catch {
             lensLog.error("load failed: \(String(describing: error), privacy: .public)")
@@ -141,6 +151,15 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     }
 
     // A click elsewhere closed it.
+    func popoverShouldClose(_ popover: NSPopover) -> Bool {
+        guard !handlingEscape, !enteringNotes,
+              NSApp.currentEvent?.type == .keyDown, NSApp.currentEvent?.keyCode == 53 else { return true }
+        handlingEscape = true
+        defer { handlingEscape = false }
+        let handled = onEscape?() ?? false
+        return !(handled && enteringNotes)
+    }
+
     func popoverDidClose(_ notification: Notification) {
         guard let closed = notification.object as? NSPopover, closed === popover else { return }
         popover = nil

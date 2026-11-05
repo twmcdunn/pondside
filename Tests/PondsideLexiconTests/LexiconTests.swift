@@ -284,6 +284,42 @@ final class LexiconEngravingTests: XCTestCase {
         XCTAssertTrue(result.errors.isEmpty, result.log)
         XCTAssertFalse(result.log.contains("Lexicon has no entry"), result.log)
     }
+    /// A graphic going on past its system ends at the system's staff end;
+    /// one stopped on the first note of a system leaves nothing on it; one
+    /// crossing a break is clipped there instead of drawn into the margins.
+    func testGraphicsReachTheEndsOfTheirSystems() async throws {
+        let body = """
+        \\paper { indent = 0 }
+        flat = #'((amplitude . 0) (curl . 0) (lines . 1) (thickness . 0.3))
+        \\score { <<
+          \\new Staff { \\autoLineBreaksOff c''1 | c'' | \\break c'' | c'' | \\break c'' | c'' }
+          \\new Staff { s1\\startGraphic "staff-ripple" \\flat s1 | s1\\stopGraphic s1 | s1 s1 }
+          \\new Staff { s1 s1\\startGraphic "staff-ripple" \\flat | s1 s1\\stopGraphic | s1 s1 }
+        >> }
+        """
+        let (result, _, _) = try await compile(body)
+        XCTAssertTrue(result.succeeded && result.errors.isEmpty, result.log)
+        let page = EngravedPage(svg: try Data(contentsOf: try XCTUnwrap(result.outputFiles.first)))
+        let staffEnd = try XCTUnwrap(page.staves.map(\.maxX).max())
+        let staffStart = try XCTUnwrap(page.staves.map(\.minX).min())
+        // The ripples are the only strokes 0.3 thick; their link is the \startGraphic line.
+        func lines(from line: Int) -> [Rect] {
+            page.graphics.filter {
+                guard $0.link?.line == line, case .path(_, _, let stroke, let style) = $0.content else { return false }
+                return stroke != nil && abs(style.width - 0.3) < 1e-6
+            }.map(\.bounds).sorted { $0.y < $1.y }
+        }
+        // Stopped on system 2's first note: one piece, to system 1's end.
+        let first = lines(from: 7)
+        XCTAssertEqual(first.count, 1, "\(first)")
+        XCTAssertEqual(first.first?.maxX ?? 0, staffEnd + 0.15, accuracy: 0.05)
+        // Across the break: to system 1's end, then from after system 2's clef.
+        let second = lines(from: 8)
+        XCTAssertEqual(second.count, 2, "\(second)")
+        XCTAssertEqual(second.first?.maxX ?? 0, staffEnd + 0.15, accuracy: 0.05)
+        XCTAssertGreaterThan(second.last?.minX ?? 0, staffStart + 2, "clipped at the break, not drawn into the margin")
+    }
+
     /// The graphics kit and every graphic entry draw, across a line break,
     /// identically on every compile, and link back to their invocation.
     func testGraphicEntriesDrawDeterministically() async throws {
@@ -488,6 +524,22 @@ final class SkillConsistencyTests: XCTestCase {
         }
         XCTAssertFalse(text.contains("music_around"), "the clicked-part selection is gone")
         XCTAssertFalse(text.contains("till 7"), "no cue/bar naming for graphics")
+    }
+
+    /// Graphics reach the system's ends: the kit does it for entries, and the
+    /// skills name the same calls and the `score_context` flag the app sends.
+    func testTheSkillsDescribeReachingTheSystemsEnds() throws {
+        let graphic = try String(contentsOf: skills.appendingPathComponent("graphic-notation/SKILL.md"), encoding: .utf8)
+        let entries = try String(contentsOf: skills.appendingPathComponent("lexicon-entries/SKILL.md"), encoding: .utf8)
+        let kit = try String(contentsOf: skills.deletingLastPathComponent().appendingPathComponent("Lexicon/kit/pondside-graphics.ily"),
+                             encoding: .utf8)
+        for key in ["Reach the system's ends", "staff_span", "(define (staff-span grob)", "broken-right?", "staff-lines"] {
+            XCTAssertTrue(graphic.contains(key), key)
+        }
+        for call in ["g-staff-span", "g-continued?", "g-broken?", "staff-lines"] {
+            XCTAssertTrue(entries.contains(call), call)
+            XCTAssertTrue(kit.contains(call), call)
+        }
     }
 
     /// The skills describe front-matter.ily as Score Setup writes it.

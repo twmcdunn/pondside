@@ -11,6 +11,9 @@ protocol ScoreCanvasDelegate: AnyObject {
     func canvas(_ canvas: ScoreCanvasView, didClickGraphic link: PointAndClickLocation)
     /// Whether a link is a graphic's `\\start…` command (for ⌥ selection).
     func canvas(_ canvas: ScoreCanvasView, isGraphicLink link: PointAndClickLocation) -> Bool
+    /// Whether a link's graphics take a click only on their drawn shape
+    /// (a slur), not anywhere in their bounding box.
+    func canvas(_ canvas: ScoreCanvasView, hitsByOutline link: PointAndClickLocation) -> Bool
     /// The user dragged a selection rectangle over these links.
     func canvas(_ canvas: ScoreCanvasView, didSelect links: [PointAndClickLocation])
     /// The user marked a graphic section (⌥-drag), or cleared it (nil).
@@ -146,6 +149,13 @@ final class ScoreCanvasView: NSView {
         relayout()
     }
 
+    /// Marks systems that run into the right margin (automatic line breaks
+    /// off): the overrun tinted red past a rule at the justified edge. Passive
+    /// feedback; it never moves the music or takes focus.
+    func setOverflows(_ list: [SystemOverflow]) {
+        for (n, v) in pageViews.enumerated() { v.overflows = list.filter { $0.page == n } }
+    }
+
     // MARK: Playback head
 
     /// The audio's place in the score: one line over the system playing now,
@@ -163,6 +173,35 @@ final class ScoreCanvasView: NSView {
 
     /// Brings a new system into view. Called when the head moves to another
     /// system, not on every tick, so the page doesn't creep while it plays.
+    /// Following playback: glide so the playhead's whole system sits in the
+    /// middle of the view (horizontally only when the head is off screen).
+    /// Reduce Motion jumps instead.
+    func centerPlayheadSystem() {
+        guard let p = playhead, pageViews.indices.contains(p.page),
+              let scrollView = enclosingScrollView else { return }
+        let clip = scrollView.contentView
+        let v = pageViews[p.page]
+        let rect = convert(v.viewRect(for: Rect(x: p.x, y: p.top, width: 0, height: p.bottom - p.top)), from: v)
+        let view = clip.bounds
+        var origin = view.origin
+        origin.y = rect.midY - view.height / 2
+        if rect.midX < view.minX + 24 || rect.midX > view.maxX - 24 { origin.x = rect.midX - view.width / 2 }
+        origin.x = min(max(origin.x, 0), max(0, bounds.width - view.width))
+        origin.y = min(max(origin.y, 0), max(0, bounds.height - view.height))
+        guard abs(origin.x - view.minX) > 1 || abs(origin.y - view.minY) > 1 else { return }
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            clip.scroll(to: origin)
+            scrollView.reflectScrolledClipView(clip)
+            return
+        }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.45
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            context.allowsImplicitAnimation = true
+            clip.animator().setBoundsOrigin(origin)
+        }, completionHandler: { scrollView.reflectScrolledClipView(clip) })
+    }
+
     func revealPlayhead() {
         guard let p = playhead, pageViews.indices.contains(p.page) else { return }
         let v = pageViews[p.page]
@@ -549,8 +588,15 @@ final class ScoreCanvasView: NSView {
     fileprivate func pageView(_ v: PageView, clickedAt p: Point, event: NSEvent) {
         window?.makeFirstResponder(self)
         let tolerance = 0.3 / max(zoom, 0.5)
-        let link = v.rendered?.page.hitTest(p, tolerance: tolerance, excluding: v.removed)?.link
-            ?? v.rendered?.page.regionHit(p, excluding: v.removed)?.link
+        var outline: [PointAndClickLocation: Bool] = [:]
+        let byOutline: (PointAndClickLocation) -> Bool = { [unowned self] link in
+            if let known = outline[link] { return known }
+            let answer = delegate?.canvas(self, hitsByOutline: link) ?? false
+            outline[link] = answer
+            return answer
+        }
+        let link = v.rendered?.page.hitTest(p, tolerance: tolerance, excluding: v.removed, byOutline: byOutline)?.link
+            ?? v.rendered?.page.regionHit(p, excluding: v.removed, byOutline: byOutline)?.link
         delegate?.canvas(self, didClick: link, at: pageViews.firstIndex { $0 === v }, point: p,
                           extending: event.modifierFlags.contains(.shift))
     }
@@ -724,6 +770,7 @@ private final class PageView: NSView {
     var removed: Set<Graphic> = [] { didSet { if removed != oldValue { needsDisplay = true } } }
     var badges: [(Rect, String)] = [] { didSet { needsDisplay = true } }
     var highlights: [Rect] = [] { didSet { if highlights != oldValue { needsDisplay = true } } }
+    var overflows: [SystemOverflow] = [] { didSet { if overflows != oldValue { needsDisplay = true } } }
     var lightsOut = false { didSet { needsDisplay = true } }
     /// The region an agent is working on (page coordinates): outlined on a
     /// layer of its own, so the pulse never redraws the music.
@@ -992,6 +1039,8 @@ private final class PageView: NSView {
             ctx.fill(bounds)
         }
 
+        drawOverflows(in: ctx)
+
         let accent = Theme.accent
         for r in highlights {
             let rect = viewRect(for: r).insetBy(dx: -3, dy: -3)
@@ -1059,6 +1108,28 @@ private final class PageView: NSView {
             ctx.setStrokeColor(accent.withAlphaComponent(0.7).cgColor)
             ctx.setLineWidth(1)
             ctx.stroke(dragRect.insetBy(dx: 0.5, dy: 0.5))
+        }
+    }
+
+    private func drawOverflows(in ctx: CGContext) {
+        guard !overflows.isEmpty else { return }
+        let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        let red = Theme.error
+        for o in overflows {
+            let top = o.band.lowerBound - 1, bottom = o.band.upperBound + 1
+            let over = viewRect(for: Rect(x: o.edge, y: top, width: o.right - o.edge, height: bottom - top))
+            ctx.setFillColor(red.withAlphaComponent(contrast ? 0.28 : 0.16).cgColor)
+            ctx.fill(over)
+            ctx.setStrokeColor(red.withAlphaComponent(contrast ? 1 : 0.85).cgColor)
+            ctx.setLineWidth(contrast ? 2.5 : 1.5)
+            ctx.move(to: CGPoint(x: over.minX, y: over.minY))
+            ctx.addLine(to: CGPoint(x: over.minX, y: over.maxY))
+            ctx.strokePath()
+            let label = NSAttributedString(string: String(format: "+%.1f mm", o.amountMM), attributes: [
+                .font: NSFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: red])
+            let size = label.size()
+            label.draw(at: NSPoint(x: max(over.minX + 3, min(over.maxX - size.width, bounds.maxX - size.width - 2)),
+                                   y: over.minY - size.height - 1))
         }
     }
 

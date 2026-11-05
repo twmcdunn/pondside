@@ -54,4 +54,18 @@ final class NoteInputTests: XCTestCase {
         _ = input.handle(ch("_"), now: 0)
         XCTAssertEqual(input.handle(ch("c"), now: 0), [.insertNote(step: 0)])
     }
+    func testDirectSlurShortcutAndCancellation() {
+        var input = NoteInput()
+        XCTAssertEqual(input.handle(ch("s"), now: 0), [.toggleSlur])
+        _ = input.handle(ch("8"), now: 1)
+        _ = input.handle(ch("="), now: 2)
+        _ = input.handle(ch("\\"), now: 3)
+        _ = input.handle(ch("t"), now: 4)
+        XCTAssertTrue(input.isBuffering)
+        input.cancelPendingInput()
+        XCTAssertFalse(input.isBuffering)
+        XCTAssertEqual(input.armedDuration, DurationValue(log: 3))
+        XCTAssertEqual(input.armedAccidental, 2)
+        XCTAssertEqual(input.handle(ch("s"), now: 5), [.toggleSlur])
+    }
 }

@@ -118,6 +118,9 @@ final class ScoreDocument {
     /// The latest compile's timing rows (bars, tempos), for playing from a bar.
     private(set) var timingLog: TimingLog?
     private(set) var pages: [EngravedPage] = []
+    /// Systems of `pages` that run into the right margin while automatic
+    /// line breaks are off; found with the pages, off the main actor.
+    private(set) var overflows: [SystemOverflow] = []
     private(set) var installation: LilyPondInstallation? {
         didSet {
             if installation != oldValue {
@@ -190,6 +193,48 @@ final class ScoreDocument {
             .appendingPathComponent(ContentHash(canonical.path).description, isDirectory: true)
         declaredVersion = LilyPondVersion.declared(in: files[0].text)
         contractRequired = StructuralEditing.isManaged(files[0].tree)
+        scheduleAudit(after: .zero)
+    }
+
+    // MARK: Contract audit
+
+    /// The project texts last known to pass `StructuralEditing.validate`.
+    /// A built-in structural or note edit keeps an audited project audited
+    /// (it preserves the contract by construction), so the GUI's edits skip
+    /// the whole-project check (165 ms on a 4,000-line score) unless a Source
+    /// or outside edit came since; that edit is audited in the background.
+    private var auditedRevision: [URL: ContentHash]?
+    private var auditTask: Task<Void, Never>?
+
+    private var currentRevision: [URL: ContentHash] {
+        Dictionary(uniqueKeysWithValues: files.map { ($0.url, ContentHash($0.text)) })
+    }
+
+    /// Built-in structural edits may skip `validate` (`validatingContract: false`).
+    var contractAudited: Bool { auditedRevision != nil && auditedRevision == currentRevision }
+
+    /// After a built-in edit: audited before means audited now.
+    private func carryAudit(from before: [URL: ContentHash]) {
+        if auditedRevision == before { auditedRevision = currentRevision } else { scheduleAudit() }
+    }
+
+    /// Audits the current texts off the main thread, after a pause so that
+    /// typing in Source doesn't start one per keystroke.
+    private func scheduleAudit(after delay: Duration = .milliseconds(400)) {
+        auditTask?.cancel()
+        guard StructuralEditing.isManaged(root.tree) else { auditedRevision = nil; return }
+        let revision = currentRevision
+        let snapshot = files.map { StructuralEditing.File(id: $0.url.path, tree: $0.tree) }
+        let rootID = root.url.path
+        auditTask = Task { [weak self] in
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            guard !Task.isCancelled else { return }
+            let valid = await Task.detached(priority: .utility) {
+                (try? StructuralEditing.validate(snapshot, root: rootID)) != nil
+            }.value
+            guard !Task.isCancelled, let self, valid, self.currentRevision == revision else { return }
+            self.auditedRevision = revision
+        }
     }
 
     func file(for path: String) -> SourceFile? {
@@ -227,16 +272,55 @@ final class ScoreDocument {
         delegate?.documentDidLoadCachedRender(self)
     }
 
+    /// The git that keeps checkpoints, once found to work; nil while
+    /// unchecked or when there is none (Revert to Checkpoint… is greyed).
+    private(set) static var checkpointGit: String?
+    private static var checkpointGitDetection: Task<String?, Never>?
+
+    /// Looks for a working git off the main thread, once per launch.
+    @discardableResult
+    static func detectCheckpointGit() -> Task<String?, Never> {
+        if let task = checkpointGitDetection { return task }
+        let task = Task { @MainActor in
+            let git = await Task.detached(priority: .utility) { ShadowHistory.workingGit() }.value
+            checkpointGit = git
+            return git
+        }
+        checkpointGitDetection = task
+        return task
+    }
+
+    /// The shadow history of this score, if checkpoints are being kept.
+    var history: ShadowHistory? {
+        guard let root = Self.historyRoot, let git = Self.checkpointGit else { return nil }
+        return ShadowHistory(score: url, root: root, git: git)
+    }
+
+    /// Checkpoints now (after saving), so the current state can be returned
+    /// to, e.g. before reverting.
+    func checkpointNow(message: String) async {
+        flushPendingSaves()
+        // A checkpoint already running finishes first: two gits at once
+        // would collide on the history's index lock.
+        let pending = historyTask
+        pending?.cancel()
+        await pending?.value
+        guard let history else { return }
+        let urls = files.map(\.url)
+        _ = try? await history.checkpoint(urls, message: message)
+    }
+
     /// A checkpoint in the shadow history (never the user's own git repo).
     private func scheduleCheckpoint(after delay: Duration) {
-        guard let root = Self.historyRoot, ShadowHistory.findGit() != nil else { return }
+        guard let root = Self.historyRoot else { return }
         historyTask?.cancel()
-        let history = ShadowHistory(score: url, root: root)
+        let url = url
         let urls = files.map(\.url)
+        let detection = Self.detectCheckpointGit()
         historyTask = Task.detached(priority: .background) {
             try? await Task.sleep(for: delay)
-            guard !Task.isCancelled else { return }
-            try? await history.checkpoint(urls)
+            guard !Task.isCancelled, let git = await detection.value else { return }
+            try? await ShadowHistory(score: url, root: root, git: git).checkpoint(urls)
         }
     }
 
@@ -321,6 +405,7 @@ final class ScoreDocument {
 
     func userEdited(_ file: SourceFile, text newText: String, prepared: SyntaxTree? = nil) {
         if let prepared {
+            let revision = currentRevision
             let before = ContentHash(file.text)
             if before == file.sync.lastSyncedHash || file.constructedRevisions.contains(before) {
                 file.constructedRevisions.insert(before)
@@ -328,15 +413,17 @@ final class ScoreDocument {
             }
             file.text = newText
             file.tree = prepared
+            carryAudit(from: revision)
         } else {
             file.text = newText
             refreshGraph()
+            scheduleAudit()
         }
         file.saveTask?.cancel()
         file.saveTask = Task { [weak self, weak file] in
             try? await Task.sleep(for: ScoreDocument.autosaveDelay)
             guard !Task.isCancelled, let self, let file else { return }
-            if self.save(file) { self.engrave() }
+            if await self.autosave(file) { self.engrave() }
         }
     }
 
@@ -365,6 +452,8 @@ final class ScoreDocument {
     private var inputEngraveTask: Task<Void, Never>?
 
     func adoptInput(_ prepared: UnmeteredInputTransaction.Prepared) {
+        let revision = currentRevision
+        defer { carryAudit(from: revision) }
         for source in prepared.plan.files {
             guard let file = file(for: source.id) else { continue }
             file.text = source.tree.text
@@ -383,7 +472,10 @@ final class ScoreDocument {
 
     /// A coordinated structural edit: validate every buffer and disk revision
     /// before writing, then publish the complete project and engrave once.
-    func replaceProjectSources(expected: [URL: String], replacements: [URL: String]) throws {
+    /// `preservesContract`: the edit keeps an audited project audited (built-in
+    /// structural edits); otherwise the result is audited afresh.
+    func replaceProjectSources(expected: [URL: String], replacements: [URL: String], preservesContract: Bool = true) throws {
+        let audit = currentRevision
         var revisions: [URL: ContentHash] = [:]
         for (url, text) in expected {
             guard let file = file(for: url.path), file.text == text else {
@@ -408,6 +500,7 @@ final class ScoreDocument {
         }
         refreshGraph()
         contractRequired = StructuralEditing.isManaged(root.tree)
+        if preservesContract { carryAudit(from: audit) } else { scheduleAudit(after: .zero) }
         scheduleCheckpoint(after: .seconds(30))
         engrave()
     }
@@ -420,56 +513,122 @@ final class ScoreDocument {
         }
     }
 
+    /// Saves now, on the main thread: for a flush that must finish before it
+    /// returns (closing, quitting, resolving a conflict).
     @discardableResult
     private func save(_ file: SourceFile) -> Bool {
         file.saveTask = nil
         guard ContentHash(file.text) != file.sync.lastSyncedHash else { return true }
         do {
-            if contractRequired || StructuralEditing.isManaged(root.tree) {
-                guard StructuralEditing.isManaged(root.tree) else {
-                    throw StructuralEditing.Failure("The generated shared-measure contract was removed. Restore it before saving; see pondside://contract.")
-                }
-                let dirty = files.filter { ContentHash($0.text) != $0.sync.lastSyncedHash }
-                let replacements = Dictionary(uniqueKeysWithValues: dirty.map { ($0.url, $0.text) })
-                // Read unchanged dependencies from disk, including generated
-                // includes that may have changed before their watcher fires.
-                let graph = SourceGraph.load(root: url, overrides: replacements)
-                // Arbitrary Source edits need an audit. Built-in notation
-                // commands already preserve the contract by construction.
-                if !dirty.allSatisfy({ $0.constructedRevisions.contains(ContentHash($0.text)) }) {
-                    let proposed = graph.files.map { StructuralEditing.File(id: $0.url.path, tree: $0.tree) }
-                    try StructuralEditing.verifyLengths(proposed, root: url.path)
-                }
-                var revisions: [URL: ContentHash] = [:]
-                for source in graph.files {
-                    let bytes = try Data(contentsOf: source.url)
-                    if let dirtyFile = dirty.first(where: { $0.url == source.url }),
-                       ContentHash(bytes: bytes) != dirtyFile.sync.lastSyncedHash {
-                        throw StructuralEditing.Failure("\(dirtyFile.displayName) changed on disk. Resolve its conflict before saving.")
-                    }
-                    revisions[source.url] = ContentHash(bytes: bytes)
-                }
-                try ProjectSourceTransaction.replace(expected: revisions, replacements: replacements, willWrite: { url, text in
-                    self.file(for: url.path)?.watcher?.noteOwnWrite(text)
-                })
-                for source in files where replacements[source.url] != nil {
-                    source.saveTask?.cancel()
-                    source.saveTask = nil
-                    source.sync.noteSynced(source.text)
-                }
-                contractRequired = true
+            if let pending = try managedSave() {
+                try commitManagedSave(pending, graph: try Self.auditedGraph(root: url, replacements: pending.replacements, audit: pending.audit))
             } else {
-                file.watcher?.noteOwnWrite(file.text)
-                try Data(file.text.utf8).write(to: file.url, options: .atomic)
-                file.sync.noteSynced(file.text)
+                try writeUnmanaged(file)
             }
             scheduleCheckpoint(after: .seconds(30))
             return true
         } catch {
-            stashRecovery(file.text, for: file, label: "unsaved-contract")
-            setStatus(.failed("Not saved: \(error). The source buffer is retained; see pondside://contract."))
+            saveFailed(file, error)
             return false
         }
+    }
+
+    /// The timed autosave. In a managed score, reading the dependencies and
+    /// auditing the contract (165 ms on a 4,000-line score) run off the main
+    /// thread (DESIGN.md §0, "All UI is instant"); only the disk transaction
+    /// returns here, and only for the texts that were audited. An edit made
+    /// meanwhile cancels this task and schedules its own save.
+    private func autosave(_ file: SourceFile) async -> Bool {
+        guard ContentHash(file.text) != file.sync.lastSyncedHash else { file.saveTask = nil; return true }
+        do {
+            guard let pending = try managedSave() else {
+                file.saveTask = nil
+                try writeUnmanaged(file)
+                scheduleCheckpoint(after: .seconds(30))
+                return true
+            }
+            let root = url
+            let graph = try await Task.detached(priority: .userInitiated) {
+                try Self.auditedGraph(root: root, replacements: pending.replacements, audit: pending.audit)
+            }.value
+            guard !Task.isCancelled else { return false }
+            file.saveTask = nil
+            // Changed some other way meanwhile (a structural commit or a
+            // reload): audit what is there now.
+            let now = files.filter { ContentHash($0.text) != $0.sync.lastSyncedHash }
+            guard Dictionary(uniqueKeysWithValues: now.map { ($0.url, $0.text) }) == pending.replacements else {
+                return now.isEmpty ? true : await autosave(now.contains { $0 === file } ? file : now[0])
+            }
+            try commitManagedSave(pending, graph: graph)
+            scheduleCheckpoint(after: .seconds(30))
+            return true
+        } catch {
+            file.saveTask = nil
+            saveFailed(file, error)
+            return false
+        }
+    }
+
+    private struct PendingSave: Sendable {
+        var replacements: [URL: String]
+        /// Arbitrary Source edits need an audit. Built-in notation commands
+        /// already preserve the contract by construction.
+        var audit: Bool
+    }
+
+    /// What a managed score must write together; nil for an unmanaged one.
+    private func managedSave() throws -> PendingSave? {
+        guard contractRequired || StructuralEditing.isManaged(root.tree) else { return nil }
+        guard StructuralEditing.isManaged(root.tree) else {
+            throw StructuralEditing.Failure("The generated shared-measure contract was removed. Restore it before saving; see pondside://contract.")
+        }
+        let dirty = files.filter { ContentHash($0.text) != $0.sync.lastSyncedHash }
+        return PendingSave(replacements: Dictionary(uniqueKeysWithValues: dirty.map { ($0.url, $0.text) }),
+                           audit: !dirty.allSatisfy { $0.constructedRevisions.contains(ContentHash($0.text)) })
+    }
+
+    /// The project as it would be saved, audited. Reads unchanged
+    /// dependencies from disk, including generated includes that may have
+    /// changed before their watcher fires. Main-actor free.
+    nonisolated private static func auditedGraph(root: URL, replacements: [URL: String], audit: Bool) throws -> [URL] {
+        let graph = SourceGraph.load(root: root, overrides: replacements)
+        if audit {
+            let proposed = graph.files.map { StructuralEditing.File(id: $0.url.path, tree: $0.tree) }
+            try StructuralEditing.verifyLengths(proposed, root: root.path)
+        }
+        return graph.files.map(\.url)
+    }
+
+    private func commitManagedSave(_ pending: PendingSave, graph: [URL]) throws {
+        var revisions: [URL: ContentHash] = [:]
+        for source in graph {
+            let bytes = try Data(contentsOf: source)
+            if let dirtyFile = files.first(where: { $0.url == source && pending.replacements[source] != nil }),
+               ContentHash(bytes: bytes) != dirtyFile.sync.lastSyncedHash {
+                throw StructuralEditing.Failure("\(dirtyFile.displayName) changed on disk. Resolve its conflict before saving.")
+            }
+            revisions[source] = ContentHash(bytes: bytes)
+        }
+        try ProjectSourceTransaction.replace(expected: revisions, replacements: pending.replacements, willWrite: { url, text in
+            self.file(for: url.path)?.watcher?.noteOwnWrite(text)
+        })
+        for source in files where pending.replacements[source.url] != nil {
+            source.saveTask?.cancel()
+            source.saveTask = nil
+            source.sync.noteSynced(source.text)
+        }
+        contractRequired = true
+    }
+
+    private func writeUnmanaged(_ file: SourceFile) throws {
+        file.watcher?.noteOwnWrite(file.text)
+        try Data(file.text.utf8).write(to: file.url, options: .atomic)
+        file.sync.noteSynced(file.text)
+    }
+
+    private func saveFailed(_ file: SourceFile, _ error: Error) {
+        stashRecovery(file.text, for: file, label: "unsaved-contract")
+        setStatus(.failed("Not saved: \(error). The source buffer is retained; see pondside://contract."))
     }
 
     /// Resolve a conflict in favour of the buffer or the disk. The losing
@@ -507,6 +666,7 @@ final class ScoreDocument {
         file.text = diskText
         file.sync.noteSynced(diskText)
         refreshGraph()
+        scheduleAudit()
     }
 
     func stashRecovery(_ contents: String, for file: SourceFile, label: String) {
@@ -558,13 +718,14 @@ final class ScoreDocument {
         for f in files { f.pendingSnapshot = (try? String(contentsOf: f.url, encoding: .utf8)) ?? f.text }
         let out = workDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         let daemon = self.daemon
+        let texts = files.map { $0.pendingSnapshot ?? $0.text }
         renderTask = Task { [weak self] in
             guard let self else { return }
             if needsStop { await daemon?.stop() }
             await prior?.value
             guard !Task.isCancelled, self.renderGeneration == generation else { return }
             self.compilingGeneration = generation
-            let outcome = await Self.compile(engraver, source: source, out: out)
+            let outcome = await Self.compile(engraver, source: source, out: out, texts: texts)
             if self.compilingGeneration == generation { self.compilingGeneration = nil }
             guard !Task.isCancelled, self.renderGeneration == generation else { return }
             self.renderTask = nil
@@ -747,18 +908,23 @@ final class ScoreDocument {
     private struct Outcome: Sendable {
         var result: EngraveResult?
         var pages: [EngravedPage]
+        var overflows: [SystemOverflow] = []
         /// The SVGs the pages came from, for the render cache.
         var svgs: [Data] = []
         var error: String?
     }
 
     /// Runs off the main actor: the compile and the SVG parsing.
-    nonisolated private static func compile(_ engraver: LilyPondEngraver, source: URL, out: URL) async -> Outcome {
+    /// `texts`: the files as engraved, to tell whether automatic line breaks
+    /// are off (only then is an overflowing system looked for).
+    nonisolated private static func compile(_ engraver: LilyPondEngraver, source: URL, out: URL, texts: [String]) async -> Outcome {
         defer { try? FileManager.default.removeItem(at: out) }
         do {
             let result = try await engraver.engrave(source, purpose: .canvas, outputDirectory: out)
             let svgs = result.outputFiles.compactMap { try? Data(contentsOf: $0) }
-            return Outcome(result: result, pages: svgs.map(EngravedPage.init(svg:)), svgs: svgs, error: nil)
+            let pages = svgs.map(EngravedPage.init(svg:))
+            let overflows = SystemOverflow.applies(toSources: texts) ? SystemOverflow.detect(in: pages) : []
+            return Outcome(result: result, pages: pages, overflows: overflows, svgs: svgs, error: nil)
         } catch {
             return Outcome(result: nil, pages: [], error: String(describing: error))
         }
@@ -794,6 +960,7 @@ final class ScoreDocument {
             // so the score never blanks out mid-thought.
             if !outcome.pages.isEmpty {
                 pages = outcome.pages
+                overflows = outcome.overflows
                 distributeLinks()
                 for f in files { f.engravedText = f.pendingSnapshot }
                 showingCachedRender = false

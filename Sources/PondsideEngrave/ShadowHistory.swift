@@ -25,6 +25,27 @@ public struct ShadowHistory: Sendable {
         ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"].first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
+    /// A git that actually runs, or nil. On macOS `/usr/bin/git` exists on
+    /// every Mac but is only a stub until the Command Line Tools or Xcode are
+    /// installed; run then, it shows Apple's install dialog and fails. So the
+    /// stub is used only when a developer directory with a real git exists,
+    /// and any candidate must answer `git --version`. Blocking: call it off
+    /// the main thread.
+    public static func workingGit() -> String? {
+        for path in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
+        where FileManager.default.isExecutableFile(atPath: path) {
+            #if os(macOS)
+            if path == "/usr/bin/git" {
+                guard let dir = try? ProcessRunner.runBlocking("/usr/bin/xcode-select", ["-p"]), dir.status == 0 else { continue }
+                let developer = dir.stdoutString.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard FileManager.default.isExecutableFile(atPath: developer + "/usr/bin/git") else { continue }
+            }
+            #endif
+            if let out = try? ProcessRunner.runBlocking(path, ["--version"]), out.status == 0 { return path }
+        }
+        return nil
+    }
+
     public struct Checkpoint: Sendable, Hashable {
         public var revision: String
         public var date: String

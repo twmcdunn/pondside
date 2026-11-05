@@ -196,6 +196,22 @@ final class SourceEditorView: NSView, NSTextViewDelegate {
         textView.undoManager?.setActionName(actionName)
     }
 
+    /// The same undoable edit in `key`'s own view, shown or not, so an edit
+    /// to another file never swaps the visible one in and out. Returns the
+    /// file's new text, or nil when it has no view yet.
+    func replace(_ range: NSRange, with string: String, actionName: String, in key: URL) -> String? {
+        guard let view = views[key] else { return nil }
+        if view === textView {
+            replace(range, with: string, actionName: actionName)
+            return textView.string
+        }
+        guard view.shouldChangeText(in: range, replacementString: string) else { return nil }
+        view.textStorage?.replaceCharacters(in: range, with: NSAttributedString(string: string, attributes: baseAttributes))
+        view.didChangeText()
+        view.undoManager?.setActionName(actionName)
+        return view.string
+    }
+
     func select(_ range: NSRange, scroll: Bool = true) {
         let length = (textView.string as NSString).length
         let clamped = NSRange(location: min(range.location, length), length: min(range.length, max(0, length - range.location)))

@@ -99,7 +99,7 @@ public enum StructuralMigration {
         return .init(file: file, edits: [TextEdit(lo..<hi, diff.replacement)])
     }
 
-    private struct Output {
+    fileprivate struct Output {
         var rows: [[String]]
         var fingerprint: [String]
     }
@@ -115,7 +115,7 @@ public enum StructuralMigration {
             + ["New events after migration:"] + added.prefix(12)).joined(separator: "\n")
     }
 
-    private struct Workspace {
+    struct Workspace {
         let directory: URL
         let destinations: [String: URL]
         let originals: [StructuralEditing.File]
@@ -139,12 +139,14 @@ public enum StructuralMigration {
             destinations.reduce(text) { $0.replacingOccurrences(of: $1.value.path, with: $1.key) }
         }
 
-        func evaluate(_ files: [StructuralEditing.File], installation: LilyPondInstallation, phase: Stage) async throws -> Output {
-            try Task.checkCancellation()
+        /// Writes `files` to their staged paths, includes pointing at the
+        /// staged copies. `rootText` replaces the root's text when given.
+        func write(_ files: [StructuralEditing.File], rootText: String? = nil) throws {
             for file in files {
                 guard let destination = destinations[file.id] else { continue }
+                let tree = file.id == root ? rootText.map { file.parse($0) } ?? file.tree : file.tree
                 var edits: [TextEdit] = []
-                for include in file.tree.includes {
+                for include in tree.includes {
                     let resolved = SourceGraph.resolve(include.path, from: URL(fileURLWithPath: file.id), root: URL(fileURLWithPath: root), exists: { url in destinations[url.path] != nil || FileManager.default.fileExists(atPath: url.path) })
                     if let resolved, let target = destinations[resolved.path] {
                         let path = target.path.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -152,8 +154,13 @@ public enum StructuralMigration {
                     }
                 }
                 try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try Data(edits.apply(to: file.tree.text).utf8).write(to: destination, options: .atomic)
+                try Data(edits.apply(to: tree.text).utf8).write(to: destination, options: .atomic)
             }
+        }
+
+        fileprivate func evaluate(_ files: [StructuralEditing.File], installation: LilyPondInstallation, phase: Stage) async throws -> Output {
+            try Task.checkCancellation()
+            try write(files)
             let settingsURL = directory.appendingPathComponent("analysis.ily")
             try Data(settings.utf8).write(to: settingsURL)
             let output = try await ProcessRunner.run(installation.executable,

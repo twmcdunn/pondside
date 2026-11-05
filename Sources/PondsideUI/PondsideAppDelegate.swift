@@ -26,15 +26,19 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
     private var openedFromLaunch = false
     private let recentMenu = NSMenu(title: "Open Recent")
     private var lightsOut = UserDefaults.standard.bool(forKey: "Pondside.lightsOut")
+    /// Playback following, on unless turned off.
+    private(set) var followPlayback = UserDefaults.standard.object(forKey: "Pondside.followPlayback") as? Bool ?? true
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = buildMenu()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        ScoreDocument.detectCheckpointGit()
         // Scripts and agents follow the app over a socket (docs/API.md).
         AppRPC.shared.app = self
         AppRPC.shared.start()
+        SettingsPanels.installEscape()
         if let cache = ScoreDocument.renderCache {
             Task.detached(priority: .background) { cache.prune() }
         }
@@ -65,6 +69,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         AppRPC.shared.stop()
         controllers.forEach { $0.score.flushPendingSaves(); $0.flushSuperCollider() }
         SCLangHost.shared.shutdown()
+        NoteAudition.shared.shutdown()
     }
 
     func windowDidClose(_ controller: DocumentWindowController) {
@@ -114,6 +119,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             let document = try ScoreDocument(url: url)
             let controller = DocumentWindowController(document: document)
             controller.lightsOut = lightsOut
+            controller.followsPlayback = followPlayback
             controllers.append(controller)
             controller.showWindow(nil)
             NSDocumentController.shared.noteNewRecentDocumentURL(url)
@@ -195,6 +201,25 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         lightsOutItem?.state = lightsOut ? .on : .off
     }
 
+    @objc func toggleFollowPlayback(_ sender: Any?) {
+        followPlayback.toggle()
+        UserDefaults.standard.set(followPlayback, forKey: "Pondside.followPlayback")
+        controllers.forEach { $0.followsPlayback = followPlayback }
+        followPlaybackItem?.state = followPlayback ? .on : .off
+        SettingsWindowController.shared.refreshToggles()
+    }
+
+    var hearNotes: Bool { NoteAudition.shared.isEnabled }
+
+    @objc func toggleHearNotes(_ sender: Any?) {
+        NoteAudition.shared.isEnabled.toggle()
+        hearNotesItem?.state = hearNotes ? .on : .off
+        let key = controllers.first { $0.window?.isKeyWindow == true } ?? controllers.first
+        key?.flash(hearNotes ? "Hear Selected Notes on (⌥N)" : "Hear Selected Notes off (⌥N)")
+        if hearNotes { key?.prepareNoteAudition() }
+        SettingsWindowController.shared.refreshToggles()
+    }
+
     @objc func showAbout(_ sender: Any?) {
         let credits = NSAttributedString(
             string: """
@@ -212,10 +237,14 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         ])
     }
 
-    func validateMenuItem(_ item: NSMenuItem) -> Bool { true }
+    /// Reached only when no score window answers: window commands that need
+    /// a score stay greyed rather than beeping.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool { item.commandID != "file.revert" }
 
     /// The menu item's checkmark follows the setting wherever it changes.
     private weak var lightsOutItem: NSMenuItem?
+    private weak var followPlaybackItem: NSMenuItem?
+    private weak var hearNotesItem: NSMenuItem?
 
     // MARK: Commands
 
@@ -225,6 +254,8 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         case "file.new": newDocument(nil)
         case "file.open": openDocument(nil)
         case "view.lightsOut": toggleLightsOut(nil)
+        case "view.followPlayback": toggleFollowPlayback(nil)
+        case "view.hearNotes": toggleHearNotes(nil)
         case "help.about": showAbout(nil)
         case "help.settings": SettingsWindowController.shared.show()
         default: NSSound.beep()
@@ -277,6 +308,7 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
             command("file.engravingSettings"),
             command("file.lilypond"),
             command("file.migrateScore"),
+            command("file.revert"),
             .separator(),
             command("file.exportPDF"),
             command("file.reveal"),
@@ -313,6 +345,10 @@ final class PondsideAppDelegate: NSObject, NSApplicationDelegate, NSMenuItemVali
         view += [.separator(), center.menuItem("view.fullScreen", action: #selector(NSWindow.toggleFullScreen(_:)))]
         lightsOutItem = view.first { $0.commandID == "view.lightsOut" }
         lightsOutItem?.state = lightsOut ? .on : .off
+        followPlaybackItem = view.first { $0.commandID == "view.followPlayback" }
+        followPlaybackItem?.state = followPlayback ? .on : .off
+        hearNotesItem = view.first { $0.commandID == "view.hearNotes" }
+        hearNotesItem?.state = hearNotes ? .on : .off
         submenu("View", view)
         submenu("Window", [
             item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"),
@@ -419,5 +455,45 @@ private extension NSMenuItem {
     func tagged(_ tag: Int) -> NSMenuItem {
         self.tag = tag
         return self
+    }
+}
+
+/// ⎋ closes any settings panel: Settings, Engraving Settings, Score Setup.
+/// The score panels float without taking the keyboard, so ⎋ in the score
+/// window closes them too (DocumentWindowController.intercept), after it
+/// stops playback.
+@MainActor
+enum SettingsPanels {
+    private static var monitor: Any?
+
+    static func isSettingsPanel(_ window: NSWindow) -> Bool {
+        window.windowController is SettingsWindowController || window is EngravingSettingsPanel || window is ScoreSetupPanel
+    }
+
+    /// For a panel that has the keyboard (its text field, list or button).
+    static func installEscape() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.numericPad, .function, .capsLock])
+            guard event.keyCode == 53, flags.isEmpty else { return event }
+            let closed = MainActor.assumeIsolated { () -> Bool in
+                guard let window = event.window, window.attachedSheet == nil, isSettingsPanel(window) else { return false }
+                close(window)
+                return true
+            }
+            return closed ? nil : event
+        }
+    }
+
+    /// Closes the frontmost visible score panel; false when none is open.
+    static func closeFloating() -> Bool {
+        guard let panel = NSApp.orderedWindows.first(where: { ($0 is EngravingSettingsPanel || $0 is ScoreSetupPanel) && $0.isVisible })
+        else { return false }
+        close(panel)
+        return true
+    }
+
+    private static func close(_ window: NSWindow) {
+        if window is NSPanel { window.orderOut(nil) } else { window.close() }
     }
 }

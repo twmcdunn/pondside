@@ -18,6 +18,21 @@ graphic notation on a shared Scheme kit with the agent workflow around it
   itself (listeners compiled into the engraving), not from re-implementing
   its semantics. Pondside's own models (the CST, the lens) are checked
   against it.
+- **All UI is instant.** A control, key or click shows its result in the
+  same frame; nothing the user touches waits on LilyPond, the disk, a
+  whole-project check or a parse of every file. Slow work runs off the
+  main thread or after the frame that shows the change, and the UI shows
+  the expected outcome optimistically: the toggle flips, the edit lands,
+  the progress indicator stops the moment its outcome is known. When the
+  slow work then disagrees, Pondside takes the change back with passive
+  red feedback (an edit-rejection notice), not a dialog. A wait the user
+  must see (an engraving, a probe still running after the edit) is a
+  status activity that starts animating only after 300 ms and stops as
+  soon as nothing is pending. Per-interaction main-thread work is
+  budgeted in milliseconds: measure it on a real score (release build)
+  before assuming it is cheap. Examples (§10, Engraving Settings): meter
+  changes verified by `MeterProbe`, settings toggles, system-break
+  progress, the autosave contract audit.
 - **Portable core, disposable shell.** Everything below `PondsideUI` builds
   and tests on Linux. The AppKit front end is a client of the portable
   modules.
@@ -525,9 +540,22 @@ the kit turns them into the stencil.
 | shapes | `(dot x y r)`, `(stroke pts thick)`, `(fill pts)`, `(wedge x0 x1 h0 h1)`, `(curve pts thick)`, `(text x y markup)`, with `gray` |
 
 The kit handles line breaks. An entry draws as if the span were one strip,
-and the kit cuts the strip at each system and shifts each piece. Entries
-that care (a ripple that restarts its phase each line) can ask
-`(g-pieces g)` instead.
+and the kit cuts the strip at each system, clips every shape to its piece
+(a stroke or fill crossing a break is drawn in two parts, never into the
+margins) and shifts each piece. Entries that care (a ripple that restarts
+its phase each line) can ask `(g-pieces g)` instead.
+
+Graphics reach the ends of their systems, like the staves around them. A
+piece that goes on past its system ends where that system's staff lines end
+(the widest StaffSymbol on it), not at its last note, and a span stopped on
+the first note of a system ends with the system before: the sliver LilyPond
+leaves there is dropped (the `to-barline` idea, done in Scheme because
+2.24's TextSpanner may not know the property). `(g-staff-span g)` gives the
+system's staff lines on a piece and `(staff-lines (y …) thick)` draws lines
+that stand in for a staff out to both ends of every system they continue
+on. Scores whose graphics are their own Scheme get the same through the
+graphic-notation skill's `staff-span` helper (`score_context` says whether
+it exists: `section_support.staff_span`).
 
 ### The entry contract
 
@@ -934,6 +962,15 @@ in-app audition, the shadow history and the CLI installer (§10).
   would only rename chords. Revisit with M5's editor.
 - Inserting before a staff's first note is still unsupported; a click on
   empty staff after a note selects the insertion anchor and octave.
+- The last main-thread contract check (noted 2026-11-04): a GUI structural
+  edit (meter, break, Finish Unmetered Bar) made within about half a
+  second of a Source edit, before the background audit of that edit
+  finishes (`ScoreDocument.scheduleAudit`, 400 ms pause then
+  `StructuralEditing.validate` off the main thread), runs `validate`
+  itself, paying about 165 ms once on a 4,000-line score. To remove it,
+  those edits could wait for the pending background audit, showing
+  progress (a status activity), instead of running the check themselves
+  (§0, "All UI is instant"; §10, Engraving Settings).
 
 **M5: editor and toolchains**
 
@@ -1031,8 +1068,11 @@ second score file.
   and tuplets and `\repeat tremolo` scale.
 - **What the writer spells out.** Explicit accidentals, by LilyPond's
   default rule per voice and measure.
-- **Attached after parsing.** Slurs, tuplet brackets and tremolos, all of
-  which the importer drops.
+- **Attached after parsing.** Slurs, tuplet brackets, tremolos, dynamics
+  and hairpins, all of which the importer drops. A dynamic becomes a voice
+  element just before its chord (inserted before tuplets, which record
+  element indices); a hairpin hangs on its start chord like a slur and ends
+  at its `\!`, the next dynamic or the next hairpin, inside the window.
 - **What the importer can't do.** Manual or feathered beams.
 - **Presentation** (HIG Popovers and Loading; `.claude/skills/pondside-ui`).
   - **Popover:** an `NSPopover` above the edited staff, on paper a shade
@@ -1139,12 +1179,53 @@ whole-project validator. Metered entry checks only changed measure bodies
 for overflow. Prepared CSTs are adopted directly, without reloading or
 reparsing unchanged includes. Autosave recognizes revisions produced by
 these constrained commands (and their undo); arbitrary Source edits retain
-their separate audit. Shared meter lookup indexes the root once per lens
+their separate audit. That audit (`verifyLengths`, 165 ms on a
+4,000-line score) and the dependency read run off the main thread in the
+timed autosave; the disk transaction then runs on the main thread only if
+the texts are still those audited (an edit meanwhile cancels the save and
+schedules its own). A flush that must finish before returning (closing,
+quitting, resolving a conflict) still saves synchronously. Shared meter lookup indexes the root once per lens
 build, and mode availability reuses that lens instead of building it again.
 Note entry does not invoke migration or a blocking interpreter compile. Opaque timing remains LilyPond's job
 during normal background engraving. Unmetered changes update the shared
 length and preserve enough room for other voices' music. At a completed
 metered bar's final event, entry continues at the next wrapper in that voice.
+A meter shortened in a bar whose music comes from functions (`\showStaff`,
+an improvisation helper) can't be measured from the CST. `MeterProbe`
+asks LilyPond instead, without engraving: temporary copies of the
+snapshot are parsed with every book handler a no-op, and the root's
+helper, instrumented in the copy only, prints each body's length as
+`pondsideMeasure` computes it (an elastic full-bar rest counts as 0). It
+is its own process, never queued behind the canvas daemon, and takes
+about 0.4 s cold on LilyPond 2.26 for a 130-body score, against 4 s for
+its engraving. When the music visible in the source already fits, the
+edit is applied at once (optimistic) and the probe confirms it. It joins
+the undo history only when the probe accepts it (or cannot tell), so an
+edit the probe refuses is taken back outside the history, leaving no Undo
+or Redo of a meter that never fit; NSUndoManager cannot drop a single
+redo, and clearing it with a no-op leaves an empty step that swallows the
+next ⌘Z. "Meter too short for content" then appears as the red notice described below,
+in the Notation Lens when it is open, otherwise on the page. When the
+visible music alone is too long, the edit waits for the probe, shown as
+the "Measuring bar" status activity. A probe that fails proves nothing:
+an applied edit stays (the engraving reports a real overflow) and a
+waiting one is refused.
+Instant UI (§0) in this panel and its commands, measured on a 4,000-line
+score: a settings toggle shows its new value in the same frame and edits
+the root on the next run-loop turn, in the root's own text view rather
+than by showing the root and switching back; `EngravingSettingsDocument`
+reads the other files' lines once and indexes their words (380 ms to
+13 ms for all values). Meter, break and finish-unmetered-bar edits skip
+the whole-project validator (165 ms) when the project is at an audited
+revision: `ScoreDocument` remembers the texts that last passed
+`validate`, a built-in edit keeps an audited project audited (it preserves
+the contract by construction, but cannot detect damage made before it),
+and a Source or outside edit is audited off the main thread 400 ms after
+typing pauses. Only an edit made before that audit finishes runs the
+check synchronously. Undoing an agent's change checks the project off the
+main thread too. A break's progress icon goes
+the moment a toggle returns the breaks to what the page shows, so a
+second ↩ that takes back the first stops it at once.
 Overflow or a meter too short for another voice is passive inline feedback:
 an opaque label with an SF Symbol beside the selection and a short red
 caret pulse. It never takes focus, moves the music, or requires dismissal;
@@ -1194,13 +1275,28 @@ the selected shared measure's definition.
 - **Panes:** the Lexicon pane (§4). Agents run in the Terminal pane:
   opening a score writes `.mcp.json`, `opencode.json` and `.codex/config.toml` beside it, so
   `claude` or `opencode` there reaches Pondside through `pondside mcp`.
+- **Pane collapse** (⌥C, `␣ p f`; 2026-11-05): a pane folds to its edge
+  (the last to the trailing edge, the others to the leading edge) and the
+  open panes share the window; at least one stays open. Each open pane has
+  a small borderless button in the title bar strip above it, at the corner
+  it folds toward, arrow to the line (`arrow.left.to.line.compact`); a
+  folded pane leaves a plain arrow pointing away from its edge, on the open
+  neighbour, that brings it back. The strip covers no code or music. Only
+  the button ⌥C would press shows "⌥C" (the focused pane's, or the expand
+  button while anything is folded). Folding the focused pane moves the
+  keyboard to the nearest open pane; opening never takes focus (HIG). No
+  animation: the split jumps, so Reduce Motion needs nothing. `collapsed`
+  is saved with the layout (`PaneLayout`, older layouts decode without it);
+  fractions keep the open arrangement and come back on expand. Presets and
+  adding/removing a pane open everything. Stacked (rows) layouts line their
+  buttons up at the strip's trailing end.
 - **Source colouring** from the CST's token kinds (commands, strings,
   numbers, comments, Scheme, braces), as TextKit 2 rendering attributes, so
   undo and the text are untouched.
 - **File › LilyPond Version…** lists every installation; choosing one pins
   it in pondside.toml, which the app now honours as the CLI does.
 - **View › Play from Here** (⌘⇧P) plays the mockup from the selected bar,
-  timed by the score's own tempo map; again to stop.
+  timed by the score's own tempo map; again, or ⎋, to stop.
 - **Pondside › Install Command-Line Tool…** (Appendix A.11).
 
 ### Playback head (2026-11-01)
@@ -1217,10 +1313,20 @@ score.
   through the printed bars, and the mockup and the mix use the same track.
   Notes generated by the playback (trills, tremolos) have no origin; the
   head stays on the last printed note until the next one.
-- **Motion.** Between two notes on one system the line glides; crossing a
-  system or page it jumps. The canvas reveals a new system only when the
-  system changes, with `scrollToVisible` (an instant scroll, so Reduce
-  Motion needs no special case).
+- **Height.** The whole system: its band is the system's start delimiter
+  (`EngravedPage.systems`, the SystemStartBar from the top staff's top to
+  the bottom staff's bottom), so it also covers staves the page draws no
+  lines for, such as an electronics staff drawn by graphics. Pages without
+  a delimiter (single-staff systems) group staves by their gaps as before.
+- **Motion and following.** Between two notes on one system the line
+  glides; crossing a system or page it jumps. With View › Follow Playback
+  (⌥F, on by default, also in Settings › Playback) each new system glides
+  to the middle of the view (0.45 s ease; Reduce Motion jumps); between
+  systems nothing scrolls, so the user can scroll freely and the next
+  system brings the view back. Off, the view never moves by itself. The
+  same for the mockup and the mix.
+- **Stopping.** Either play command again, or ⎋, which stops playback
+  before it does anything else (close the lens, clear a selection).
 - **Appearance.** Solid `Theme.accent`, with a filled round cap: colour and
   shape together. No material, so Reduce Transparency changes nothing;
   Increase Contrast thickens the line and cap. It is drawn after Lights Out
@@ -1498,7 +1604,13 @@ handles on the legend's pages; ⎋ ends it.
    score's folder, so nothing is written into the project, not even a
    `.pondside/` folder, and no consent is needed). A checkpoint follows 30 s
    after the last save and on close; `pondside history` lists, shows and
-   restores.
+   restores, and File ▸ Revert to Checkpoint… (`␣ f h`) checkpoints the
+   current state, then restores a chosen checkpoint as one undoable edit.
+   Checkpoints need a git that runs (`ShadowHistory.workingGit`: on macOS
+   `/usr/bin/git` is only a stub until the Command Line Tools are
+   installed); without one nothing is kept and the command is greyed, with
+   a tool tip saying why, so the menu never promises a safety net that
+   isn't there.
 6. **Autosave races:** content-hash ownership, atomic writes, minimal-diff
    merges, and a conflict sheet with recovery files.
 7. **`\ecue`, not `\cue`** (LilyPond already has cue notes). Timing comes
@@ -1653,6 +1765,55 @@ immediately if that change is undone, including before the deferred write.
 These follow HIG Loading and Motion: show feedback immediately, keep the
 editing loop responsive, and use no motion when Reduce Motion is enabled.
 
+**Overflowing systems.** With `\autoLineBreaksOff` the systems are the
+user's, and one with more than fits runs into the right margin: LilyPond
+widens a line it cannot fit rather than squeeze its notes past their
+minimum distances. No spacing setting narrows it. Lowering
+`Score.SpacingSpanner.spacing-increment` (or `packed-spacing`,
+`strict-note-spacing`, `shortest-duration-space`) changes the ideal
+distances, which an overfull line no longer uses; on 2.26 a forced line 44
+staff spaces too long stayed exactly as long at increments 1.2 to 0.1. So
+Pondside never edits spacing or breaks for it. `SystemOverflow` finds such
+systems on the engraved pages (the right edge most staves share is the
+justified line's end; staves past it overflow; legend pages and
+ragged-right scores, with no shared edge in the outer quarter of the page,
+are skipped) in the render's own background step, with the SVG parsing, so
+note entry never waits for it. The page tints the overrun red past a rule at
+the margin with its amount ("+8.9 mm"), passive like the edit-rejection
+notice; the status bar says once which system and how far. `check` (CLI,
+MCP, the app's document state) lists them as `overflows`.
+
+`s` runs the same slur toggle as Space a s: selecting the full span again
+and repeating either command removes both endpoints. A slur can also be
+selected on its own: click its curve on the page (LilyPond links a slur to
+its `(`; slurs are hit on their drawn outline, not their bounding box, so
+empty staff under a slur still sets the insertion point) or in the
+Notation Lens (the renderer's curve hit test; the lens outlines the slur,
+since its renderer tints only notes and text). The selection is the
+opening mark in the source, so selecting `(`, `)`, `\(` or `\)` in the
+source pane is the same selection. Delete then removes both marks
+(`ScoreEditor.removeSlur`, which follows the slur's voice to its matching
+close) and selects the opening note; the slur's ink is hidden at once,
+before the engraving lands.
+
+Every other mark works the same way (`ScoreEditor.mark(at:)` and
+`removeMark(at:)`): LilyPond links an articulation, dynamic, hairpin,
+fermata, tie or text script to its own post-event, so a click on it (on the
+page, or on a dynamic, hairpin, articulation or fermata in the lens) selects
+that post-event and Delete removes it. A hairpin takes its `\!` along (not a
+dynamic that ends it), a manual beam its `]`, and a `-\tweak` just before a
+mark goes with it. A time signature links to its `\time`: Delete removes it
+from the music, or, with shared measures, returns the bar it began and the
+following bars in the same meter (up to the next change) to the meter
+before it (`StructuralEditing.planMeterRemoval`), with the same length
+checks, and LilyPond probe for function-generated bars, as Add Time
+Signature. The first bar's meter has nothing to return to and is refused. Escape in a lens with
+a note selection moves to cursor entry after the last selected note; a
+second Escape closes it. Footer hints reflect the current Escape action.
+This changes selection/presentation only, without editing source or waiting
+for engraving. Dismissing during queued input suppresses late automatic
+reopening; the next edit or explicit open can show the lens again.
+
 `=`, `-`, and `0` toggle visible sharp, flat, and natural accidentals on
 selected notes. With the entry cursor they arm that accidental for the next
 pitched note. Compact `♮ 0`, `♭ -`, and `♯ =` hint groups sit beside the
@@ -1674,6 +1835,15 @@ contextual pitch, preventing an automatic accidental from reappearing.
 Option-arrow pitch changes remove explicit display marks and retain normal
 LilyPond accidental suppression. `-` is exclusively the flat key; directed
 articulations remain available through `^` and `_` prefixes.
+
+The graphics request line opens before drawing dependencies and section
+timing are expanded. A frozen source/engraving/selection snapshot prepares
+the complete agent context on a worker; unchanged openings reuse that task.
+Only the detail label updates when preparation completes, preserving the
+typed request and focus. Endpoint lookups request musical context only,
+without repeating drawing expansion. Source, selection and engraving
+revisions are checked again before submission. Mode availability uses a
+cheap CST target check, deferring notation XML/layout until that mode opens.
 
 Ask Agent is an explicit document sheet, appropriate for a deliberate
 project request with target/file choices. It is separate from the transient

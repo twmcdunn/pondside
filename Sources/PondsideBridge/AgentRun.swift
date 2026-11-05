@@ -447,6 +447,9 @@ public struct AgentRun: Sendable {
     interpolated `from.at`/`to.at` moments are for music placement, never system identity or a visual boundary.
     Change only inside the marked range; never change a shared constant, base seed or table. If the request
     combines graphics with traditional notation, make both changes in that range (skill://lilypond when needed).
+    If the request sounds as if it reaches past the marked range ("all of them", "every system"), ask_user
+    first whether to change only the marked range or every place it occurs (both as choices); until the user
+    picks the wider one, change only inside the marked range.
     """
 
     static let emptySectionRules = """
@@ -461,6 +464,9 @@ public struct AgentRun: Sendable {
     Do not force a Lexicon entry for a one-off notation/layout change. The context's `from.at` and
     `to.at` are the moment at each edge, interpolated from the engraved notes; use them for timing,
     and use `from.x`/`to.x` for the visual boundary.
+    If the request sounds as if it reaches past the marked range ("all of them", "every system"), ask_user
+    first whether to change only the marked range or every place it occurs (both as choices); until the user
+    picks the wider one, change only inside the marked range.
     """
 
     public static func graphicsPrompt(request: String, context: String, score: URL,

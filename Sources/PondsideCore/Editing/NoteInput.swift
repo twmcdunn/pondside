@@ -32,6 +32,7 @@ public enum InputAction: Hashable, Sendable {
     case insertRest
     case delete
     case togglePostEvent(String)
+    case toggleSlur
     case select(step: Int, extend: Bool)
     case clearSelection
     case editSource
@@ -52,7 +53,8 @@ public enum InputAction: Hashable, Sendable {
 /// | `.` | toggle dot |
 /// | `↑` `↓` | diatonic step · `⇧` octave · `⌥` chromatic |
 /// | `←` `→` | previous / next object · `⇧` extends |
-/// | `( ) ~ [ ]` | slur, tie, beam: toggled on the selection |
+/// | `s` | toggle a slur over the selection (same as Space a s) |
+/// | `( ) ~ [ ]` | slur endpoints, tie, beam: toggled on the selection |
 /// | `=`, `-`, `0` | visible sharp, flat, natural: toggle selection or arm next note |
 /// | `^.` `^>` `^-` `_1` … | directed articulations and fingerings |
 /// | `\trill⏎` | any post-event command, typed as in LilyPond |
@@ -189,6 +191,8 @@ public struct NoteInput: Sendable {
             return [.insertNote(step: step)]
         case "r":
             return [.insertRest]
+        case "s":
+            return [.toggleSlur]
         case ".":
             if var armed = armedDuration { armed.dots = armed.dots == 0 ? 1 : 0; armedDuration = armed }
             return [.toggleDot]
@@ -208,6 +212,9 @@ public struct NoteInput: Sendable {
     static func isDurationPrefix(_ s: String) -> Bool {
         durations.contains { String($0).hasPrefix(s) }
     }
+
+    /// Cancel an unfinished key sequence without changing armed values.
+    public mutating func cancelPendingInput() { command = nil; direction = nil; digits = "" }
 
     public mutating func clearAccidental() { armedAccidental = nil }
 

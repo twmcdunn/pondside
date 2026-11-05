@@ -13,6 +13,12 @@ final class LensScoreHostView: NSView {
     var enteringNotes = false
     var onSelectEvent: ((Int, Bool) -> Void)?
     private var displayedSelectionHandler: ((Int, Bool) -> Void)?
+    /// A slur was clicked: its opening event and whether it is a phrasing slur.
+    var onSelectSlur: ((Int, Bool) -> Void)?
+    /// A mark other than a slur was clicked: its event and kind.
+    var onSelectMark: ((Int, LensMarkKind) -> Void)?
+    private var displayedMarkHandler: ((Int, LensMarkKind) -> Void)?
+    private var displayedSlurHandler: ((Int, Bool) -> Void)?
     private let scrollView = NSScrollView()
     private var document: LayoutDocument?
     private var target: VoiceElementID?
@@ -99,19 +105,29 @@ final class LensScoreHostView: NSView {
 
     private func install(_ lens: LensScoreWindow, score: Score, document: LayoutDocument, options: ScoreViewOptions, selectionHandler: ((Int, Bool) -> Void)?) {
         displayedSelectionHandler = selectionHandler
+        displayedSlurHandler = onSelectSlur
+        displayedMarkHandler = onSelectMark
         self.document = document
         self.lensWindow = lens
         self.renderedScore = score
 
         targetMeasure = lens.target?.measureIndex ?? 0
         let selected = LensScoreAdapter.items(of: lens, in: score)
-        let selection: ScoreSelection
+        var selection: ScoreSelection
         if let (id, item) = LensScoreAdapter.target(of: lens, in: score) {
             target = id
             selection = selected.count > 1 ? .multi(selected) : .single(item)
         } else {
             selection = selected.isEmpty ? .none : .multi(selected)
             target = nil
+        }
+        // A selected slur is outlined instead of its notes: the renderer
+        // tints notes and text only, so the outline is drawn here.
+        cursorView.slurRects = []
+        if !enteringNotes, let index = lens.selectedSlur,
+           let id = LensScoreAdapter.slurID(of: index, in: lens, score: score) {
+            selection = .none
+            cursorView.slurRects = ScoreHitTester(document: document).elementHitRects(for: .slur(id))
         }
 
         let view = ScoreView(document: document, score: score, options: options,
@@ -158,6 +174,16 @@ final class LensScoreHostView: NSView {
         guard let document, let lensWindow, let renderedScore,
               let view = scrollView.documentView else { return }
         let point = view.convert(event.locationInWindow, from: nil)
+        let hit = ScoreHitTester(document: document).hitTest(at: point)
+        if case .slur(let id)? = hit,
+           let slur = LensScoreAdapter.slur(for: id, in: lensWindow, score: renderedScore) {
+            displayedSlurHandler?(lensWindow.events[slur.start].sourceEvent, slur.phrasing)
+            return
+        }
+        if let (anchor, kind) = Self.mark(hit), let event = LensScoreAdapter.event(at: anchor, in: lensWindow, score: renderedScore) {
+            displayedMarkHandler?(event.sourceEvent, kind)
+            return
+        }
         if let item = document.editingHitTest(at: point, activeVoice: 0, nearMissTolerance: 4),
            let source = lensWindow.events.first(where: { source in
                guard source.measureIndex == item.measureIndex,
@@ -168,6 +194,17 @@ final class LensScoreHostView: NSView {
         } else if let measure = document.editingMeasureHit(at: point),
                   let source = lensWindow.events.first(where: { $0.measureIndex == measure.measureIndex && $0.notes.isEmpty }) {
             displayedSelectionHandler?(source.sourceEvent, event.modifierFlags.contains(.shift))
+        }
+    }
+
+    /// The chord a clicked mark belongs to, and its kind.
+    private static func mark(_ hit: ScoreHitTarget?) -> (VoiceElementID, LensMarkKind)? {
+        switch hit {
+        case .dynamic(let anchor)?: (anchor, .dynamic)
+        case .articulation(let anchor, _)?: (anchor, .articulation)
+        case .fermata(let anchor)?: (anchor, .fermata)
+        case .spanner(let anchor, .hairpin)?: (anchor, .hairpin)
+        default: nil
         }
     }
 
@@ -211,8 +248,18 @@ final class LensScoreHostView: NSView {
 @MainActor
 private final class LensCursorView: NSView {
     var cursor: CGPoint?
+    /// The selected slur's pieces, outlined like a selection on the page.
+    var slurRects: [CGRect] = []
     override var isFlipped: Bool { true }
     override func draw(_ dirtyRect: NSRect) {
+        for rect in slurRects {
+            let outline = NSBezierPath(roundedRect: rect.insetBy(dx: -3, dy: -3), xRadius: 3, yRadius: 3)
+            outline.lineWidth = 1.5
+            Theme.accent.withAlphaComponent(0.15).setFill()
+            outline.fill()
+            Theme.accent.setStroke()
+            outline.stroke()
+        }
         guard let cursor else { return }
         Theme.accent.setStroke()
         let line = NSBezierPath()
@@ -242,6 +289,7 @@ private actor LensLayoutWorker {
 
     nonisolated static func sameMusic(_ a: LensScoreWindow, _ b: LensScoreWindow) -> Bool {
         a.xml == b.xml && a.slurs == b.slurs && a.tuplets == b.tuplets
+            && a.dynamics == b.dynamics && a.hairpins == b.hairpins
             && a.tremolos == b.tremolos && a.reachesEnd == b.reachesEnd
             && a.events.map { $0.notes.map(\.forcesAccidental) } == b.events.map { $0.notes.map(\.forcesAccidental) }
     }

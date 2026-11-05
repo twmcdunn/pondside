@@ -22,7 +22,7 @@ public struct PlayheadTrack: Sendable {
         let map = TempoMap(log)
         let info = pages.map { page -> (staves: [Staff], systems: [ClosedRange<Double>]) in
             let staves = page.staves
-            return (staves, EngravedPage.systems(of: staves))
+            return (staves, EngravedPage.systems(of: staves, graphics: page.graphics))
         }
         var canonical: [String: String] = [:]
         func canon(_ path: String) -> String {

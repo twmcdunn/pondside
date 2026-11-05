@@ -74,6 +74,20 @@ public struct LensTremoloMark: Sendable, Hashable {
     public var between: Bool
 }
 
+/// A dynamic (`f`, `mp`, `sfz` …) on event `event` of the window.
+public struct LensDynamic: Sendable, Hashable {
+    public var event: Int
+    public var text: String
+}
+
+/// A hairpin from event `start` to the event that ends it (its `\\!`, the
+/// next dynamic or the next hairpin), in one voice and inside the window.
+public struct LensHairpin: Sendable, Hashable {
+    public var start: Int
+    public var end: Int
+    public var crescendo: Bool
+}
+
 /// A few measures of one staff around the selection, as MusicXML.
 public struct LensScoreWindow: Sendable {
     public var xml: String
@@ -81,9 +95,15 @@ public struct LensScoreWindow: Sendable {
     public var events: [LensEvent]
     /// The renderer's MusicXML import drops slurs, so they travel separately.
     public var slurs: [LensSlur] = []
+    /// The slur the selection is (its `(` or `)` alone), by index into
+    /// `slurs`: the lens marks it rather than a note.
+    public var selectedSlur: Int?
     /// Tuplet brackets and tremolos, which the import drops too.
     public var tuplets: [LensTupletSpan] = []
     public var tremolos: [LensTremoloMark] = []
+    /// Dynamics and hairpins, which the lens's MusicXML leaves out.
+    public var dynamics: [LensDynamic] = []
+    public var hairpins: [LensHairpin] = []
     /// What the lens can't show faithfully, for a badge.
     public var unsupported: [String]
     public var targetEvent: Int
@@ -108,6 +128,17 @@ public struct LensScoreWindow: Sendable {
     }
 
     public var target: LensEvent? { events.first { $0.isTarget } }
+
+    /// Sets `selectedSlur` from the source selection: the slur whose mark
+    /// the selection is exactly, else none. A strip reused for a new
+    /// selection must call this too, or it keeps the old slur.
+    public mutating func updateSelectedSlur(selection: Range<Int>, tree: SyntaxTree) {
+        selectedSlur = nil
+        guard let mark = ScoreEditor(tree).slurMark(at: selection.lowerBound), mark.range == selection else { return }
+        selectedSlur = slurs.firstIndex { slur in
+            slur.phrasing == mark.phrasing && events[mark.opens ? slur.start : slur.end].sourceEvent == mark.event
+        }
+    }
 
     /// The source event one step after (`step > 0`) or before the target,
     /// for ←→ in the lens. The walk stays in the target's voice and falls
@@ -165,6 +196,12 @@ public enum LensScoreBuilder {
     /// Divisions per quarter: divisible by 2…10, 12, 14, 16 and so on, so
     /// common tuplets come out exact.
     public static let divisions = 10080
+
+    /// Cheap mode availability: defer timeline/XML work until the lens opens.
+    public static func hasTarget(tree: SyntaxTree, selection: Range<Int>) -> Bool {
+        guard let target = targetEvent(tree: tree, selection: selection) else { return false }
+        return LensBlockFinder.block(in: tree, at: tree.events[target].range.lowerBound) != nil
+    }
 
     public static func build(tree: SyntaxTree, selection: Range<Int>, radius: Int = 4, structure: SyntaxTree? = nil) -> LensScoreWindow? {
         guard let target = targetEvent(tree: tree, selection: selection),
@@ -260,9 +297,39 @@ public enum LensScoreBuilder {
                                      reachesEnd: last == timeline.starts.count - 1)
         window.selected = selected
         window.slurs = slurs
+        window.updateSelectedSlur(selection: selection, tree: tree)
         window.tuplets = tuplets.sorted { $0.start < $1.start }
         window.tremolos = tremolos
+        (window.dynamics, window.hairpins) = dynamicMarks(events, tree: tree)
         return window
+    }
+
+    /// Each dynamic, and each hairpin that ends inside the window: at the
+    /// next `\\!`, dynamic or hairpin start in its voice, as in LilyPond.
+    /// Grace notes are skipped, as for slurs.
+    static func dynamicMarks(_ events: [LensEvent], tree: SyntaxTree) -> ([LensDynamic], [LensHairpin]) {
+        var dynamics: [LensDynamic] = []
+        var hairpins: [LensHairpin] = []
+        var open: [Int: (start: Int, crescendo: Bool)] = [:]
+        for (index, event) in events.enumerated() where !event.isGrace {
+            let marks = tree.events[event.sourceEvent].postEvents.map { post -> String in
+                let text = tree.string(post)
+                guard text.count > 1, let first = text.first, "-^_".contains(first) else { return text }
+                return String(text.dropFirst())
+            }
+            let ends = marks.contains { $0 == "\\!" || ScoreEditor.dynamics.contains($0) || ScoreEditor.hairpinStarts.contains($0) }
+            if ends, let hairpin = open[event.voiceIndex], hairpin.start != index {
+                hairpins.append(LensHairpin(start: hairpin.start, end: index, crescendo: hairpin.crescendo))
+                open[event.voiceIndex] = nil
+            }
+            for mark in marks {
+                if ScoreEditor.dynamics.contains(mark) { dynamics.append(LensDynamic(event: index, text: String(mark.dropFirst()))) }
+                if ScoreEditor.hairpinStarts.contains(mark) {
+                    open[event.voiceIndex] = (index, ["\\<", "\\cr", "\\cresc"].contains(mark))
+                }
+            }
+        }
+        return (dynamics, hairpins)
     }
 
     /// Pairs `(` with the next `)` in the same voice, and `\(` with `\)`.

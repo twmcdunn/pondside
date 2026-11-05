@@ -143,6 +143,27 @@ final class StructuralEditingTests: XCTestCase {
         XCTAssertEqual(StructuralEditing.time(in: after[0].tree, name: "pondsideBarA"), .init(beats: 3, beatType: 4))
     }
 
+    func testRemovingAMeterChangeReturnsItsBarsToThePreviousMeter() throws {
+        let files = try managed("flute = { \\time 4/4 c'1 | \\time 3/4 c'2. | c'2. | \\time 4/4 c'1 | c'1 }\nelectronics = { s1 | s2. | s2. | s1 | s1 }")
+        let root = files[0].tree
+        XCTAssertEqual(StructuralEditing.time(in: root, name: "pondsideBarB"), .init(beats: 3, beatType: 4))
+        // The click lands on the definition's `\time`.
+        let at = try XCTUnwrap(root.text.utf8.ranges(of: Array("pondsideBarB = { \\time".utf8)).first).upperBound
+        let offset = root.text.utf8.distance(from: root.text.utf8.startIndex, to: at) - 1
+        XCTAssertEqual(StructuralEditing.definition(in: root, containing: offset), "pondsideBarB")
+        let plan = try StructuralEditing.planMeterRemoval(measure: "pondsideBarB", files: files, root: "score.ly")
+        XCTAssertEqual(plan.measures, ["pondsideBarB", "pondsideBarC"])
+        XCTAssertEqual(plan.meter, .init(beats: 4, beatType: 4))
+        let after = apply(plan.changes, to: files)
+        for bar in ["pondsideBarA", "pondsideBarB", "pondsideBarC", "pondsideBarD"] {
+            XCTAssertEqual(StructuralEditing.time(in: after[0].tree, name: bar), .init(beats: 4, beatType: 4), bar)
+        }
+        XCTAssertEqual(after[1].tree.text, files[1].tree.text)
+        // Back to 3/4 at bar D: too short for its whole notes.
+        XCTAssertThrowsError(try StructuralEditing.planMeterRemoval(measure: "pondsideBarD", files: files, root: "score.ly"))
+        XCTAssertThrowsError(try StructuralEditing.planMeterRemoval(measure: "pondsideBarA", files: files, root: "score.ly"))
+    }
+
     func testShorterMeterNeverCutsSoundingContent() throws {
         let files = try managed()
         XCTAssertThrowsError(try StructuralEditing.changeMeter(.init(beats: 3, beatType: 4), measure: "pondsideBarA", files: files, root: "score.ly"))
@@ -349,6 +370,33 @@ final class StructuralEditingTests: XCTestCase {
         try StructuralEditing.validate(files, root: "score.ly")
         files[0] = file("score.ly", files[0].tree.text.replacingOccurrences(of: "\\new Staff \\flute", with: "\\new Staff { \\flute \\flute }"))
         XCTAssertThrowsError(try StructuralEditing.validate(files, root: "score.ly"))
+    }
+
+    func testInsertedBarsTakeFreshNamesWithoutRenamingAndKeepTheFollowingBreak() throws {
+        let files = try managed()
+        let after = apply(try StructuralEditing.insertMeasures(after: "pondsideBarA", count: 2, time: .init(beats: 3, beatType: 4),
+                                                               files: files, root: "score.ly"), to: files)
+        try StructuralEditing.validate(after, root: "score.ly")
+        let order = ["pondsideBarA", "pondsideBarD", "pondsideBarE", "pondsideBarB", "pondsideBarC"]
+        XCTAssertEqual(StructuralEditing.names(in: after[0].tree), order)
+        XCTAssertEqual(StructuralEditing.time(in: after[0].tree, name: "pondsideBarD"), .init(beats: 3, beatType: 4))
+        XCTAssertEqual(StructuralEditing.breakBefore("pondsideBarC", in: after[0].tree), .system)
+        let flute = StructuralEditing.measures(in: after[1].tree).prefix(5)
+        XCTAssertEqual(flute.map(\.name), order)
+        XCTAssertTrue(after[1].tree.string(flute[flute.startIndex + 3].body).contains("g1"))
+        XCTAssertEqual(after[1].tree.string(flute[flute.startIndex + 1].body), " s1*0 ")
+        // Bars added after the bar that ends a system: the break moves with
+        // them, still before the bar that followed.
+        let moved = apply(try StructuralEditing.insertMeasures(after: "pondsideBarB", count: 1, time: .common, files: files, root: "score.ly"), to: files)
+        try StructuralEditing.validate(moved, root: "score.ly")
+        XCTAssertEqual(StructuralEditing.breakBefore("pondsideBarC", in: moved[0].tree), .system)
+        XCTAssertNil(StructuralEditing.breakBefore("pondsideBarD", in: moved[0].tree))
+        // Names are identities; a later insertion never reuses one.
+        let again = apply(try StructuralEditing.insertMeasures(after: "pondsideBarA", count: 1, time: .common, files: after, root: "score.ly"), to: after)
+        XCTAssertEqual(StructuralEditing.names(in: again[0].tree), ["pondsideBarA", "pondsideBarF"] + order.dropFirst())
+        var duplicate = files
+        duplicate[0] = file("score.ly", files[0].tree.text.replacingOccurrences(of: "pondsideBarC = ", with: "pondsideBarA = "))
+        XCTAssertThrowsError(try StructuralEditing.validate(duplicate, root: "score.ly"))
     }
 
     func testAppendingMovesTheFinalBarlineToTheNewLastMeasure() throws {

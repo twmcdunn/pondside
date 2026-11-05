@@ -66,7 +66,11 @@ and ranges by line before LilyPond runs.
   Never `(random …)` without the state, never the clock.
 - **Coordinates.** u along the whole span in staff spaces (0 at the start, as
   if it were one strip); y in staff spaces from the middle line. The kit cuts
-  the strip at line breaks and shifts each piece; you draw the whole strip.
+  the strip at line breaks, clips every shape to its piece and shifts each
+  piece; you draw the whole strip. A piece that goes on past its system ends
+  at that system's staff end, and a span stopping on a system's first note
+  ends with the system before, so drawings reach the system's ends by
+  themselves: draw to `(g-width g)`, never stop short of it.
 - **Don't build stencils or touch grobs.** Return shapes; ask the kit for
   layout facts. That keeps entries short and robust.
 
@@ -81,13 +85,18 @@ and ranges by line before LilyPond runs.
 | `(g-u-at g moment)`, `(g-moment-at g u)` | between moments (whole notes) and u |
 | `(g-seconds g u)`, `(g-u-at-cue g "12")` | the score's time at u; where a cue falls |
 | `(g-staff-y g i)` | line i (0 = bottom) of a five-line staff |
+| `(g-staff-span g)` | this piece's system staff lines as (u-left . u-right): under the clef to the system's end |
+| `(g-continued? g)`, `(g-broken? g)` | this piece goes on from the system before / past its system |
 | `(g-clear-of g '(note-head-interface …))` | boxes (u0 u1 y0 y1) of those grobs on this staff |
 | `(g-inside? boxes u y pad)` | is the point in one of them |
 | `(env-at env q)` | an envelope's value (see the high-level skill's table) |
 
 Shapes: `(dot u y r)`, `(stroke ((u . y) …) thick)`, `(fill ((u . y) …))`,
 `(curve ((u . y) …) thick)`, `(wedge u0 u1 h0 h1 y)`, `(text u y markup)`,
-`(gray g shape)` with g 0 black … 1 white.
+`(gray g shape)` with g 0 black … 1 white, and `(staff-lines (y …) thick)`:
+lines that stand in for a staff (an electronics staff drawn by the graphic),
+across the span and, on a system it goes on from or past, out to that
+system's staff ends, like the real staves above and below.
 
 ### Patterns
 

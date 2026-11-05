@@ -56,14 +56,109 @@ public struct PaneLayout: Codable, Hashable, Sendable {
     /// Shares of the window, summing to 1.
     public var fractions: [Double]
     public var focused: Int
+    /// Panes folded away to their edge (⌥C): the others share their room.
+    /// At least one pane always stays open.
+    public var collapsed: Set<Int>
 
-    public init(name: String, axis: Axis = .columns, contents: [PaneContent], fractions: [Double]? = nil, focused: Int = 0) {
+    public init(name: String, axis: Axis = .columns, contents: [PaneContent], fractions: [Double]? = nil, focused: Int = 0,
+                collapsed: Set<Int> = []) {
         self.name = name
         self.axis = axis
         self.contents = contents
         let n = Double(max(contents.count, 1))
         self.fractions = fractions ?? Array(repeating: 1 / n, count: contents.count)
         self.focused = min(max(focused, 0), max(contents.count - 1, 0))
+        self.collapsed = collapsed.filter { contents.indices.contains($0) }
+        if self.collapsed.count >= contents.count { self.collapsed = [] }
+    }
+
+    private enum CodingKeys: String, CodingKey { case name, axis, contents, fractions, focused, collapsed }
+
+    /// Layouts saved before panes could collapse have no `collapsed`.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(name: try c.decode(String.self, forKey: .name),
+                  axis: try c.decodeIfPresent(Axis.self, forKey: .axis) ?? .columns,
+                  contents: try c.decode([PaneContent].self, forKey: .contents),
+                  fractions: try c.decodeIfPresent([Double].self, forKey: .fractions),
+                  focused: try c.decodeIfPresent(Int.self, forKey: .focused) ?? 0,
+                  collapsed: try c.decodeIfPresent(Set<Int>.self, forKey: .collapsed) ?? [])
+    }
+
+    // MARK: Collapsing
+
+    /// The edge a pane folds toward: the last pane to the trailing (or
+    /// bottom) edge, every other one to the leading (or top) edge.
+    public enum Edge: Sendable, Equatable { case leading, trailing }
+
+    public func collapseEdge(of i: Int) -> Edge { i == contents.count - 1 && contents.count > 1 ? .trailing : .leading }
+
+    public func isCollapsed(_ i: Int) -> Bool { collapsed.contains(i) }
+
+    /// Whether pane `i` may fold: it is open and another pane stays open.
+    public func canCollapse(_ i: Int) -> Bool {
+        contents.indices.contains(i) && !collapsed.contains(i) && contents.count - collapsed.count > 1
+    }
+
+    /// Folds pane `i`; focus moves to the nearest open pane.
+    public mutating func collapse(_ i: Int) {
+        guard canCollapse(i) else { return }
+        collapsed.insert(i)
+        if collapsed.contains(focused) { focused = nearestOpen(to: focused) }
+    }
+
+    /// Opens the collapsed panes in `indices` (all when nil).
+    public mutating func expand(_ indices: [Int]? = nil) {
+        collapsed.subtract(indices ?? Array(collapsed))
+    }
+
+    /// ⌥C: opens what is folded if anything is, else folds the focused pane.
+    /// Returns the panes it opened (empty when it folded one).
+    @discardableResult
+    public mutating func toggleCollapse() -> [Int] {
+        if !collapsed.isEmpty {
+            let opened = collapsed.sorted()
+            collapsed = []
+            return opened
+        }
+        collapse(focused)
+        return []
+    }
+
+    /// Each run of collapsed panes, and the open pane whose corner shows the
+    /// button that opens it: the pane after the run, or for a run at the
+    /// end, the pane before it. `side` is the corner of that open pane.
+    public struct CollapsedRun: Sendable, Equatable {
+        public var panes: [Int]
+        public var host: Int
+        public var side: Edge
+    }
+
+    public var collapsedRuns: [CollapsedRun] {
+        var runs: [CollapsedRun] = []
+        var i = 0
+        while i < contents.count {
+            guard collapsed.contains(i) else { i += 1; continue }
+            var j = i
+            while j + 1 < contents.count, collapsed.contains(j + 1) { j += 1 }
+            if j + 1 < contents.count {
+                runs.append(CollapsedRun(panes: Array(i...j), host: j + 1, side: .leading))
+            } else if i > 0 {
+                runs.append(CollapsedRun(panes: Array(i...j), host: i - 1, side: .trailing))
+            }
+            i = j + 1
+        }
+        return runs
+    }
+
+    /// The open pane nearest `i` (`i` itself when it is open).
+    public func nearestOpen(to i: Int) -> Int {
+        guard collapsed.contains(i) else { return i }
+        for d in 1..<max(contents.count, 2) {
+            if contents.indices.contains(i + d), !collapsed.contains(i + d) { return i + d }
+            if contents.indices.contains(i - d), !collapsed.contains(i - d) { return i - d }
+        }
+        return i
     }
 
     public static let presets: [PaneLayout] = [
@@ -79,7 +174,7 @@ public struct PaneLayout: Codable, Hashable, Sendable {
     /// Moves focus to the next pane, wrapping.
     public mutating func focusNext() {
         guard !contents.isEmpty else { return }
-        focused = (focused + 1) % contents.count
+        repeat { focused = (focused + 1) % contents.count } while collapsed.contains(focused) && collapsed.count < contents.count
     }
 
     /// Steps the focused pane through `available` content (skipping what
@@ -101,6 +196,7 @@ public struct PaneLayout: Codable, Hashable, Sendable {
     /// `share` of the window), or, if a pane shows it already, closes that
     /// pane and gives its room back. Focus stays on the pane it was on.
     public mutating func toggle(_ content: PaneContent, share: Double = 0.3) {
+        collapsed = []
         if let i = contents.firstIndex(of: content) {
             guard contents.count > 1 else { return }
             let freed = fractions.indices.contains(i) ? fractions[i] : 0
@@ -127,6 +223,7 @@ public struct PaneLayout: Codable, Hashable, Sendable {
     /// absent, open a new pane alongside the existing ones.
     public mutating func reveal(_ content: PaneContent, share: Double = 0.42) {
         if let existing = contents.firstIndex(of: content) {
+            collapsed.remove(existing)
             focused = existing
         } else {
             toggle(content, share: share)

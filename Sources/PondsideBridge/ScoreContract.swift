@@ -15,6 +15,8 @@ public enum ScoreContract {
     Keep that generated block, its helper implementations, marker flags and definitions intact.
     Each pondsideBar definition owns one literal meter, a skip of the same exact rational length,
     and optionally a final system/page break. Never edit the helper's Scheme implementation.
+    Bar names are unique identities, not positions: the definitions' order is the score's order.
+    A new bar takes an unused name (`pondsideBar` + capitals); never rename existing bars.
 
     Every score voice contains one `\\pondsideMeasure \\pondsideBarNAME { music }` wrapper for
     every shared definition, in the same order. Preserve all wrappers, including empty ones.

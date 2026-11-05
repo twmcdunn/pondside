@@ -334,6 +334,345 @@ public struct ScoreEditor: Sendable {
         return ScoreEdit(name: name, edits: edits, selectionAnchors: anchorsAfter(edits, events: sorted))
     }
 
+    // MARK: Slurs
+
+    /// One slur mark on an event: `(`, `)`, `\(` or `\)`, with any
+    /// direction (`^(`). `range` is the whole post-event.
+    public struct SlurMark: Sendable, Hashable {
+        public var event: Int
+        public var range: Range<Int>
+        public var phrasing: Bool
+        public var opens: Bool
+    }
+
+    /// A slur as written: its opening mark and the mark that closes it
+    /// (nil when the music never closes it).
+    public struct SlurSpan: Sendable, Hashable {
+        public var open: SlurMark
+        public var close: SlurMark?
+    }
+
+    /// The slur mark whose post-event contains `offset` (where LilyPond's
+    /// point-and-click puts a slur: on its opening `(`).
+    public func slurMark(at offset: Int) -> SlurMark? {
+        guard let e = tree.eventIndex(at: offset) else { return nil }
+        for r in events[e].postEvents where r.contains(offset) {
+            if let mark = slurMark(event: e, range: r) { return mark }
+        }
+        return nil
+    }
+
+    private func slurMark(event e: Int, range r: Range<Int>) -> SlurMark? {
+        var s = Substring(tree.string(r))
+        if s.count > 1, let first = s.first, "-^_".contains(first) { s = s.dropFirst() }
+        switch s {
+        case "(": return SlurMark(event: e, range: r, phrasing: false, opens: true)
+        case ")": return SlurMark(event: e, range: r, phrasing: false, opens: false)
+        case "\\(": return SlurMark(event: e, range: r, phrasing: true, opens: true)
+        case "\\)": return SlurMark(event: e, range: r, phrasing: true, opens: false)
+        default: return nil
+        }
+    }
+
+    /// The slur that the mark at `offset` opens or closes.
+    public func slur(at offset: Int) -> SlurSpan? {
+        guard let mark = slurMark(at: offset) else { return nil }
+        if mark.opens { return SlurSpan(open: mark, close: closingMark(for: mark)) }
+        // A closing mark: the nearest earlier opening of its kind that it
+        // closes. LilyPond ignores a second `(` while one is open, so the
+        // nearest opening is not always the one.
+        var checked = 0
+        for e in stride(from: mark.event, through: 0, by: -1) {
+            for r in events[e].postEvents.reversed() where r.upperBound <= mark.range.lowerBound {
+                guard let open = slurMark(event: e, range: r), open.opens, open.phrasing == mark.phrasing else { continue }
+                if closingMark(for: open)?.range == mark.range { return SlurSpan(open: open, close: mark) }
+                checked += 1
+                if checked > 32 { return nil }
+            }
+        }
+        return nil
+    }
+
+    /// Removes the slur whose mark is at `offset`: both its ends, so no
+    /// stray `)` is left to end another slur. The opening note is selected
+    /// afterwards.
+    public func removeSlur(at offset: Int) -> ScoreEdit? {
+        guard let span = slur(at: offset) else { return nil }
+        func removal(_ r: Range<Int>) -> TextEdit {
+            let joins = isWordByte(at: r.lowerBound - 1) && isWordByte(at: r.upperBound)
+            // A mark standing alone (`b') ( c`) takes one of its spaces along.
+            let space = UInt8(ascii: " ")
+            if tree.bytes[safe: r.lowerBound - 1] == space, tree.bytes[safe: r.upperBound] == space {
+                return TextEdit(r.lowerBound..<r.upperBound + 1, "")
+            }
+            return TextEdit(r, joins ? " " : "")
+        }
+        var edits = [removal(span.open.range)]
+        if let close = span.close { edits.append(removal(close.range)) }
+        let name = span.open.phrasing ? "Delete Phrasing Slur" : "Delete Slur"
+        return ScoreEdit(name: name, edits: edits, selectionAnchors: anchorsAfter(edits, events: [span.open.event]))
+    }
+
+    // MARK: Marks (articulations, dynamics, hairpins, text …)
+
+    /// One post-event on a note, as a click on its grob selects it:
+    /// LilyPond links an articulation, dynamic, hairpin or text script to
+    /// its own post-event, not to the note.
+    public struct Mark: Sendable, Hashable {
+        public var event: Int
+        public var range: Range<Int>
+        /// "Staccato", "Dynamic f", "Crescendo" …, for the status bar.
+        public var name: String
+        public var kind: Kind
+
+        public enum Kind: Sendable, Hashable {
+            case dynamic, hairpin, hairpinEnd, articulation, fermata, slur, beam, tie, text, other
+        }
+    }
+
+    /// The post-event whose text contains `offset` (slurs included).
+    public func mark(at offset: Int) -> Mark? {
+        guard let e = tree.eventIndex(at: offset),
+              let r = events[e].postEvents.first(where: { $0.contains(offset) }) else { return nil }
+        let text = core(of: r)
+        return Mark(event: e, range: r, name: Self.markName(text), kind: Self.markKind(text))
+    }
+
+    /// Removes the mark at `offset`. A slur, beam or hairpin loses its end
+    /// too, so no stray `)`, `]` or `\!` is left to end another; a hairpin
+    /// that ends on a dynamic keeps that dynamic. A `-\tweak` standing
+    /// just before the mark goes with it. The note is selected afterwards.
+    public func removeMark(at offset: Int) -> ScoreEdit? {
+        if let slur = removeSlur(at: offset) { return slur }
+        guard let mark = mark(at: offset) else { return nil }
+        let text = core(of: mark.range)
+        var ranges = [mark.range]
+        if let tweak = events[mark.event].postEvents.last(where: { $0.upperBound <= mark.range.lowerBound }),
+           isTweak(tweak), tree.bytes[tweak.upperBound..<mark.range.lowerBound].allSatisfy({ [0x20, 0x09, 0x0A].contains($0) }) {
+            ranges.insert(tweak, at: 0)
+        }
+        if text == "[" {
+            if let close = closingPostEvent(after: mark.range, event: mark.event, where: { core(of: $1) == "]" }) {
+                ranges.append(close.range)
+            }
+        } else if Self.hairpinStarts.contains(text) {
+            // The hairpin ends at the next `\!`, dynamic or hairpin.
+            if let end = closingPostEvent(after: mark.range, event: mark.event, where: { _, r in
+                let t = core(of: r)
+                return t == "\\!" || Self.hairpinStarts.contains(t) || Self.dynamics.contains(t)
+            }), core(of: end.range) == "\\!" {
+                ranges.append(end.range)
+            }
+        }
+        let edits = ranges.map(markRemoval)
+        return ScoreEdit(name: "Delete \(mark.name)", edits: edits, selectionAnchors: anchorsAfter(edits, events: [mark.event]))
+    }
+
+    /// The removal of one post-event, leaving neither a double space nor
+    /// two tokens fused (`c4~8` must not become `c48`).
+    private func markRemoval(_ r: Range<Int>) -> TextEdit {
+        let space = UInt8(ascii: " ")
+        if tree.bytes[safe: r.lowerBound - 1] == space, tree.bytes[safe: r.upperBound] == space {
+            return TextEdit(r.lowerBound..<r.upperBound + 1, "")
+        }
+        let joins = isWordByte(at: r.lowerBound - 1) && isWordByte(at: r.upperBound)
+        return TextEdit(r, joins ? " " : "")
+    }
+
+    /// The post-event without its direction (`^\f` → `\f`, `-.` stays).
+    private func core(of r: Range<Int>) -> String {
+        let s = tree.string(r)
+        if s.count > 1, let first = s.first, "-^_".contains(first) {
+            let rest = s.dropFirst()
+            // `-.`, `-^`, `--`, `->`, `-_`, `-!`, `-+`: the articulation itself.
+            if rest.count == 1, ".^-_>!+|".contains(rest.first!) { return s }
+            return String(rest)
+        }
+        return s
+    }
+
+    private func isTweak(_ r: Range<Int>) -> Bool {
+        let c = core(of: r)
+        return c.hasPrefix("\\tweak") && !c.contains("\\markup")
+    }
+
+    static let hairpinStarts: Set<String> = ["\\<", "\\>", "\\cr", "\\decr", "\\cresc", "\\dim", "\\decresc"]
+    static let dynamics: Set<String> = [
+        "\\ppppp", "\\pppp", "\\ppp", "\\pp", "\\p", "\\mp", "\\mf", "\\f", "\\ff", "\\fff", "\\ffff", "\\fffff",
+        "\\fp", "\\sf", "\\sff", "\\sp", "\\spp", "\\sfz", "\\rfz", "\\n",
+    ]
+
+    static func markKind(_ text: String) -> Mark.Kind {
+        if dynamics.contains(text) { return .dynamic }
+        if hairpinStarts.contains(text) { return .hairpin }
+        switch text {
+        case "\\!": return .hairpinEnd
+        case "(", ")", "\\(", "\\)": return .slur
+        case "[", "]": return .beam
+        case "~": return .tie
+        default: break
+        }
+        if text.hasSuffix("fermata") || text == "\\fermataMarkup" { return .fermata }
+        if text.count == 2, text.first == "-" { return text.last!.isNumber ? .other : .articulation }
+        if text.first == "\"" || text.hasPrefix("\\markup") { return .text }
+        if text.hasPrefix("\\"), articulationNames.contains(String(text.dropFirst())) { return .articulation }
+        return .other
+    }
+
+    /// script-init.ly's articulations and ornaments.
+    static let articulationNames: Set<String> = [
+        "accent", "marcato", "staccatissimo", "staccato", "tenuto", "portato", "espressivo",
+        "thumb", "lheel", "rheel", "ltoe", "rtoe", "open", "halfopen", "snappizzicato", "stopped",
+        "turn", "reverseturn", "trill", "prall", "mordent", "prallprall", "prallmordent", "upprall",
+        "downprall", "upmordent", "downmordent", "pralldown", "prallup", "lineprall", "signumcongruentiae",
+        "flageolet", "upbow", "downbow", "ictus", "accentus", "circulus", "semicirculus", "haydnturn", "slashturn",
+        "segno", "coda", "varcoda",
+    ]
+
+    static func markName(_ text: String) -> String {
+        if dynamics.contains(text) { return "Dynamic \(text.dropFirst())" }
+        if hairpinStarts.contains(text) { return text == "\\>" || text == "\\decr" || text == "\\dim" || text == "\\decresc" ? "Diminuendo" : "Crescendo" }
+        switch text {
+        case "\\!": return "Hairpin End"
+        case "-.", "\\staccato": return "Staccato"
+        case "->", "\\accent": return "Accent"
+        case "--", "\\tenuto": return "Tenuto"
+        case "-^", "\\marcato": return "Marcato"
+        case "-!", "\\staccatissimo": return "Staccatissimo"
+        case "-_", "\\portato": return "Portato"
+        case "-+", "\\stopped": return "Stopped"
+        case "~": return "Tie"
+        case "[": return "Beam"
+        case "]": return "Beam End"
+        case "\\startTrillSpan": return "Trill"
+        case "\\glissando": return "Glissando"
+        case "\\arpeggio": return "Arpeggio"
+        default: break
+        }
+        if text.first == "\"" || text.hasPrefix("\\markup") { return "Text" }
+        if text.first?.isNumber == true || text.hasPrefix("\\finger") { return "Fingering" }
+        if text.hasPrefix("\\"), let word = text.dropFirst().split(whereSeparator: { !$0.isLetter }).first, !word.isEmpty {
+            return word.prefix(1).uppercased() + word.dropFirst()
+        }
+        return "Mark"
+    }
+
+    // MARK: Time signatures
+
+    /// The `\\time n/d` command whose `\\time` holds `offset`, where
+    /// LilyPond links the time signature it prints.
+    public func timeSignature(at offset: Int) -> Range<Int>? {
+        var leaves: [SyntaxNode] = []
+        tree.root.forEachLeaf { leaf in
+            if leaf.range.upperBound > offset, leaf.range.lowerBound < offset + 64 { leaves.append(leaf) }
+        }
+        guard let first = leaves.first, first.kind == .command, first.range.contains(offset),
+              tree.string(first.range) == "\\time" else { return nil }
+        var end = first.range.upperBound
+        var numbers = 0
+        for leaf in leaves.dropFirst() {
+            if leaf.kind.isTrivia { continue }
+            let text = tree.string(leaf.range)
+            guard leaf.kind == .number || text == "/" || text == "," else { break }
+            if leaf.kind == .number { numbers += 1 }
+            end = leaf.range.upperBound
+        }
+        return numbers >= 2 ? first.range.lowerBound..<end : nil
+    }
+
+    /// Removes a `\\time` written in the music, so the meter before it
+    /// continues. (In a score with shared measures the meter belongs to the
+    /// bar's definition: see `StructuralEditing.planMeterRemoval`.)
+    public func removeTimeSignature(at offset: Int) -> ScoreEdit? {
+        guard let r = timeSignature(at: offset) else { return nil }
+        let edit = markRemoval(r)
+        let anchors = events.firstIndex { $0.range.lowerBound >= r.upperBound }.map { [edit].mapOffset(events[$0].range.lowerBound) }
+        return ScoreEdit(name: "Delete Time Signature", edits: [edit], selectionAnchors: anchors.map { [$0] } ?? [])
+    }
+
+    /// The mark that ends the slur `open` starts: the next closing mark of
+    /// its kind in the same voice. The walk follows the music forward
+    /// through braces; it skips other voices of a `<< … >>` begun after the
+    /// slur (a second branch, or anything after `\\`), and gives up where
+    /// the slur's own voice ends (its `<< >>` branch closes) or the
+    /// expression holding it does.
+    private func closingMark(for open: SlurMark) -> SlurMark? {
+        guard let (e, r) = closingPostEvent(after: open.range, event: open.event, where: { e, r in
+            guard let mark = slurMark(event: e, range: r) else { return false }
+            return !mark.opens && mark.phrasing == open.phrasing
+        }) else { return nil }
+        return slurMark(event: e, range: r)
+    }
+
+    /// The first post-event after `start` (on `event` or later) that
+    /// `matches` accepts, in the same voice: the walk follows the music
+    /// forward through braces, skips other voices of a `<< … >>` begun after
+    /// `start`, and gives up where its own voice or expression ends.
+    private func closingPostEvent(after start: Range<Int>, event: Int,
+                                  where matches: (Int, Range<Int>) -> Bool) -> (event: Int, range: Range<Int>)? {
+        var closes: [Int: (event: Int, range: Range<Int>)] = [:]
+        for e in event..<events.count {
+            for r in events[e].postEvents where r.lowerBound >= start.upperBound && matches(e, r) {
+                for offset in r { closes[offset] = (e, r) }
+            }
+        }
+        guard !closes.isEmpty else { return nil }
+        let open = (range: start, event: event)
+
+        struct Frame { var simultaneous: Bool; var branches = 0; var otherVoice = false }
+        var outer: [Frame] = []   // containers open at the slur's start
+        var local: [Frame] = []   // containers opened after it
+        var found: (event: Int, range: Range<Int>)?
+        var done = false
+        func enterBranch(_ stack: inout [Frame]) {
+            guard let last = stack.indices.last, stack[last].simultaneous else { return }
+            stack[last].branches += 1
+            if stack[last].branches > 1 { stack[last].otherVoice = true }
+        }
+        tree.root.forEachLeaf { leaf in
+            guard !done else { return }
+            let before = leaf.range.lowerBound < open.range.upperBound
+            switch leaf.kind {
+            case .openBrace, .embeddedOpen, .openSimultaneous:
+                let frame = Frame(simultaneous: leaf.kind == .openSimultaneous)
+                if before {
+                    enterBranch(&outer)
+                    outer.append(frame)
+                } else if local.isEmpty, outer.last?.simultaneous == true {
+                    // A parallel expression beside the slur's own.
+                    done = true
+                } else {
+                    enterBranch(&local)
+                    local.append(frame)
+                }
+            case .closeBrace, .embeddedClose, .closeSimultaneous:
+                if before {
+                    if !outer.isEmpty { outer.removeLast() }
+                } else if !local.isEmpty {
+                    local.removeLast()
+                } else {
+                    // Leaving a container that holds the slur's start.
+                    let closed = outer.popLast()
+                    if closed == nil || closed!.simultaneous || outer.isEmpty || outer.last!.simultaneous { done = true }
+                }
+            case .escapedPunct where !before && tree.string(leaf.range) == "\\\\":
+                if let last = local.indices.last {
+                    if local[last].simultaneous { local[last].otherVoice = true }
+                } else if outer.last?.simultaneous == true {
+                    done = true
+                }
+            case .closeParen, .escapedPunct, .command, .closeBracket, .tie, .articulation:
+                guard !before, let mark = closes[leaf.range.lowerBound],
+                      !local.contains(where: \.otherVoice) else { return }
+                found = mark
+                done = true
+            default:
+                break
+            }
+        }
+        return found
+    }
+
     /// Wraps the selected events in `\tuplet n/d { … }`. Refused when the
     /// selection crosses a brace or `<< >>` boundary, or holds the operand
     /// of `\relative`-style commands, since wrapping would change the music.

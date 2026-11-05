@@ -219,6 +219,20 @@ final class LensTests: XCTestCase {
         XCTAssertFalse(window.unsupported.contains { $0.contains("bold") })
     }
 
+    func testDynamicsAndHairpinsTravelBesideTheXML() throws {
+        let window = try lens("""
+        m = \\relative c'' {
+          a4\\p\\< b c d\\f | e\\> f g a\\! | b\\mf\\< c d e |
+        }
+        """, at: "e\\>")
+        XCTAssertEqual(window.dynamics.map(\.text), ["p", "f", "mf"])
+        let spans = window.hairpins.map { (window.events[$0.start].sourceEvent, window.events[$0.end].sourceEvent, $0.crescendo) }
+        // p< to f, > to its \\!; the last hairpin never ends, so it is left out.
+        XCTAssertEqual(spans.count, 2, "\(spans)")
+        XCTAssertTrue(spans[0] == (0, 3, true))
+        XCTAssertTrue(spans[1] == (4, 7, false))
+    }
+
     func testSlursPairWithinTheirVoice() throws {
         let window = try lens("""
         m = \\relative c'' {
@@ -233,6 +247,26 @@ final class LensTests: XCTestCase {
         let voiced = window.slurs.filter { window.events[$0.start].voiceIndex != window.events[$0.end].voiceIndex }
         XCTAssertTrue(voiced.isEmpty)
         XCTAssertEqual(Set(window.slurs.map { window.events[$0.start].voiceIndex }), [0, 1])
+    }
+
+    func testASelectedSlurMarkSelectsThatSlur() throws {
+        let text = "m = \\relative c'' { a4( b) c\\( d e f\\) }"
+        let tree = SyntaxTree(text)
+        func window(at needle: String) throws -> LensScoreWindow {
+            try XCTUnwrap(LensScoreBuilder.build(tree: tree, selection: try range(of: needle, in: text)))
+        }
+        let slur = try window(at: "(")
+        XCTAssertEqual(slur.selectedSlur.map { slur.slurs[$0].phrasing }, false)
+        let phrasing = try window(at: "\\)")
+        XCTAssertEqual(phrasing.selectedSlur.map { phrasing.slurs[$0].phrasing }, true)
+        // A note selection is not a slur selection.
+        XCTAssertNil(try window(at: "a4(").selectedSlur)
+        // A strip reused for another selection follows it.
+        var reused = slur
+        reused.updateSelectedSlur(selection: try range(of: "\\)", in: text), tree: tree)
+        XCTAssertEqual(reused.selectedSlur.map { reused.slurs[$0].phrasing }, true)
+        reused.updateSelectedSlur(selection: try range(of: "b)", in: text), tree: tree)
+        XCTAssertNil(reused.selectedSlur)
     }
 
     func testTremolosTakeTheirWholeLength() throws {

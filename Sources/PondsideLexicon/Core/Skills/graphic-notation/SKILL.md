@@ -22,6 +22,17 @@ If the request is a drawing, texture, shape or gesture, add a graphic in the
 same range (or edit the existing drawing). A request may combine both kinds:
 make the drawing and traditional-notation changes, each only in that range.
 
+**Beyond the marked range only when the user says so.** If a request sounds
+as if it reaches past the mark ("all of them", "every system", "many
+graphics stop short of the system's end"), first ask with `ask_user`
+whether to change only the marked range or every place it occurs (offer
+both as choices), and change only the marked range until the user picks the
+wider one. Then the mark is an example: it shows the cause, so fix that
+cause in every drawing where it occurs. Outside the lens (an agent started
+at a terminal, with no selection, or one that isn't on an instance), ask the
+user to select an example in the score instead of searching renders or
+reading whole files.
+
 ## The fast path (1 call per file)
 
 A request from the lens comes with `score_context` already in it. Its code
@@ -85,7 +96,7 @@ is notation or layout, use `skill://lilypond` and score code instead.
 |---|---|
 | `graphic.entry`, `params`, `start`, `stop` | a Lexicon graphic: edit its alist in place (`\startGraphic "id" #'(...)`) |
 | `graphic.command`, `start`, `stop`, `definition`, `drawing[].text`, `uses`, `notes` | a graphic drawn by the score's own Scheme (`\startGrains`): `drawing` is the stencil procedure (file and lines), `uses` the helpers and constants it calls, in full (numbered) when short, else their definition line, `notes` the file's description |
-| `graphic.section_support` | which of `g-span`, `smoothstep`, `system-moments`, `section-window` already exist, and the insertion anchor for missing ones; never search for them |
+| `graphic.section_support` | which of `g-span`, `smoothstep`, `system-moments`, `section-window` already exist, and the insertion anchor for missing ones; `staff_span`: whether the score has `staff-span` (see "Reach the system's ends"); never search for them |
 | `event`, `staff`, `music` | where a new graphic goes: the clicked staff's voice |
 | `bar`, `moment` | where "here" is (moment = whole notes from the staff's start) |
 | `systems` | the marked systems, canonical system moments and selected x ranges |
@@ -224,6 +235,54 @@ its exact grains.
   scale the amplitude/height per x; a local bump needs the ramps.
 - envelope-driven drawings (`ripples-stencil`, `wedges-stencil`): apply the
   window to the envelope value at x, not to the envelope parameters.
+
+## Reach the system's ends
+
+A graphic that goes on past a line break, or stands in for a staff, ends
+where the system's staff lines end, like the instruments' staves; a
+drawing that stops at the last note, short of the margin, reads as a
+mistake. Leave a drawing short of the end only when the music says so (the
+graphic stops mid-system).
+
+- **Lexicon graphics do this already.** Stop the graphic on the first note
+  (skip) of the next system to run it to the end of a system; the kit ends
+  it with that system and leaves nothing on the next. An electronics staff
+  drawn by a graphic is `(staff-lines (y …) thick)`, which reaches both
+  staff ends of every system it continues on.
+- **The score's own Scheme** draws between `g-span` bounds, which end at the
+  last column, not at the staff's end. If `section_support.staff_span` is
+  false, add this helper (after `g-span`, in the same atomic edit):
+
+```scheme
+% The system's staff lines as (left . right), x relative to grob like g-span:
+% from the first staff's start to the last staff's end.
+#(define (staff-span grob)
+   (let* ((sys (ly:grob-system grob))
+          (me (ly:grob-relative-coordinate grob sys X))
+          (exts (filter-map
+                 (lambda (g)
+                   (and (grob::has-interface g 'staff-symbol-interface)
+                        (let ((e (ly:grob-extent g sys X))) (and (interval-sane? e) e))))
+                 (ly:grob-array->list (ly:grob-object sys 'all-elements)))))
+     (if (null? exts) (g-span grob)
+         (cons (- (apply min (map car exts)) me) (- (apply max (map cdr exts)) me)))))
+
+% Does this piece go on past its system (a line break ends it)?
+#(define (broken-right? grob)
+   (let* ((o (ly:grob-original grob)) (pieces (if o (ly:spanner-broken-into o) '())))
+     (and (pair? pieces) (not (eq? grob (last pieces))))))
+```
+
+  Then, in each stencil whose drawing should run on: the right end is
+  `(if (broken-right? grob) (cdr (staff-span grob)) x1)` instead of the
+  `(- (cdr sp) 0.6)` style inset, for every layer (lines, waves, fills and
+  their echoes alike); lines that stand in for staff lines start at
+  `(car (staff-span grob))` on a piece continued from the system before.
+  A span stopped on the first note of a system leaves a piece narrower than
+  a staff space there: draw nothing on it (the piece before already
+  reaches the end).
+- **Verify** with the returned vector check: on every system the drawing
+  covers, its right end equals the other staves' right end.
 
 ## Lexicon graphic: window in the params, or split
 
