@@ -67,6 +67,8 @@ struct LensContext: Sendable {
     var tuplets: [LensTuplet] = []
     var tremolos: [LensTremolo] = []
     var graces: [Range<Int>] = []
+    /// `\collection { … }` bodies: no time, like graces (and in `graces`).
+    var collections: [Range<Int>] = []
     var unsupported: [String] = []
     var custom: [String] = []
     var managedMeasures: [(body: Range<Int>, time: LensTime)] = []
@@ -91,6 +93,10 @@ struct LensContext: Sendable {
 
     func isGrace(at offset: Int) -> Bool {
         graces.contains { $0.contains(offset) }
+    }
+
+    func isCollection(at offset: Int) -> Bool {
+        collections.contains { $0.contains(offset) }
     }
 
     mutating func flag(_ text: String) {
@@ -240,6 +246,13 @@ enum LensContextScanner {
                 if reference == nil,
                    let body = body(after: leaf.range.upperBound, leaves: leaves, from: index, nodes: source.bodies) {
                     context.graces.append(body)
+                }
+            case "collection":
+                // A pitch collection takes no time (pondside-collections.ily).
+                if reference == nil,
+                   let body = body(after: leaf.range.upperBound, leaves: leaves, from: index, nodes: source.bodies) {
+                    context.graces.append(body)
+                    context.collections.append(body)
                 }
             case "markup", "markuplist":
                 // Markup is text, and its commands are not music.

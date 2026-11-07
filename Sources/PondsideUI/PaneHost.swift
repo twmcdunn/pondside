@@ -61,7 +61,7 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
             layout = new
         }
         if geometryChanged { rebuildSlots() } else { fill() }
-        if collapseChanged || geometryChanged { applyCollapsed() }
+        if collapseChanged, !geometryChanged { applyCollapsed() }
         if geometryChanged || fractionsChanged || (collapseChanged && layout.collapsed.isEmpty) { applyFractions() }
         collapseBar.refresh()
     }
@@ -69,6 +69,9 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
     private func applyCollapsed() {
         for (i, slot) in slots.enumerated() { slot.isHidden = layout.collapsed.contains(i) }
         split.adjustSubviews()
+        // Dividers beside folded panes hide: redraw so none is left behind.
+        split.needsDisplay = true
+        collapseBar.needsLayout = true
     }
 
     /// The pane holding `view` (e.g. the first responder), if any.
@@ -142,6 +145,14 @@ final class PaneHost: NSObject, NSSplitViewDelegate {
             position += (total * f).rounded()
             split.setPosition(position, ofDividerAt: i)
         }
+    }
+
+    /// One divider between each pair of open panes: the divider beside a
+    /// folded pane goes with it, so no separator is left at the window edge.
+    func splitView(_ splitView: NSSplitView, shouldHideDividerAt i: Int) -> Bool {
+        let views = splitView.arrangedSubviews
+        guard views.indices.contains(i) else { return false }
+        return views[i].isHidden || !views[(i + 1)...].contains { !$0.isHidden }
     }
 
     func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt i: Int) -> CGFloat {
@@ -224,7 +235,9 @@ final class PaneCollapseBar: NSView {
             b.isHidden = false
             let x: CGFloat
             if b.edge == .leading {
-                x = max(f.minX + 6, f.minX < 1 ? Self.trafficLights : 0)
+                // A pane at the window's leading edge (its folded neighbour's
+                // divider may leave it a point in) keeps clear of the lights.
+                x = max(f.minX + 6, Self.trafficLights)
             } else {
                 x = f.maxX - 6 - size.width
             }

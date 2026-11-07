@@ -169,6 +169,8 @@ struct LensMeasuredEvent: Sendable {
     var isMeasureRest: Bool
     var isGrace: Bool
     var isSpacer: Bool
+    /// In a `\collection`: drawn as stemless graces, accidentals from the pitch alone.
+    var isCollection = false
     /// Tuplets around the event, outermost first.
     var tuplets: [LensTuplet]
     var tupletStart = false
@@ -531,6 +533,8 @@ struct LensTimeline {
                 isMeasureRest: event.kind == .multiMeasureRest, isGrace: grace, isSpacer: spacer,
                 tuplets: tuplets, clef: context.clef(at: offset), key: event.key
             )
+
+            measured.isCollection = context.isCollection(at: offset)
 
             let innermost = tuplets.last
             let previous = lastTuplet[voice]

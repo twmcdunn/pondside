@@ -29,6 +29,7 @@ final class NoteInputTests: XCTestCase {
         var input = NoteInput()
         XCTAssertEqual(input.handle(ch("g"), now: 0), [.insertNote(step: 4)])
         XCTAssertEqual(input.handle(ch("r"), now: 0), [.insertRest])
+        XCTAssertEqual(input.handle(ch("i"), now: 0), [.invert])
         XCTAssertEqual(input.handle(KeyInput(.up), now: 0), [.move(.step(1))])
         XCTAssertEqual(input.handle(KeyInput(.down, shift: true), now: 0), [.move(.octave(-1))])
         XCTAssertEqual(input.handle(KeyInput(.up, option: true), now: 0), [.move(.chromatic(1))])

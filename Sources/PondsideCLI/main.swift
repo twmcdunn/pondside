@@ -21,12 +21,13 @@ commands:
       List the point-and-click links in a canvas SVG with their bounds.
   doctor [--json]
       List every LilyPond installation found, with version and origin.
-  cues <file.ly> [--format json|cues|marks|ec] [--rate <hz>] [--out <file>]
+  cues <file.ly> [--format json|cues|marks|ec|collections] [--rate <hz>] [--out <file>]
       Every \\ecue with its moment, bar, beat, seconds and samples, timed
       exactly as LilyPond's MIDI plays (hidden \\playTempo included).
       --format cues writes the piece.cues lines SuperCollider loaders read;
       marks the \\timingMark lines starting with --prefix (default improv);
-      ec the \\collection pitch classes on --staff (default elecUp) as ~ec.
+      ec the \\collection pitch classes on --staff (default elecUp) as ~ec;
+      collections every staff's as ~collections (render writes it too).
   handlers <file.ly> [--scd <patch.scd>] [--rate <hz>]
       Create or update the score's patch (patch/<name>.scd) with one handler
       per cue, and its engine (patch/dependencies/pondside.scd). New
@@ -339,7 +340,9 @@ func cues(_ args: Arguments) async throws -> Int32 {
     case "ec":
         let staff = args.options["staff"] ?? "elecUp"
         data = Data(Collections.scd(Collections.find(in: log, staff: staff), staff: staff, score: sheet.score).utf8)
-    case let f: throw CLIError("unknown format '\(f)' (json, cues, marks, ec)")
+    case "collections":
+        data = Data(Collections.collectionsSCD(Collections.all(in: log), score: sheet.score).utf8)
+    case let f: throw CLIError("unknown format '\(f)' (json, cues, marks, ec, collections)")
     }
     if let out = args.options["out"] {
         try data.write(to: URL(fileURLWithPath: out), options: .atomic)
@@ -598,6 +601,20 @@ func mockup(_ args: Arguments) async throws -> Int32 {
             try Data(sheet.cuesText.utf8).write(to: cues, options: .atomic)
         }
         print("\(cues.path): \(sheet.cues.count) cues")
+    }
+    // The score's pitch collections beside them (renders/<name>.collections.scd):
+    // the engine loads them as ~collections. Rewritten only when they change;
+    // removed when the score has none.
+    let collectionsURL = out.deletingPathExtension().appendingPathExtension("collections.scd")
+    let found = Collections.all(in: playback.timing)
+    if found.isEmpty {
+        try? FileManager.default.removeItem(at: collectionsURL)
+    } else {
+        let text = Collections.collectionsSCD(found, score: source.lastPathComponent)
+        if (try? String(contentsOf: collectionsURL, encoding: .utf8)) != text {
+            try Data(text.utf8).write(to: collectionsURL, options: .atomic)
+        }
+        print("\(collectionsURL.path): \(found.count) collections")
     }
     // Passages the MIDI can't play (improvisations), at their marks.
     let partsDirs = MockupParts.folders(score: source, configured: config.parts)

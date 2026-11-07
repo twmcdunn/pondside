@@ -211,9 +211,12 @@ final class LibraryTests: XCTestCase {
         XCTAssertTrue(problems.contains { $0.contains("above the maximum") }, "\(problems)")
         // The kit comes with any graphic entry, before the implementations.
         let include = lex.includeFile(for: ["grain-cloud"])
-        let kit = include.range(of: "pondside-graphics.ily"), impl = include.range(of: "grain-cloud/impl.ily")
+        let kit = include.range(of: "%% ---- pondside-graphics.ily"), impl = include.range(of: "%% ---- grain-cloud ")
         XCTAssertNotNil(kit)
         XCTAssertTrue(kit!.lowerBound < impl!.lowerBound)
+        // Written in, never included from the app or the user's library.
+        XCTAssertFalse(include.contains("\\include"), "lexicon.ily must not depend on files outside the project")
+        XCTAssertTrue(include.contains("collection =\n#(define-music-function"))
         XCTAssertTrue(include.contains("#(hash-set! pondside-graphics-defaults \"grain-cloud\""))
         XCTAssertFalse(lex.includeFile(for: ["air-tone"]).contains("pondside-graphics.ily"))
     }
@@ -284,6 +287,37 @@ final class LexiconEngravingTests: XCTestCase {
         XCTAssertTrue(result.errors.isEmpty, result.log)
         XCTAssertFalse(result.log.contains("Lexicon has no entry"), result.log)
     }
+    /// `\collection` (pondside-collections.ily, through lexicon.ily): every
+    /// note links to its own pitch, the timing dump reports each collection
+    /// on its staff, and the display options compile.
+    func testCollectionsEngraveLinkedAndTimed() async throws {
+        let line = "  \\new Staff = \"fl\" \\relative c'' { \\key g \\major c4 d \\collection { f, fis g bes } e f fis f e d c1 }"
+        let (result, _, _) = try await compile("""
+        \\score { <<
+        \(line)
+          \\new Staff = "el" \\with {
+            \\override NoteHead.details.collection-layout = #'stacked
+            \\override NoteHead.details.collection-enclosure = #'brackets
+            \\override NoteHead.details.collection-heads = #'hollow
+          } { s4 \\collection { c' d' dis' } s2. s1 \\collection { } s4 }
+        >> \\layout { } }
+        """)
+        XCTAssertTrue(result.succeeded, result.log)
+        XCTAssertTrue(result.errors.isEmpty, result.log)
+        XCTAssertFalse(result.log.contains("programming error"), result.log)
+        // Line 4 of the file (\\version and the include come first).
+        let svg = result.outputFiles.compactMap { try? String(contentsOf: $0, encoding: .utf8) }.joined()
+        for name in ["f,", "fis", "g ", "bes"] {
+            let column = line.range(of: "\\collection { ")!.upperBound
+            let at = line[column...].range(of: name)!.lowerBound
+            let character = line.distance(from: line.startIndex, to: at)
+            XCTAssertTrue(svg.contains("score.ly:4:\(character):"), "no link to \(name) at 4:\(character)")
+        }
+        let found = Collections.all(in: result.timing)
+        XCTAssertEqual(found.map(\.staff), ["el", "fl"])
+        XCTAssertEqual(found.map(\.midi), [[60, 62, 63], [65, 66, 67, 70]])
+    }
+
     /// A graphic going on past its system ends at the system's staff end;
     /// one stopped on the first note of a system leaves nothing on it; one
     /// crossing a break is clipped there instead of drawn into the margins.
@@ -512,6 +546,26 @@ final class SkillConsistencyTests: XCTestCase {
                               "\(folder)/SKILL.md names \(path), which isn't in the skill")
             }
         }
+    }
+
+    /// Collections are Pondside's (the kit), and the skills say so: the
+    /// electronics library no longer defines its own, and the display
+    /// options the skill names are the ones the kit and Settings read.
+    func testCollectionsAreDescribedAsPondsidesOwn() throws {
+        let asset = try String(contentsOf: skills.appendingPathComponent("lilypond-electronics-staff/assets/electronics.ily"), encoding: .utf8)
+        XCTAssertFalse(asset.contains("collection ="), "electronics.ily must not define \\collection")
+        XCTAssertFalse(asset.contains("collectionStyle ="))
+        let skill = try String(contentsOf: skills.appendingPathComponent("lilypond-electronics-staff/SKILL.md"), encoding: .utf8)
+        let kit = try String(contentsOf: XCTUnwrap(Lexicon.collectionsKit), encoding: .utf8)
+        for option in ["collection-heads", "collection-enclosure", "collection-layout", "collection-gap"] {
+            XCTAssertTrue(skill.contains(option), option)
+            XCTAssertTrue(kit.contains(option), option)
+            XCTAssertTrue(EngravingSetting.all.contains { $0.keys.contains("\\override NoteHead.details.\(option)") }, option)
+        }
+        XCTAssertTrue(skill.contains("pondside-collections.ily"))
+        let sc = try String(contentsOf: skills.appendingPathComponent("lilypond-supercollider/SKILL.md"), encoding: .utf8)
+        XCTAssertTrue(sc.contains("renders/score.collections.scd") && sc.contains("~collectionsOn"))
+        XCTAssertTrue(HandlerSync.engine(name: "score").contains(".collections.scd"))
     }
 
     /// The one graphic skill and the app's selection JSON name the same fields.

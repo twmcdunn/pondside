@@ -996,7 +996,12 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     @discardableResult
     private func copyNotation() -> Bool {
         synchronizeScoreSource()
-        guard let text = NotationClipboard.copy(tree: tree, events: targets().events) else {
+        // A collection (or some of its notes) copies as a collection.
+        let clip = selectedCollection().map { c in
+            ScoreEditor.collectionClipboard(c, in: tree, notes: Set(targets().events).isSubset(of: c.events) && !targets().events.isEmpty
+                                            ? targets().events.flatMap { tree.events[$0].notes } : nil)
+        }
+        guard let text = clip ?? NotationClipboard.copy(tree: tree, events: targets().events) else {
             statusBar.flash("Select notes or rests in one voice to copy")
             return false
         }
@@ -1024,6 +1029,18 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             statusBar.flash("Select where to paste notation")
             return
         }
+        if SyntaxTree(text).collections.count == 1 {
+            guard let edit = ScoreEditor(tree).pasteCollection(text, after: anchor, step: noteInput.armedDuration ?? .quarter,
+                                                               root: score.root.tree, parse: structuralFile(activeFile).parse) else {
+                statusBar.flash("No room for the collection there")
+                NSSound.beep()
+                return
+            }
+            enteringNotes = false
+            ensureCollectionsKit()
+            apply(edit)
+            return
+        }
         let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
         guard let edit = ScoreEditor(tree).pasteNotation(text, after: anchor, insertionAt: next?.body.lowerBound, parsing: structuralFile(activeFile).parse) else {
             statusBar.flash("The clipboard does not contain supported LilyPond notation")
@@ -1031,6 +1048,132 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         enteringNotes = false
         apply(edit)
+    }
+
+    private func repeatSelection() {
+        if hasPendingNoteInput { afterNoteInput { [weak self] in self?.repeatSelection() }; return }
+        synchronizeScoreSource()
+        let events = targets().events
+        guard let anchor = events.max() else {
+            statusBar.flash("Select notes to repeat")
+            return
+        }
+        let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
+        guard let edit = ScoreEditor(tree).repeatNotation(events: events, insertionAt: next?.body.lowerBound, parsing: structuralFile(activeFile).parse) else {
+            statusBar.flash("Select notes or rests in one voice to repeat")
+            NSSound.beep()
+            return
+        }
+        enteringNotes = false
+        apply(edit)
+    }
+
+    // MARK: Collections (DESIGN.md §13)
+
+    /// The collection the selection means: its notes, or its (empty) command.
+    private func selectedCollection() -> ScoreCollection? {
+        ScoreEditor(tree).selectedCollection(events: targets().events, offset: selectionUTF8().lowerBound)
+    }
+
+    /// `k`: an empty collection where the selection ends, selected so a–g fill it.
+    private func insertCollection() {
+        if hasPendingNoteInput { afterNoteInput { [weak self] in self?.insertCollection() }; return }
+        synchronizeScoreSource()
+        let r = selectionUTF8()
+        let anchor = mouseInsertion.flatMap { tree.events.indices.contains($0.event) ? $0.event : nil }
+            ?? targets().events.max()
+            ?? tree.events.lastIndex { $0.range.upperBound <= r.lowerBound && $0.acceptsNoteEntry }
+        guard let anchor, let edit = ScoreEditor(tree).insertCollection(after: anchor, parse: structuralFile(activeFile).parse) else {
+            statusBar.flash("Select a note or click the staff where the collection starts")
+            NSSound.beep()
+            return
+        }
+        mouseInsertion = nil
+        ensureCollectionsKit()
+        apply(edit)
+        if let at = edit.selectionAnchors.first, let made = tree.collection(at: at) {
+            setSelection(utf8: made.command)
+        }
+        enteringNotes = true
+        updateInputStatus()
+        statusBar.flash("Collection: type a–g · = - for sharp and flat · ⌥←→ moves it · ⎋ ends")
+    }
+
+    /// ⌥←/⌥→ (move) and r (copy): the input duration later or earlier.
+    private func shiftCollection(forward: Bool, copy: Bool) {
+        if hasPendingNoteInput { afterNoteInput { [weak self] in self?.shiftCollection(forward: forward, copy: copy) }; return }
+        synchronizeScoreSource()
+        guard let collection = selectedCollection() else {
+            statusBar.flash("Select a collection (its notes) to \(copy ? "repeat" : "move") it")
+            NSSound.beep()
+            return
+        }
+        let step = noteInput.armedDuration ?? .quarter
+        guard let (edit, snapped) = ScoreEditor(tree).shiftCollection(collection, by: step, forward: forward, copy: copy,
+                                                                     root: score.root.tree, parse: structuralFile(activeFile).parse) else {
+            statusBar.flash(forward ? "No room for the collection later in this voice" : "No room for the collection earlier in this voice")
+            NSSound.beep()
+            return
+        }
+        enteringNotes = false
+        apply(edit)
+        if snapped { statusBar.flash("That moment is inside a note: the collection goes where the note ends") }
+    }
+
+    /// ⌥⇧↑/⌥⇧↓: to the staff above or below, at the same moment.
+    private func moveCollectionToStaff(_ direction: Int) {
+        if hasPendingNoteInput { afterNoteInput { [weak self] in self?.moveCollectionToStaff(direction) }; return }
+        synchronizeScoreSource()
+        guard let collection = selectedCollection(),
+              let fileIndex = score.files.firstIndex(where: { $0 === activeFile }) else {
+            statusBar.flash("Select a collection (its notes) to move it to another staff")
+            NSSound.beep()
+            return
+        }
+        let files = score.files
+        let parsers = files.map { structuralFile($0) }
+        guard let move = CollectionStaves.move(collectionAt: collection.command.lowerBound, file: fileIndex, direction: direction,
+                                               trees: parsers.map(\.tree), parse: { parsers[$0].parse($1) }) else {
+            statusBar.flash(direction < 0 ? "No staff above to move the collection to" : "No staff below to move the collection to")
+            NSSound.beep()
+            return
+        }
+        let changes = move.edits.map { StructuralEditing.Change(file: files[$0.key].url.path, edits: $0.value) }
+        enteringNotes = false
+        guard applyStructural(changes, name: "Move Collection") else { return }
+        let target = files[move.anchor.file]
+        if target !== activeFile { showFile(target) }
+        if let made = tree.collection(at: move.anchor.offset) {
+            if made.events.isEmpty { setSelection(utf8: made.command) } else { selectEvents(made.events) }
+        }
+        statusBar.flash("Collection moved to \\\(move.staffName)" + (move.snapped ? " (where the note there ends)" : ""))
+    }
+
+    private func deleteCollection(_ collection: ScoreCollection) {
+        apply(ScoreEditor(tree).deleteCollection(collection, parse: structuralFile(activeFile).parse))
+    }
+
+    /// `\collection` is defined by Pondside's kit, written into lexicon.ily.
+    private func ensureCollectionsKit() {
+        let dir = score.url.deletingLastPathComponent()
+        let include = dir.appendingPathComponent("lexicon.ily")
+        let current = (try? String(contentsOf: include, encoding: .utf8)) ?? ""
+        let root = score.root.text
+        // An older lexicon.ily included the kit from the app; rewrite it.
+        guard !current.contains("%% ---- pondside-collections.ily") || current.contains("\\include \"/")
+                || !root.contains("\\include \"lexicon.ily\"") else { return }
+        do {
+            let lex = Lexicon.load(Lexicon.standardScopes(project: dir))
+            let used = Set(score.files.flatMap { LexiconUse.find(in: $0.text).map(\.id) })
+            try Data(lex.includeFile(for: used).utf8).write(to: include, options: .atomic)
+            if !root.contains("\\include \"lexicon.ily\"") {
+                let withInclude = GraphicEdit.withLexiconInclude(root)
+                applyText(EngravingSettingsDocument.span(from: Array(root.utf8), to: Array(withInclude.utf8)), to: score.root,
+                          name: "Include the Lexicon")
+            }
+        } catch {
+            statusBar.flash("Could not write lexicon.ily: \(error)")
+        }
     }
 
     // MARK: Keyboard note input
@@ -1403,6 +1546,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             enteringNotes = true
             insert(step: step)
         case .insertRest:
+            // A selected collection: r repeats it, the input duration later.
+            if mouseInsertion == nil, selectedCollection() != nil {
+                shiftCollection(forward: true, copy: true)
+                return
+            }
+            // With a stretch selected (not a single entry anchor or a clicked
+            // insertion point), r repeats the stretch instead of adding a rest.
+            if mouseInsertion == nil, Set(events).count > 1 {
+                repeatSelection()
+                return
+            }
             enteringNotes = true
             insert(step: nil)
         case .delete:
@@ -1438,6 +1592,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 }
                 return
             }
+            if let collection = selectedCollection(), Set(events) == Set(collection.events) {
+                deleteCollection(collection)
+                return
+            }
             let gone = events.allSatisfy { isEngraved($0) } ? highlighted : []
             let edit = scoreEditor.delete(events: events)
             apply(edit)
@@ -1445,6 +1603,22 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 canvas.provisionalDelete(gone, path: activeFile.url.path)
                 refreshHighlight(reveal: false)
             }
+        case .invert:
+            // In a collection, i inverts the whole collection.
+            let collection = selectedCollection()
+            guard let edit = scoreEditor.invert(events: collection?.events ?? events, extraNotes: collection == nil ? notes : []) else {
+                statusBar.flash("Select two or more notes to invert")
+                NSSound.beep()
+                return
+            }
+            enteringNotes = false
+            apply(edit)
+        case .insertCollection:
+            insertCollection()
+        case .shiftCollection(let direction):
+            shiftCollection(forward: direction > 0, copy: false)
+        case .moveCollectionToStaff(let direction):
+            moveCollectionToStaff(direction)
         case .toggleSlur:
             let pitched = events.filter { !tree.events[$0].notes.isEmpty }
             apply(scoreEditor.toggleSpan(open: "(", close: ")", events: pitched, name: "Slur"))
@@ -1495,6 +1669,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private func insert(step: Int?) {
         if unmeteredStart != nil { enqueueUnmeteredNote(step: step); return }
         let r = selectionUTF8()
+        // The first note typed into an empty collection (k makes one).
+        if mouseInsertion == nil, let collection = tree.collection(at: r.lowerBound), collection.events.isEmpty,
+           r.upperBound <= collection.command.upperBound {
+            guard let step else {
+                statusBar.flash("A collection holds pitches only: type a–g")
+                NSSound.beep()
+                return
+            }
+            enteringNotes = true
+            apply(ScoreEditor(tree).insertIntoEmptyCollection(collection, step: step, accidental: noteInput.armedAccidental,
+                                                             parse: structuralFile(activeFile).parse))
+            noteInput.clearAccidental()
+            updateInputStatus()
+            return
+        }
         let mouse = mouseInsertion.flatMap { tree.events.indices.contains($0.event) ? $0 : nil }
         // After the clicked insertion point or the selected event, or after
         // the event just before the caret.
@@ -1513,7 +1702,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let anchorDiatonic = engraved ? tree.events[anchor].notes.first.map { tree.notes[$0].absolute.diatonicIndex } : nil
         let emptyMeasureAnchor = tree.events[anchor].kind == .spacer && tree.string(tree.events[anchor].range) == "s1*0"
         let entryDuration = noteInput.armedDuration ?? (emptyMeasureAnchor ? DurationValue.quarter : nil)
-        let next = unmeteredStart == nil
+        let next = unmeteredStart == nil && tree.collection(containingEvent: anchor) == nil
             ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
         let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: entryDuration,
                                             octave: step != nil ? mouse?.octave : nil, accidental: noteInput.armedAccidental,
@@ -2267,6 +2456,13 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         case "add.cue": addCue(events: selected)
         case "add.note": statusBar.flash("Type a–g with the score focused: the note goes after the selection")
         case "add.rest": insert(step: nil)
+        case "add.repeat": repeatSelection()
+        case "add.collection": insertCollection()
+        case "edit.collectionLater": shiftCollection(forward: true, copy: false)
+        case "edit.collectionEarlier": shiftCollection(forward: false, copy: false)
+        case "edit.collectionStaffUp": moveCollectionToStaff(-1)
+        case "edit.collectionStaffDown": moveCollectionToStaff(1)
+        case "edit.invert": perform(.invert)
 
         case "add.pageBreak":
             if let first = selected.min() { toggleStructuralBreak(before: first, kind: .page) }
@@ -2469,6 +2665,19 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
             guard let c = event.characters?.first else { return true }
             handle(chord.feed(c, keymap))
             return true
+        }
+        // ⌥ shortcuts (⌥C, ⌥B…) run window-wide: a text view would otherwise
+        // take the key as a character to type (⌥C is "ç") before the menu sees it.
+        if event.type == .keyDown, !flags.isDisjoint(with: .option),
+           flags.subtracting([.option, .shift, .capsLock, .numericPad, .function]).isEmpty,
+           let key = event.charactersIgnoringModifiers?.lowercased(), key.count == 1 {
+            var mods: KeyStroke.Modifiers = .option
+            if flags.contains(.shift) { mods.insert(.shift) }
+            let stroke = KeyStroke(key, mods)
+            if let spec = keymap.specs.first(where: { $0.shortcut == stroke }) {
+                run(spec.id)
+                return true
+            }
         }
         let isSpace = event.keyCode == 49
         let leader = isSpace && (flags == .option || (flags.isEmpty && window.firstResponder === canvas && !noteInput.isBuffering))

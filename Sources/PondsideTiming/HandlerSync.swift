@@ -148,6 +148,10 @@ public enum HandlerSync {
         };
         // Required preparation belongs to the main waitForBoot routine.
         e[\\list] = e[\\cues].value;
+        // the score's pitch collections, ~collections and ~collectionsOn['staff'], from
+        // ../renders/<name>.collections.scd (written with the mockup, when the score has any)
+        e[\\collections] = e[\\renders] +/+ e[\\name] ++ ".collections.scd";
+        if(File.exists(e[\\collections])) { e[\\collections].load };
         e[\\buf] !? { e[\\buf].free };
         e[\\buf] = if(~mode == \\mockup) { Buffer.read(s, e[\\renders] +/+ e[\\name] ++ ".wav") };
         e[\\fire] = { |c| ("cue " ++ c.name).postln; ~cue[c.handler] !? { |f| f.value(c) } };

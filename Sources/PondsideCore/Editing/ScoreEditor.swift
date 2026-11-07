@@ -52,6 +52,7 @@ public struct ScoreEditor: Sendable {
         for e in eventIndices { targets.formUnion(events[e].notes) }
         targets = targets.filter { notes[$0].role == .event }
         guard !targets.isEmpty else { return nil }
+        let collectionBodies = tree.collections.map(\.body)
         var changes: [Int: Pitch] = [:]
         for i in targets {
             let n = notes[i]
@@ -60,7 +61,9 @@ public struct ScoreEditor: Sendable {
             case .step(let s):
                 let idx = p.diatonicIndex + s
                 let step = ((idx % 7) + 7) % 7
-                let key = n.event.map { events[$0].key } ?? .cMajor
+                // A collection's notes are natural unless written otherwise.
+                let inCollection = collectionBodies.contains { $0.contains(n.name.lowerBound) }
+                let key = inCollection ? .cMajor : (n.event.map { events[$0].key } ?? .cMajor)
                 changes[i] = Pitch(diatonicIndex: idx, alteration: key.alteration(for: step))
             case .chromatic(let semis):
                 let alt = p.alteration + semis * 2
@@ -151,8 +154,18 @@ public struct ScoreEditor: Sendable {
         var timelines: [LensBlock: LensTimeline] = [:]
         var changes: [Int: Pitch] = [:]
         var marks: [TextEdit] = []
+        let collectionBodies = tree.collections.map(\.body)
+        func inCollection(_ offset: Int) -> Bool { collectionBodies.contains { $0.contains(offset) } }
         for index in targets.sorted() {
             let note = notes[index]
+            if inCollection(note.name.lowerBound) {
+                // Sharps and flats are always shown and nothing else is assumed:
+                // the key sets the pitch, again for natural.
+                let target = note.absolute.alteration == alteration ? 0 : alteration
+                changes[index] = Pitch(step: note.absolute.step, alteration: target, octave: note.absolute.octave)
+                if let mark = note.accidentalMark { marks.append(TextEdit(mark, "")) }
+                continue
+            }
             guard let event = note.event, let block = LensBlockFinder.block(in: tree, at: note.name.lowerBound) else { continue }
             if timelines[block] == nil {
                 var context = LensContextScanner.scan(tree, block: block.context)
@@ -166,7 +179,7 @@ public struct ScoreEditor: Sendable {
                 timelines[block] = LensTimeline(tree: tree, block: block, context: &context)
             }
             guard let timeline = timelines[block], let current = timeline.events.first(where: { $0.sourceEvent == event }) else { continue }
-            let prior = timeline.events.filter { $0.voiceIndex == current.voiceIndex && $0.sourceOffset < current.sourceOffset }.sorted { $0.sourceOffset < $1.sourceOffset }
+            let prior = timeline.events.filter { $0.voiceIndex == current.voiceIndex && $0.sourceOffset < current.sourceOffset && !inCollection($0.sourceOffset) }.sorted { $0.sourceOffset < $1.sourceOffset }
             var key = current.key
             var inherited = key.alteration(for: note.absolute.step)
             var replacementInherited = inherited
@@ -222,7 +235,9 @@ public struct ScoreEditor: Sendable {
         }
         var key = event.key
         var alteration = key.alteration(for: step)
-        for index in prior {
+        // A collection neither takes nor leaves accidentals.
+        let collectionBodies = tree.collections.map(\.body)
+        for index in prior where !collectionBodies.contains(where: { $0.contains(events[index].range.lowerBound) }) {
             if events[index].key != key { key = events[index].key; alteration = key.alteration(for: step) }
             for note in events[index].notes where notes[note].absolute.step == step && notes[note].absolute.octave == octave {
                 alteration = notes[note].absolute.alteration
@@ -751,11 +766,16 @@ public struct ScoreEditor: Sendable {
     public func insert(step: Int?, after eventIndex: Int, duration: DurationValue?, octave explicitOctave: Int? = nil, accidental: Int? = nil,
                        insertionAt offset: Int? = nil) -> ScoreEdit? {
         let ev = events[eventIndex]
-        let at = offset ?? ev.range.upperBound
+        // In a collection (DESIGN.md §13): no duration, no rests, and an
+        // accidental only when one is armed; nothing comes from the context.
+        let inCollection = tree.collection(containingEvent: eventIndex) != nil
+        if inCollection && step == nil { return nil }
+        let at = inCollection ? ev.range.upperBound : (offset ?? ev.range.upperBound)
         guard at >= ev.range.upperBound, at <= tree.bytes.count else { return nil }
         var edits: [TextEdit] = []
         let inheritedHere = ev.effectiveDuration
-        let durationText = offset != nil ? (duration ?? inheritedHere).text : ((duration == nil || duration == inheritedHere) ? "" : duration!.text)
+        let durationText = inCollection ? ""
+            : offset != nil ? (duration ?? inheritedHere).text : ((duration == nil || duration == inheritedHere) ? "" : duration!.text)
         let newEffective = durationText.isEmpty ? inheritedHere : (duration ?? inheritedHere)
 
         var noteText: String
@@ -771,12 +791,12 @@ public struct ScoreEditor: Sendable {
             } else {
                 octave = OctaveRules.nearestOctave(step: step, to: previous ?? Pitch(step: 0, octave: 1))
             }
-            let alteration = accidental ?? entryAccidental(step: step, octave: octave, after: eventIndex, at: at)
+            let alteration = accidental ?? (inCollection ? 0 : entryAccidental(step: step, octave: octave, after: eventIndex, at: at))
             let pitch = Pitch(step: step, alteration: alteration, octave: octave)
             inserted = pitch
             let marks = OctaveRules.marks(for: pitch, mode: ev.octaveMode, reference: reference)
             noteText = ev.language.spell(step: step, alteration: alteration) + OctaveRules.markText(marks)
-                + (accidental == nil ? "" : "!")
+                + (accidental == nil || inCollection ? "" : "!")
         } else {
             noteText = "r"
         }
@@ -951,4 +971,42 @@ extension ScoreEdit {
 
 extension Array {
     subscript(safe i: Int) -> Element? { indices.contains(i) ? self[i] : nil }
+}
+
+extension ScoreEditor {
+    /// Inverts the selected pitches about the centre of their range: the
+    /// lowest and highest notes trade places and every other note mirrors
+    /// between them (c' g' e' → g' c' ees'; the chord <c' e' g'> becomes
+    /// <c' ees' g'>). Spelling mirrors diatonically about the same axis, so a
+    /// third stays a third; the accidental makes up the exact interval.
+    public func invert(events eventIndices: [Int], extraNotes: [Int] = []) -> ScoreEdit? {
+        var targets = Set(extraNotes)
+        for e in eventIndices { targets.formUnion(events[e].notes) }
+        targets = targets.filter { notes[$0].role == .event }
+        guard targets.count > 1 else { return nil }
+        func quarters(_ p: Pitch) -> Int { p.octave * 24 + [0, 4, 8, 10, 14, 18, 22][p.step] + p.alteration }
+        let pitches = targets.map { notes[$0].absolute }
+        let order: (Pitch, Pitch) -> Bool = { (quarters($0), $0.diatonicIndex) < (quarters($1), $1.diatonicIndex) }
+        guard let low = pitches.min(by: order), let high = pitches.max(by: order) else { return nil }
+        let quarterSum = quarters(low) + quarters(high)
+        let diatonicSum = low.diatonicIndex + high.diatonicIndex
+        var changes: [Int: Pitch] = [:]
+        for i in targets {
+            let p = notes[i].absolute
+            let goal = quarterSum - quarters(p)
+            var candidate = Pitch(diatonicIndex: diatonicSum - p.diatonicIndex, alteration: 0)
+            candidate.alteration = goal - quarters(candidate)
+            // Beyond a double accidental, respell on the nearest step.
+            if abs(candidate.alteration) > 4 {
+                let natural = (0..<7).map { Pitch(diatonicIndex: candidate.diatonicIndex - 3 + $0, alteration: 0) }
+                    .min { abs(goal - quarters($0)) < abs(goal - quarters($1)) }!
+                candidate = natural
+                candidate.alteration = goal - quarters(natural)
+            }
+            if candidate != p { changes[i] = candidate }
+        }
+        guard !changes.isEmpty else { return nil }
+        let edits = rewritePitches(changes)
+        return ScoreEdit(name: "Invert", edits: edits, selectionAnchors: anchorsAfter(edits, events: eventIndices))
+    }
 }

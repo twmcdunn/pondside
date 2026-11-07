@@ -47,8 +47,10 @@ rename the score to match.
 |---|---|---|
 | `renders/score.wav` | the app after every good engraving (`pondside mockup score.ly`) | the playback, padded to the end mark (improvisation recordings mixed in) |
 | `renders/score.cues` | the same run | `seconds<TAB>bar<TAB>cue N`, one line per cue, in order |
+| `renders/score.collections.scd` | the same run, when the score has collections | `~collections` (every staff's `\collection`, in score order, each an Event: `pcs`, `midi`, `staff`, `bar`, `time`, `cue`, `index`) and `~collectionsOn['elecUp']`; the engine loads it |
 | any `--out` file | `pondside cues score.ly --format cues` | the same lines |
-| | `pondside cues score.ly --format ec [--staff elecUp]` | `~ec = [...]; ~ecWhere = [...];` (pitch classes of each `\collection`) |
+| | `pondside cues score.ly --format collections` | the same `~collections` file |
+| | `pondside cues score.ly --format ec [--staff elecUp]` | `~ec = [...]; ~ecWhere = [...];` (pitch classes of each `\collection` on one staff; older patches) |
 | | `pondside cues score.ly --format marks [--prefix improv]` | `seconds<TAB>bar<TAB>improv 1` lines |
 | | `pondside cues score.ly` (json) / MCP `cues` | cues.json: moment, bar, beat, seconds, samples, handler name |
 | `patch/score.scd` | the SuperCollider pane when there is no patch, or `pondside handlers score.ly` | the patch (below); after each mockup the app adds a `~cue[\cue12] = { |cue| … };` stub per new cue that has no handler yet |
@@ -101,7 +103,7 @@ Copy `assets/playback.ily` (this skill) and `electronics.ily`
 (lilypond-electronics-staff) into the score's folder and include them.
 
 - **Cues:** `\ecue "N"` in the electronics cues voice. Number them in score order.
-- **Collections:** `\collection { ... }` on the staff named by `--staff` (`\new Staff = "elecUp"`).
+- **Collections:** `\collection { ... }` on any staff (Pondside's own, through `lexicon.ily`; not in `electronics.ily`). Name the staff (`\new Staff = "elecUp"`): that is its `staff` in `~collections`. In the patch, `~collections[3].pcs` or `Scale(~collectionsOn['elecUp'][0].pcs)`; a patch that used `~ec` can keep it with `~ec = ~collectionsOn['elecUp'].collect(_.pcs);` after the engine loads.
 - **The MIDI:** a score without its own `\midi` gets Pondside's generated
   playback (repeats played out, trills, `\articulate`, electronics staves
   silent; music tagged `printed` silent). A score with a `\midi` block plays
@@ -141,6 +143,6 @@ Cue Inspector, or diff the old and new `score.cues`).
 
 - `renders/score.cues`: one line per `\ecue`, times increasing (Pondside warns
   otherwise). Spot-check one: sum of beats × 60/bpm.
-- `~ec` has one entry per `\collection`; `sclang` can load the file.
+- `~collections` has one entry per `\collection`, in score order; `sclang` can load the file.
 - Commit the `.ly`/`.ily` files and `patch/`, not `renders/`, `score.timing`,
   PDFs or MIDI.

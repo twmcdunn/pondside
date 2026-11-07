@@ -169,3 +169,46 @@ final class RestTimingTests: XCTestCase {
         XCTAssertTrue(log.collections(staff: "flute").isEmpty)
     }
 }
+
+/// `\collection`s as Pondside's dump reports them (`cnote` rows), and the
+/// `~collections` file the patch engine loads.
+final class CollectionNoteTests: XCTestCase {
+    static let log = """
+    PONDSIDE-TIMING\t0\t1\t@0\ttempo\t60.0
+    PONDSIDE-TIMING\t0\t1\t@0\ttext\tcue 1
+    PONDSIDE-TIMING\t1\t2\t@0\tnote\tflute\t79\t/s/flute.ly\t3\t2
+    PONDSIDE-TIMING\t1\t2\t@0\tcnote\tflute\t62\t0\t/s/flute.ly\t3\t18
+    PONDSIDE-TIMING\t1\t2\t@0\tcnote\tflute\t66\t1\t/s/flute.ly\t3\t21
+    PONDSIDE-TIMING\t1\t2\t@0\tgroup\tflute\tstart
+    PONDSIDE-TIMING\t1\t2\t@0\tgroup\tflute\tstop
+    PONDSIDE-TIMING\t5/4\t2\t@1/4\tcnote\telecUp\t60\t0
+    PONDSIDE-TIMING\t5/4\t2\t@1/4\tcnote\telecUp\t70\t1
+    PONDSIDE-TIMING\t5/4\t2\t@1/4\tcnote\telecUp\t61\t0
+    """
+
+    func testCollectionNotesAreTheirOwnRowsAndNeverTheStaffsMusic() {
+        let log = TimingLog(parsing: Self.log, prefix: "PONDSIDE-TIMING\t")
+        XCTAssertEqual(log.rows.filter { if case .collectionNote = $0.kind { return true }; return false }.count, 5)
+        // The flute's own note at the same moment is not in its collection.
+        XCTAssertEqual(Collections.find(in: log, staff: "flute").map(\.midi), [[62, 66]])
+        // Two collections at one moment: index 0 starts each.
+        XCTAssertEqual(Collections.find(in: log, staff: "elecUp").map(\.midi), [[60, 70], [61]])
+        let all = Collections.all(in: log)
+        XCTAssertEqual(all.map(\.staff), ["flute", "elecUp", "elecUp"])
+        XCTAssertEqual(all.first?.cue, "cue 1")
+        XCTAssertEqual(all.first?.seconds ?? 0, 4, accuracy: 1e-9)
+    }
+
+    func testCollectionsFileForThePatch() {
+        let all = Collections.all(in: TimingLog(parsing: Self.log, prefix: "PONDSIDE-TIMING\t"))
+        let scd = Collections.collectionsSCD(all, score: "score.ly")
+        XCTAssertTrue(scd.contains("\t(index: 0, staff: 'flute', bar: 2, time: 4.000, cue: \"cue 1\", midi: [62, 66], pcs: [2, 6]),   // D F#\n"), scd)
+        XCTAssertTrue(scd.contains("(index: 2, staff: 'elecUp', bar: 2, time: 5.000, cue: \"cue 1\", midi: [61], pcs: [1])   // C#\n"), scd)
+        XCTAssertTrue(scd.contains("~collectionsOn = IdentityDictionary.new;"))
+    }
+
+    func testTheEngineLoadsTheCollections() {
+        XCTAssertTrue(HandlerSync.engine(name: "score").contains("e[\\collections] = e[\\renders] +/+ e[\\name] ++ \".collections.scd\";"))
+    }
+}
+

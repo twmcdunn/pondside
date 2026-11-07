@@ -4,7 +4,7 @@ import PondsideTiming
 
 /// Asks LilyPond when everything happens: tempos (printed or hidden),
 /// cues (`\ecue`, read from the event's `cue-label`), timing marks
-/// (`timing-label`), notes and groups, each at its exact moment with its
+/// (`timing-label`), notes, collection notes and groups, each at its exact moment with its
 /// bar and position in the bar.
 ///
 /// The rows are timing.ily's (the lilypond-supercollider workflow), plus
@@ -101,8 +101,13 @@ public enum TimingDump {
                                  (let ((o (ly:input-file-line-char-column loc)))
                                    (list (car o) (cadr o) (caddr o)))
                                  '())))
-                  (apply pondside-timing-row context "note"
-                         (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p)) where)))))
+                  ; a \\collection's note (pondside-collections.ily): no time, no sound
+                  (let ((i (ly:event-property event 'collection-index #f)))
+                    (if (number? i)
+                        (apply pondside-timing-row context "cnote"
+                               (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p)) i where)
+                        (apply pondside-timing-row context "note"
+                               (pondside-timing-staff context) (+ 60 (ly:pitch-semitones p)) where)))))))
          ((rest-event engraver event) (pondside-timing-rest context event))
          ((multi-measure-rest-event engraver event) (pondside-timing-rest context event))
          ((note-grouping-event engraver event)

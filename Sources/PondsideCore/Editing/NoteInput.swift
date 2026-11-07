@@ -33,6 +33,14 @@ public enum InputAction: Hashable, Sendable {
     case delete
     case togglePostEvent(String)
     case toggleSlur
+    /// Mirror the selected pitches about the centre of their range.
+    case invert
+    /// A pitch collection where the selection ends (`k`).
+    case insertCollection
+    /// The selected collection later (+1) or earlier (−1) by the input duration (⌥→ ⌥←).
+    case shiftCollection(Int)
+    /// The selected collection to the staff below (+1) or above (−1) (⌥⇧↓ ⌥⇧↑).
+    case moveCollectionToStaff(Int)
     case select(step: Int, extend: Bool)
     case clearSelection
     case editSource
@@ -48,11 +56,15 @@ public enum InputAction: Hashable, Sendable {
 /// | keys | effect |
 /// |---|---|
 /// | `a`–`g` (`h`) | insert that note after the selection, nearest octave, current measure's accidental |
-/// | `r` | insert a rest |
+/// | `r` | insert a rest · with several events selected, repeat the selection after itself |
 /// | `1 2 4 8 16 32 64 128` | duration, as in LilyPond; applies to the selection and arms the next note |
 /// | `.` | toggle dot |
 /// | `↑` `↓` | diatonic step · `⇧` octave · `⌥` chromatic |
 /// | `←` `→` | previous / next object · `⇧` extends |
+/// | `i` | invert the selection about the centre of its range |
+/// | `k` | a pitch collection where the selection ends; a–g then fill it |
+/// | `⌥←` `⌥→` | move the selected collection by the input duration |
+/// | `⌥⇧↑` `⌥⇧↓` | move the selected collection to the staff above / below |
 /// | `s` | toggle a slur over the selection (same as Space a s) |
 /// | `( ) ~ [ ]` | slur endpoints, tie, beam: toggled on the selection |
 /// | `=`, `-`, `0` | visible sharp, flat, natural: toggle selection or arm next note |
@@ -144,10 +156,12 @@ public struct NoteInput: Sendable {
         switch input.key {
         case .up, .down:
             let sign = input.key == .up ? 1 : -1
+            if input.shift && input.option { return [.moveCollectionToStaff(-sign)] }
             if input.shift { return [.move(.octave(sign))] }
             if input.option { return [.move(.chromatic(sign))] }
             return [.move(.step(sign))]
         case .left, .right:
+            if input.option && !input.shift { return [.shiftCollection(input.key == .right ? 1 : -1)] }
             return [.select(step: input.key == .right ? 1 : -1, extend: input.shift)]
         case .delete:
             if !digits.isEmpty { digits = ""; return [.buffer("")] }
@@ -193,6 +207,10 @@ public struct NoteInput: Sendable {
             return [.insertRest]
         case "s":
             return [.toggleSlur]
+        case "i":
+            return [.invert]
+        case "k":
+            return [.insertCollection]
         case ".":
             if var armed = armedDuration { armed.dots = armed.dots == 0 ? 1 : 0; armedDuration = armed }
             return [.toggleDot]

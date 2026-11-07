@@ -1,0 +1,359 @@
+%% Pondside collections: unmetered pitch collections anchored at one moment.
+%%
+%%   c'4 \collection { c' d' fis' a' } d'4      % at d's moment, on this staff
+%%   s2  \collection { ees' f' bes' } s2        % anywhere a skip can be split
+%%
+%% A collection takes no time. Its notes are written without durations and
+%% laid out by the collection itself, a fixed distance apart, whatever the
+%% spacing of the music around it; only its start is anchored to the moment
+%% where it stands. Accidentals ignore context: sharps and flats are always
+%% shown, any other note is natural, and the notes neither take nor leave
+%% accidentals for the staff's own music (key, earlier notes in the bar).
+%% Collections do not sound in the MIDI. Each note links to its own pitch in
+%% the source (point-and-click), and the timing dump reads them as a group
+%% (`\startGroup`/`\stopGroup` on the staff), for the patch's ~ec and
+%% ~collections.
+%%
+%% Display, score-wide or per staff (Engraving Settings, Collections):
+%%   \override NoteHead.details.collection-heads     = #'filled   % or 'hollow
+%%   \override NoteHead.details.collection-enclosure = #'parentheses % 'brackets 'none
+%%   \override NoteHead.details.collection-layout    = #'row      % or 'stacked
+%%   \override NoteHead.details.collection-gap       = #0.8       % staff spaces
+%%
+%% Pondside writes this into each project's lexicon.ily (a copy, not an
+%% include, so the project needs nothing from the app); it needs nothing else.
+
+#(define (pondside-collection-detail grob key default)
+   (let ((v (assoc-get key (ly:grob-property grob 'details '()) default)))
+     (if (eq? v '()) default v)))
+
+#(define (pondside-collection-head? head)
+   (let ((cause (event-cause head)))
+     (and cause (number? (ly:event-property cause 'collection-index #f)))))
+
+#(define (pondside-collection-index head)
+   (ly:event-property (event-cause head) 'collection-index 0))
+
+#(define (pondside-collection-size head)
+   (ly:event-property (event-cause head) 'collection-size 1))
+
+#(define (pondside-collection-row? head)
+   (not (eq? (pondside-collection-detail head 'collection-layout 'row) 'stacked)))
+
+% The accidental a note shows: from its pitch alone. Naturals are implied.
+#(define (pondside-collection-accidental head)
+   (let* ((cause (event-cause head))
+          (pitch (and cause (ly:event-property cause 'pitch #f)))
+          (alt (and pitch (ly:pitch-alteration pitch))))
+     (and alt (not (zero? alt))
+          (let ((glyph (assoc-get alt standard-alteration-glyph-name-alist #f)))
+            (and glyph
+                 (let ((st (ly:font-get-glyph (ly:grob-default-font head) glyph)))
+                   (and (not (ly:stencil-empty? st)) st)))))))
+
+% The head alone. Note_heads_engraver sets duration-log itself, so the
+% collection's filled or hollow heads are chosen here, not by an override.
+#(define (pondside-collection-plain-head head)
+   (if (pondside-collection-head? head)
+       (ly:grob-set-property! head 'duration-log
+                              (if (eq? (pondside-collection-detail head 'collection-heads 'filled) 'hollow) 1 2)))
+   (ly:note-head::print head))
+
+#(define (pondside-collection-heads-of head)
+   (let ((col (ly:grob-parent head X)))
+     (sort (filter pondside-collection-head?
+                   (ly:grob-array->list (ly:grob-object col 'note-heads)))
+           (lambda (a b) (< (pondside-collection-index a) (pondside-collection-index b))))))
+
+#(define (pondside-collection-acc-width head)
+   (let ((a (pondside-collection-accidental head)))
+     (if a (+ 0.2 (interval-length (ly:stencil-extent a X))) 0)))
+
+% Where the row starts: after any notes another voice has at this moment on
+% the same staff, so a collection beside the staff's own music never covers it.
+#(define (pondside-collection-start head)
+   (let* ((col (ly:grob-parent head X))
+          (paper (ly:grob-parent col X))
+          (staff (ly:grob-object head 'staff-symbol))
+          (others (if (ly:grob? paper)
+                      (filter (lambda (g)
+                                (and (not (eq? g col))
+                                     (grob::has-interface g 'note-column-interface)
+                                     (let ((hs (ly:grob-object g 'note-heads)))
+                                       (and (ly:grob-array? hs)
+                                            (pair? (ly:grob-array->list hs))
+                                            (eq? (ly:grob-object (car (ly:grob-array->list hs)) 'staff-symbol) staff)
+                                            (not (pondside-collection-head? (car (ly:grob-array->list hs))))))))
+                              (ly:grob-array->list (ly:grob-object paper 'elements)))
+                      '()))
+          (here (if (ly:grob? paper) (ly:grob-relative-coordinate col paper X) 0))
+          (right (fold (lambda (g acc)
+                         (let ((ext (coord-translate (ly:grob-extent g paper X) (- here))))
+                           (cond ((interval-empty? ext) acc)
+                                 ((not acc) (cdr ext))
+                                 (else (max acc (cdr ext))))))
+                       #f others)))
+     (if right (+ right 0.6) 0)))
+
+% Stacked: accidentals in columns left of the chord, top down, a column
+% shared only by accidentals at least a sixth apart. (head . column) pairs.
+#(define (pondside-collection-acc-columns head)
+   (let* ((heads (filter pondside-collection-accidental (pondside-collection-heads-of head)))
+          (pos (lambda (h) (ly:grob-property h 'staff-position 0)))
+          (ordered (sort heads (lambda (a b) (> (pos a) (pos b))))))
+     (let loop ((hs ordered) (placed '()))
+       (if (null? hs)
+           placed
+           (let* ((h (car hs))
+                  (column (let find ((c 0))
+                            (if (any (lambda (p) (and (= (cdr p) c) (< (abs (- (pos (car p)) (pos h))) 5))) placed)
+                                (find (1+ c))
+                                c))))
+             (loop (cdr hs) (cons (cons h column) placed)))))))
+
+#(define (pondside-collection-acc-column-width head)
+   (let ((ws (filter-map (lambda (h) (let ((a (pondside-collection-accidental h)))
+                                       (and a (interval-length (ly:stencil-extent a X)))))
+                         (pondside-collection-heads-of head))))
+     (if (null? ws) 0 (+ 0.15 (apply max ws)))))
+
+% Room the accidental columns take left of a stacked chord.
+#(define (pondside-collection-acc-room head)
+   (let ((cols (pondside-collection-acc-columns head)))
+     (if (null? cols)
+         0
+         (+ 0.1 (* (1+ (apply max (map cdr cols))) (pondside-collection-acc-column-width head))))))
+
+% Room the left parenthesis or bracket takes.
+#(define (pondside-collection-enclosure-room head)
+   (if (eq? (pondside-collection-detail head 'collection-enclosure 'parentheses) 'none) 0 0.75))
+
+% Stacked: a note a second (or a unison) above an undisplaced one moves to
+% the right, as in a chord with its stem up.
+#(define (pondside-collection-cluster-shift head)
+   (let* ((pos (lambda (h) (ly:grob-property h 'staff-position 0)))
+          (heads (sort (pondside-collection-heads-of head)
+                       (lambda (a b) (or (< (pos a) (pos b))
+                                         (and (= (pos a) (pos b))
+                                              (< (pondside-collection-index a) (pondside-collection-index b)))))))
+          (width (interval-length (ly:stencil-extent (pondside-collection-plain-head head) X))))
+     (let loop ((hs heads) (prev #f) (prev-shifted #f))
+       (if (null? hs)
+           0
+           (let* ((h (car hs))
+                  (shifted (and prev (not prev-shifted) (<= (- (pos h) (pos prev)) 1))))
+             (if (eq? h head)
+                 (if shifted (* 0.95 width) 0)
+                 (loop (cdr hs) h shifted)))))))
+
+% Each note's x: in a row, after the notes (and accidentals) before it;
+% stacked, as a chord's heads are. Both start after the enclosure.
+#(define (pondside-collection-head-x head)
+   (cond
+    ((not (pondside-collection-head? head))
+     (ly:note-head::stem-x-shift head))
+    ((not (pondside-collection-row? head))
+     (+ (pondside-collection-start head) (pondside-collection-enclosure-room head)
+        (pondside-collection-acc-room head) (pondside-collection-cluster-shift head)))
+    (else
+     (let ((gap (pondside-collection-detail head 'collection-gap 0.8))
+           (width (lambda (h) (interval-length (ly:stencil-extent (pondside-collection-plain-head h) X))))
+           (heads (pondside-collection-heads-of head))
+           (start (+ (pondside-collection-start head) (pondside-collection-enclosure-room head))))
+       (let loop ((hs heads) (x start))
+         (if (null? hs)
+             start
+             (let* ((h (car hs))
+                    (hx (+ x (pondside-collection-acc-width h))))
+               (if (eq? h head)
+                   hx
+                   (loop (cdr hs) (+ hx (width h) gap))))))))))
+
+% Stacked: this head's accidental, in its column, relative to the head.
+#(define (pondside-collection-stacked-acc-x head acc)
+   (let* ((col (ly:grob-parent head X))
+          (chord-left (+ (pondside-collection-start head) (pondside-collection-enclosure-room head)
+                         (pondside-collection-acc-room head)))
+          (me (ly:grob-relative-coordinate head col X))
+          (column (or (assq-ref (pondside-collection-acc-columns head) head) 0)))
+     (- chord-left me 0.1
+        (* column (pondside-collection-acc-column-width head))
+        (cdr (ly:stencil-extent acc X)))))
+
+% The y range the enclosure spans (stacked parentheses, and brackets): the
+% notes, or the whole staff for brackets.
+#(define (pondside-collection-y-span head kind)
+   (let* ((heads (pondside-collection-heads-of head))
+          (ys (map (lambda (h) (* 0.5 (ly:grob-property h 'staff-position 0))) heads))
+          (lo (- (apply min ys) 0.6))
+          (hi (+ (apply max ys) 0.6))
+          (staff (ly:grob-object head 'staff-symbol))
+          (half (if (ly:grob? staff) (* 0.5 (1- (ly:grob-property staff 'line-count 5))) 2)))
+     (if (eq? kind 'brackets)
+         (cons (min lo (- half)) (max hi half))
+         (cons lo hi))))
+
+#(define (pondside-collection-paren head side span)
+   (let* ((st (ly:stencil-aligned-to
+               (grob-interpret-markup head (markup #:fontsize 1 (if (= side LEFT) "(" ")")))
+               Y CENTER))
+          (h (interval-length (ly:stencil-extent st Y)))
+          (want (interval-length span)))
+     (if (> want (* 1.4 h))
+         ;; tall: a drawn parenthesis, as wide as the glyph's curve
+         (let* ((lo (car span)) (hi (cdr span)) (q (* 0.22 want))
+                (w (min 0.9 (max 0.45 (* 0.12 want))))
+                (path (if (= side LEFT)
+                          (list 'moveto w lo 'curveto 0 (+ lo q) 0 (- hi q) w hi)
+                          (list 'moveto 0 lo 'curveto w (+ lo q) w (- hi q) 0 hi))))
+           (make-path-stencil path 0.14 1 1 #f))
+         (ly:stencil-translate-axis st (interval-center span) Y))))
+
+% In a row: the parenthesis LilyPond puts round a single note, about a
+% note head tall, level with this (the first or last) note.
+#(define (pondside-collection-head-paren head side)
+   (ly:stencil-aligned-to
+    (ly:font-get-glyph (ly:grob-default-font head)
+                       (if (= side LEFT) "accidentals.leftparen" "accidentals.rightparen"))
+    Y CENTER))
+
+#(define (pondside-collection-bracket side span)
+   (let* ((th 0.16) (arm 0.5)
+          (x0 (if (= side LEFT) 0 (- arm)))
+          (vertical (if (= side LEFT) 0 0)))
+     (ly:stencil-add
+      (make-filled-box-stencil (cons (- (/ th 2)) (/ th 2)) span)
+      (make-filled-box-stencil (if (= side LEFT) (cons 0 arm) (cons (- arm) 0))
+                               (cons (- (cdr span) th) (cdr span)))
+      (make-filled-box-stencil (if (= side LEFT) (cons 0 arm) (cons (- arm) 0))
+                               (cons (car span) (+ (car span) th))))))
+
+% The enclosure piece on one side, positioned against `edge` (the head's own
+% coordinates, y relative to the head).
+#(define (pondside-collection-enclosure head side edge)
+   (let* ((kind (pondside-collection-detail head 'collection-enclosure 'parentheses))
+          (y0 (* 0.5 (ly:grob-property head 'staff-position 0)))
+          (span (coord-translate (pondside-collection-y-span head kind) (- y0))))
+     (cond
+      ((eq? kind 'parentheses)
+       (let ((p (if (pondside-collection-row? head)
+                    (pondside-collection-head-paren head side)
+                    (pondside-collection-paren head side span))))
+         (ly:stencil-translate-axis p (if (= side LEFT)
+                                          (- edge 0.15 (cdr (ly:stencil-extent p X)))
+                                          (+ edge 0.15 (- (car (ly:stencil-extent p X)))))
+                                    X)))
+      ((eq? kind 'brackets)
+       (ly:stencil-translate-axis (pondside-collection-bracket side span)
+                                  (if (= side LEFT) (- edge 0.35) (+ edge 0.35)) X))
+      (else #f))))
+
+% Stacked: the enclosure's x edges, relative to this head, from every head.
+#(define (pondside-collection-stacked-edges head)
+   (let* ((heads (pondside-collection-heads-of head))
+          (col (ly:grob-parent head X))
+          (exts (map (lambda (h)
+                       (let ((x (ly:grob-relative-coordinate h col X))
+                             (e (ly:stencil-extent (pondside-collection-plain-head h) X))
+                             (a (pondside-collection-accidental h)))
+                         (cons (+ x (if a
+                                        (min (car e) (+ (pondside-collection-stacked-acc-x h a)
+                                                        (car (ly:stencil-extent a X))))
+                                        (car e)))
+                               (+ x (cdr e)))))
+                     heads))
+          (me (ly:grob-relative-coordinate head col X)))
+     (cons (- (apply min (map car exts)) me) (- (apply max (map cdr exts)) me))))
+
+#(define (pondside-collection-head-stencil head)
+   (let ((st (pondside-collection-plain-head head)))
+     (if (not (pondside-collection-head? head))
+         st
+         (let* ((acc (pondside-collection-accidental head))
+                (row? (pondside-collection-row? head))
+                (i (pondside-collection-index head))
+                (first? (zero? i))
+                (last? (= i (1- (pondside-collection-size head))))
+                (with-acc (cond ((not acc) st)
+                                (row? (ly:stencil-combine-at-edge st X LEFT acc 0.2))
+                                (else (ly:stencil-add
+                                       st
+                                       (ly:stencil-translate-axis
+                                        acc (pondside-collection-stacked-acc-x head acc) X)))))
+                (edges (if row?
+                           (ly:stencil-extent with-acc X)
+                           (pondside-collection-stacked-edges head)))
+                (left (and first? (pondside-collection-enclosure head LEFT (car edges))))
+                (right (and last? (pondside-collection-enclosure head RIGHT (cdr edges)))))
+           (apply ly:stencil-add (filter ly:stencil? (list with-acc left right)))))))
+
+% The whole collection, enclosure included, relative to its column: given to
+% the (hidden) stem, so spacing keeps the music after it clear of the row.
+#(define (pondside-collection-fan-extent stem)
+   (let* ((col (ly:grob-parent stem X))
+          (heads (filter pondside-collection-head?
+                         (ly:grob-array->list (ly:grob-object col 'note-heads)))))
+     (if (null? heads)
+         '(0 . 0)
+         (reduce interval-union '(0 . 0)
+                 (map (lambda (h)
+                        (coord-translate (ly:stencil-extent (pondside-collection-head-stencil h) X)
+                                         (ly:grob-relative-coordinate h col X)))
+                      heads)))))
+
+pondsideCollectionVoice = \with {
+  nullAccidentals = ##t
+  \override NoteColumn.ignore-collision = ##t
+  \override Stem.stencil = ##f
+  \override Flag.stencil = ##f
+  \override Beam.stencil = ##f
+  \override Dots.stencil = ##f
+  \override Stem.X-offset = 0
+  \override Stem.X-extent = #pondside-collection-fan-extent
+  \override NoteHead.stencil = #pondside-collection-head-stencil
+  \override NoteHead.X-offset = #pondside-collection-head-x
+  % spacing and ledger lines see only the head itself
+  \override NoteHead.X-extent = #(lambda (head) (ly:stencil-extent (pondside-collection-plain-head head) X))
+}
+
+% In \relative music the notes are read one after another, as written (not
+% as a chord), and the music after the collection continues from its last
+% note: what Pondside's editor assumes when it keeps octaves.
+#(define (pondside-collection-relative music pitch)
+   (let* ((chord (ly:music-property music 'element))
+          (notes (filter (lambda (m) (music-is-of-type? m 'note-event))
+                         (ly:music-property chord 'elements))))
+     (if (null? notes)
+         pitch
+         (ly:make-music-relative! (make-sequential-music notes) pitch))))
+
+collection =
+#(define-music-function (music) (ly:music?)
+   (let* ((notes (extract-typed-music music 'note-event))
+          (n (length notes))
+          (zero (ly:make-duration 2 0 0)))
+     (if (zero? n)
+         (make-music 'SequentialMusic 'elements '())
+         (make-music
+          'ContextSpeccedMusic
+          'create-new #t
+          'context-type 'Voice
+          'property-operations (ly:get-context-mods pondsideCollectionVoice)
+          'to-relative-callback pondside-collection-relative
+          'element
+          (make-music
+           'EventChord
+           'elements
+           (append
+            (map (lambda (note i)
+                   (let ((m (make-music 'NoteEvent
+                                        'pitch (ly:music-property note 'pitch)
+                                        'duration zero
+                                        'collection-index i
+                                        'collection-size n)))
+                     ; point-and-click: each note links to its own pitch
+                     (ly:music-set-property! m 'origin (ly:music-property note 'origin))
+                     m))
+                 notes (iota n))
+            (list (make-music 'NoteGroupingEvent 'span-direction START)
+                  (make-music 'NoteGroupingEvent 'span-direction STOP))))))))

@@ -114,3 +114,17 @@ extension ScoreEditor {
         return ScoreEdit(name: "Paste Notation", edits: [TextEdit(start..<oldEnd, String(decoding: after[start..<newEnd], as: UTF8.self))], selectionAnchors: anchors)
     }
 }
+
+extension ScoreEditor {
+    /// Repeats the selected stretch of music straight after itself, as one
+    /// reversible edit, selecting the copy so a further repeat continues the
+    /// sequence. Nil when the selection cannot be copied (see
+    /// `NotationClipboard.copy`).
+    public func repeatNotation(events: [Int], insertionAt: Int? = nil, parsing: ((String) -> SyntaxTree)? = nil) -> ScoreEdit? {
+        guard let anchor = events.max(),
+              let copied = NotationClipboard.copy(tree: tree, events: events),
+              var edit = pasteNotation(copied, after: anchor, insertionAt: insertionAt, parsing: parsing) else { return nil }
+        edit.name = "Repeat Selection"
+        return edit
+    }
+}

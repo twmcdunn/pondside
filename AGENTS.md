@@ -9,7 +9,8 @@ shown on reopen while LilyPond engraves afresh.
 
 Read `docs/DESIGN.md` before planning work: §0 has the principles, §7–8
 the graphics kit and the agent workflow, §9 what remains, §11 Score
-Setup (staves, and the cover/notes/legend in `front-matter.ily`). CLI, MCP,
+Setup (staves, and the cover/notes/legend in `front-matter.ily`), §13 pitch
+collections (`\collection`, its kit `pondside-collections.ily`). CLI, MCP,
 `cues.json`, `pondside.toml` and the RPC socket are documented in
 `docs/API.md`; test coverage, gaps and the planned agent smoke test in
 `docs/TESTING.md`; the SuperCollider patch, its offline render and patch

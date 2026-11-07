@@ -13,7 +13,8 @@ import Foundation
 /// Kinds: `tempo <quarters per minute>`, `text <label>` (cues are
 /// `text cue N`), `note <staff> <midi>` (Pondside adds the note's source
 /// `file line character`, for the playhead), `group <staff> start|stop`,
-/// `meter <n>/<d>`.
+/// `meter <n>/<d>`, `cnote <staff> <midi> <index>` (a note of a
+/// `\collection`, which takes no time and does not sound; DESIGN.md §13).
 public struct TimingLog: Sendable, Hashable {
     public struct Row: Sendable, Hashable {
         public enum Kind: Sendable, Hashable {
@@ -22,6 +23,8 @@ public struct TimingLog: Sendable, Hashable {
             case note(staff: String, midi: Int)
             case rest(staff: String)
             case group(staff: String, start: Bool)
+            /// A note of a `\collection`: its place in the collection.
+            case collectionNote(staff: String, midi: Int, index: Int)
             case meter(numerator: Int, denominator: Int)
             /// A Lexicon entry's cue: which entry, how long its music is (whole
             /// notes) and its params as written (a Scheme alist), so its sound
@@ -110,6 +113,12 @@ public struct TimingLog: Sendable, Hashable {
                 if values.count >= 4, let line = Int(values[2]), let ch = Int(values[3]) {
                     origin = Row.Origin(file: values[1], line: line, character: ch)
                 }
+            case "cnote":
+                guard values.count >= 3, let midi = Int(values[1]), let index = Int(values[2]) else { continue }
+                kind = .collectionNote(staff: values[0], midi: midi, index: index)
+                if values.count >= 6, let line = Int(values[4]), let ch = Int(values[5]) {
+                    origin = Row.Origin(file: values[3], line: line, character: ch)
+                }
             case "group":
                 guard values.count >= 2 else { continue }
                 kind = .group(staff: values[0], start: values[1] == "start")
@@ -162,32 +171,9 @@ public struct TimingLog: Sendable, Hashable {
         return best.map { ($0.1, $0.2) }
     }
 
-    /// Notes between each group start and stop on `staff` (e.g. the
-    /// electronics' `\collection`s), in score order.
+    /// Each collection on `staff` (the electronics' `\\collection`s), in
+    /// score order: Pondside's `cnote` rows, or older logs' groups.
     public func collections(staff: String) -> [(moment: Rational, bar: Int, midi: [Int])] {
-        var byMoment: [Rational: [Row]] = [:]
-        for r in rows {
-            switch r.kind {
-            case .note(let s, _) where s == staff: byMoment[r.moment, default: []].append(r)
-            case .group(let s, _) where s == staff: byMoment[r.moment, default: []].append(r)
-            default: break
-            }
-        }
-        var out: [(moment: Rational, bar: Int, midi: [Int])] = []
-        var current: (moment: Rational, bar: Int, midi: [Int])?
-        for m in byMoment.keys.sorted() {
-            let rs = byMoment[m]!
-            if rs.contains(where: { if case .group(_, true) = $0.kind { return true }; return false }) {
-                current = (m, rs[0].bar, [])
-            }
-            if current != nil {
-                for r in rs { if case .note(_, let midi) = r.kind { current!.midi.append(midi) } }
-            }
-            if current != nil, rs.contains(where: { if case .group(_, false) = $0.kind { return true }; return false }) {
-                out.append(current!)
-                current = nil
-            }
-        }
-        return out
+        Collections.find(in: self, staff: staff).map { ($0.moment, $0.bar, $0.midi) }
     }
 }

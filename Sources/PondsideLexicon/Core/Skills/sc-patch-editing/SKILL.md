@@ -52,7 +52,7 @@ Then reply in one line: what changed and how it sounds now, with numbers
 |---|---|
 | `cue` | the cue at or before the point: `name`, `bar`, `seconds`, `handler` (`~cue[\cue12]`), `window` (until the next cue), `code` (the handler, numbered), `point_after_cue`, and `wait`/`wait_examples` when the point is over 0.5 s after it |
 | `cue.touches` | what the handler uses (SynthDefs, patterns, buses, functions): `item`, `at` (file:lines), and `text` when short |
-| `collections` | the score's pitch collections around the point: `pitch_classes` (C = 0) and `midi` -- "on this chord" means these |
+| `collections` | the score's pitch collections around the point: `pitch_classes` (C = 0), `midi`, `staff`, and `index` into `~collections` (the engine loads every collection as `~collections[i]`, an Event with `pcs`, `midi`, `staff`, `bar`, `time`, `cue`) -- "on this chord" means these |
 | `doc` | the patch doc: every item with file:lines, and notes on intent. **Read the notes first**: they are what you (or the composer) worked out about this patch before |
 | `stale_notes` | notes whose code changed since: trust the code, and rewrite the note when you touch it |
 | `sc_lexicon` | one line per entry: id, kind, gloss, how to call it, params |

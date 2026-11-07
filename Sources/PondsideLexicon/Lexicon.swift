@@ -78,6 +78,12 @@ public struct Lexicon: Sendable {
         coreDirectory?.appendingPathComponent("Lexicon/kit/pondside-graphics.ily")
     }
 
+    /// Pitch collections, `\collection { … }` (DESIGN.md §13): every
+    /// generated `lexicon.ily` includes it.
+    public static var collectionsKit: URL? {
+        coreDirectory?.appendingPathComponent("Lexicon/kit/pondside-collections.ily")
+    }
+
     public static var userDirectory: URL {
         let env = ProcessInfo.processInfo.environment
         if let custom = env["PONDSIDE_LEXICON"] { return URL(fileURLWithPath: custom) }
@@ -200,10 +206,16 @@ public struct Lexicon: Sendable {
         #(define (pondside-lexicon-register! id proc) (hash-set! pondside-lexicon-impls id proc))
 
         """
+        // Everything is written in, not included from the app or the user's
+        // library: the project engraves without Pondside (DESIGN.md §0).
         // Graphic entries draw with the kit; it comes first, once.
         let graphics = ids.filter { entries[$0]?.entry.kind == .graphic }
         if !graphics.isEmpty, let kit = Self.graphicsKit {
-            out += "\\include \(Self.schemeString(kit.path))\n"
+            out += Self.inlined(kit, label: kit.lastPathComponent)
+        }
+        // `\collection`, wherever the score uses it.
+        if let kit = Self.collectionsKit {
+            out += Self.inlined(kit, label: kit.lastPathComponent)
         }
         for id in ids.sorted() {
             guard let l = entries[id] else { continue }
@@ -217,7 +229,7 @@ public struct Lexicon: Sendable {
             if let cue = l.entry.sound?.cue {
                 out += "#(hash-set! pondside-lexicon-cues \(Self.schemeString(id)) \(Self.schemeString(cue)))\n"
             }
-            out += "\\include \(Self.schemeString(l.directory.appendingPathComponent(l.entry.implFile).path))\n"
+            out += Self.inlined(l.directory.appendingPathComponent(l.entry.implFile), label: "\(id) \(l.entry.version)")
         }
         out += """
 
@@ -241,6 +253,12 @@ public struct Lexicon: Sendable {
 
         """
         return out
+    }
+
+    /// A file's text, between banner lines naming it, for lexicon.ily.
+    static func inlined(_ url: URL, label: String) -> String {
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? "% (missing)\n"
+        return "\n%% ---- \(label)\n" + text + (text.hasSuffix("\n") ? "" : "\n") + "%% ---- end \(label)\n\n"
     }
 
     public static func scheme(_ v: TOMLValue) -> String {

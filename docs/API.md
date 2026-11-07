@@ -45,7 +45,8 @@ pondside completion zsh|bash                       eval "$(pondside completion z
   read; `marks` the `\timingMark` lines starting with `--prefix`
   (default `improv`) in the same shape; `ec` the pitch classes of each
   `\collection` on `--staff` (default `elecUp`) as `~ec`/`~ecWhere`, as
-  `piece.ec.scd` always held them.
+  `piece.ec.scd` always held them; `collections` every staff's
+  collections as `~collections` (below, "Pitch collections").
 
 ## Project settings: `pondside.toml`
 
@@ -325,7 +326,7 @@ offered.
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `edit` | `file`, `edits: [{ old?, new, from_line?, to_line? }]`, `root?` | applies every edit or none: `old` is exact text, unique in the file (the contexts' `412| ` prefixes are stripped if copied); `from_line`…`to_line` replaces whole lines as the contexts number them, and with `old` too checks they still say it (else says where `old` is now). No reading the file first. For `.ly`/`.ily` it then returns `check`'s result (the app's engraving; `root` for an `.ily` when the app isn't open); for `.scd`, a pointer to `patch_check`. Pondside's own `pondside.scd` and `sc-lexicon.scd` are refused |
+| `edit` | `file`, `edits: [{ old?, new, from_line?, to_line? }]`, `root?` | applies every edit or none: `old` is exact text, unique in the file (the contexts' `412| ` prefixes are stripped if copied); `from_line`…`to_line` replaces whole lines as the contexts number them, and with `old` too checks they still say it (else says where `old` is now). No reading the file first. For `.ly`/`.ily` it then returns `check`'s result (the app's engraving; `root` for an `.ily` when the app isn't open); for `.scd`, a pointer to `patch_check`. Pondside's own `pondside.scd`, `sc-lexicon.scd` and a generated `lexicon.ily` are refused (an entry is changed with `lexicon_propose`) |
 | `check` | `file` | `{ ok, pages, diagnostics: [{ severity, file, line, column, message }], overflows?, log? }`. `overflows`: with `\autoLineBreaksOff`, the systems that run into the right margin, `[{ page, mm_past_margin, first: { file, line, column }, message }]` (no spacing setting narrows them: move a bar or narrow the content). On failure, `log` is the bounded tail of LilyPond's own log, including Guile backtraces the parser cannot locate. When the app has the score open: the app's engraving of the files as they are now (`from: "the running app"`, about a second), else a compile |
 | `query` | `file`, `from_line?`, `to_line?` | events in order: `{ kind, text, line, character, pitches, duration, explicitDuration }` |
 | `render` | `file`, `format?` (`pdf`·`svg`·`png`), `out?` | `{ files }` |
@@ -591,6 +592,49 @@ p.play(from: "42");                          // bar 42, or seconds
 It refuses to play when the server's sample rate differs from the
 mockup's, and prints the line that fixes it.
 
+## Pitch collections
+
+`\collection { c' d' fis' a' }` (DESIGN.md §13) is defined by Pondside's
+kit, `pondside-collections.ily`, which every generated `lexicon.ily`
+contains (written in, so the project needs nothing from the app); the root needs `\include "lexicon.ily"` (the app adds it, with
+the file, when a collection is inserted or pasted; `pondside lexicon
+include score.ly` writes the file). A collection takes no time, has no
+durations, does not sound in the MIDI, and its accidentals come from its
+pitches alone.
+
+The timing dump reports each note as a `cnote` row: `<moment> <bar>
+@<position> cnote <staff> <midi> <index> <file> <line> <character>`
+(`index` from 0 in written order; a collection's notes are never `note`
+rows). The group events it also carries keep older readers working.
+
+`pondside mockup` (the app runs it after every good engraving) writes
+`renders/<name>.collections.scd` beside `<name>.cues` when the score has
+collections, rewritten only when they change and removed when there are
+none. The engine (`patch/dependencies/pondside.scd`) loads it:
+
+```supercollider
+~collections[0]        // (index: 0, staff: 'elecUp', bar: 1, time: 0.0, cue: "cue 1",
+                       //  midi: [60, 62, 64, 67, 69], pcs: [0, 2, 4, 7, 9])
+~collectionsOn['elecUp']            // one staff's, in score order
+Scale(~collections[3].pcs)
+~ec = ~collectionsOn['elecUp'].collect(_.pcs);   // a patch written for ~ec
+```
+
+`staff` is the staff's context name (`\new Staff = "elecUp"`), empty for an
+unnamed staff; `time` is seconds in the mockup; `cue` the last cue at or
+before it. `patch_context` lists the collections around a point with the
+same `index` and their `staff`.
+
+Engraving Settings › Collections writes, in the root's `\layout`
+`\Score` context (a staff can override them in its `\with`):
+
+| Setting | Statement | Values |
+|---|---|---|
+| Noteheads | `\override NoteHead.details.collection-heads = #'filled` | `filled`, `hollow` |
+| Enclosure | `\override NoteHead.details.collection-enclosure = #'parentheses` | `parentheses` (in a row, note-head sized and level with the first and last notes; stacked, spanning the chord), `brackets` (the staff's height), `none` |
+| Layout | `\override NoteHead.details.collection-layout = #'row` | `row`, `stacked` |
+| Space between notes | `\override NoteHead.details.collection-gap = #0.8` | staff spaces |
+
 ## Skills and the files Pondside writes
 
 The skills `pondside mcp` serves describe the files Pondside itself
@@ -607,11 +651,12 @@ Names follow the root file: `quartet.ly` gives `quartet.cues`,
 | Cue times: `renders/score.cues` (`seconds<TAB>bar<TAB>cue N`) | `pondside mockup`, run by the app after every good engraving; `pondside cues --format cues` | lilypond-supercollider (the quark reads it), lilypond-electronics-staff (`\ecue` → `cue N`) |
 | Mockup: `renders/score.wav` | the same run | lilypond-supercollider |
 | cues.json | `pondside cues`, MCP `cues`, RPC `document.cues` | lilypond-supercollider, sc-patch-editing |
-| Collections `~ec`, marks | `pondside cues --format ec` / `marks` | lilypond-supercollider, lilypond-electronics-staff |
+| Collections: `renders/score.collections.scd` (`~collections`, loaded by the engine) | `pondside mockup`, with the cues | lilypond-supercollider, lilypond-electronics-staff, sc-patch-editing |
+| Collections `~ec` (one staff), marks | `pondside cues --format ec` / `marks` | lilypond-supercollider, lilypond-electronics-staff |
 | The patch `patch/score.scd` (`// @pondside patch`), its engine `patch/dependencies/pondside.scd` | the SuperCollider pane when the score has no patch; `pondside handlers`; stubs for new cues and the current engine after each mockup | lilypond-supercollider, sc-patch-migration |
 | The mix `renders/score.mix.wav` | `pondside mix`, run by the app after each mockup | — (⌘⌥P plays it) |
 | `score.before-pondside.scd` | `pondside patch --fix`, `patch_migrate`, the app's refactor dialog | sc-patch-migration |
-| `lexicon.ily` | `graphic_insert`, `pondside lexicon include` | graphic-notation, lexicon-entries |
+| `lexicon.ily` (self-contained: the collections kit, the graphics kit when a graphic is used, and each entry's impl, written in; never `\include`s outside the project) | `graphic_insert`, `pondside lexicon include`, the app when a collection is inserted or pasted | graphic-notation, lexicon-entries, lilypond-electronics-staff |
 | `patch/dependencies/sc-lexicon.scd` (`// @pondside sc-lexicon <ids>`) and its load line after the engine's | `sc_lexicon_add` | sc-patch-editing |
 | The patch doc `patch/score.patch.md` | `patch_doc`, `patch_note`, `patch_context`, `patch_check` | sc-patch-editing |
 | `front-matter.ily`: cover, notes, legend (`%% ---- cover` …, `%% legend: <id>` rows) and its `\include` before the root's first `\score` | the app's Score Setup (`⌘⇧U`) | lilypond, graphic-notation (the legend) |
@@ -622,7 +667,7 @@ All cue times come from one interpretation of the score: the playback
 compile (`PlaybackScore`) with Pondside's timing listener. The bundled
 libraries only mark things for it: `\ecue` sets `cue-label`,
 `\timingMark`/`\improvisation` set `timing-label`, `\playTempo` is a
-hidden `\tempo`, `\collection` wraps its notes in `\startGroup`/`\stopGroup`.
+hidden `\tempo`, `\collection` numbers its notes (`collection-index`, reported as `cnote` rows).
 A score that still includes the old workflow's `timing.ily` keeps writing
 `score.timing` (into the score's folder, as LilyPond runs there); Pondside
 reads its own rows, and the two agree (`pondside cues --format cues` and

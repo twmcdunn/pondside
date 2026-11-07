@@ -55,4 +55,19 @@ final class NotationClipboardTests: XCTestCase {
         XCTAssertNil(NotationClipboard.copy(tree: tree, events: []))
         XCTAssertNil(ScoreEditor(tree).pasteNotation("not music", after: 0))
     }
+
+    func testRepeatInsertsSelectionAfterItselfAndSelectsTheCopy() throws {
+        let source = "\\relative c' { c8 d e f g2 }"
+        let tree = SyntaxTree(source)
+        let edit = try XCTUnwrap(ScoreEditor(tree).repeatNotation(events: [1, 2]))
+        XCTAssertEqual(edit.name, "Repeat Selection")
+        let text = edit.edits.apply(to: source)
+        let after = SyntaxTree(text)
+        let pitches = after.events.map { $0.notes.map { after.notes[$0].absolute } }
+        let original = tree.events.map { $0.notes.map { tree.notes[$0].absolute } }
+        XCTAssertEqual(pitches, [original[0], original[1], original[2], original[1], original[2], original[3], original[4]])
+        XCTAssertEqual(after.events.map(\.effectiveDuration), [0, 1, 2, 1, 2, 3, 4].map { tree.events[$0].effectiveDuration })
+        XCTAssertEqual(edit.selectionAnchors, [after.events[3].range.lowerBound, after.events[4].range.lowerBound])
+        XCTAssertEqual(edit.edits.inverse(original: tree.bytes).apply(to: text), source)
+    }
 }

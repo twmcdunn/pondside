@@ -14,6 +14,14 @@ graphic notation on a shared Scheme kit with the agent workflow around it
   edit to the user's files. The app keeps no score state anywhere else.
   The only exceptions are derived and disposable: a cache of the latest
   engraving (§8, render cache) and app preferences.
+- **A project needs nothing outside its folder.** Everything a score
+  includes lives in the project: generated files (`lexicon.ily`, with the
+  graphics and collections kits and every Lexicon entry it uses written
+  into it; `front-matter.ily`; the patch's `dependencies/`) are copies,
+  never `\include`s or loads of files in the app bundle, the user's
+  library or Application Support. Take the folder out of Pondside and it
+  still engraves and plays. Pondside rewrites those copies (on open, and
+  whenever it writes them), so a newer kit reaches the project only then.
 - **LilyPond decides.** Timing, links and diagnostics come from LilyPond
   itself (listeners compiled into the engraving), not from re-implementing
   its semantics. Pondside's own models (the CST, the lens) are checked
@@ -1289,7 +1297,14 @@ the selected shared measure's definition.
   is saved with the layout (`PaneLayout`, older layouts decode without it);
   fractions keep the open arrangement and come back on expand. Presets and
   adding/removing a pane open everything. Stacked (rows) layouts line their
-  buttons up at the strip's trailing end.
+  buttons up at the strip's trailing end. The divider beside a folded
+  pane hides with it (`shouldHideDividerAt`), and a button at the window's
+  leading edge stays clear of the traffic lights.
+- **⌥ shortcuts are window-wide:** the window's key monitor runs a
+  catalog command whose shortcut is ⌥ or ⌥⇧ plus a key (⌥C, ⌥B, ⌥⇧B, ⌥U,
+  ⌥F, ⌥N) before the first responder sees the key, so they work in the
+  source editor instead of typing "ç", "∫" and so on. Those characters
+  can't be typed there; other ⌥ keys still type theirs.
 - **Source colouring** from the CST's token kinds (commands, strings,
   numbers, comments, Scheme, braces), as TextKit 2 rendering attributes, so
   undo and the text are untouched.
@@ -1586,6 +1601,96 @@ handles on the legend's pages; ⎋ ends it.
     the log's path.
 
 ---
+
+## 13. Pitch collections (2026-11-06)
+
+A pitch collection is a set of pitches shown at one moment on a staff, for
+the harmony or scale of a passage (an electronics part's, or an
+improvisation's). It began as a score's own `\collection` (the
+lilypond-electronics-staff library); it is now Pondside's.
+
+### Decision: zero time, in the voice, laid out by the kit
+
+- **Source.** `c'4 \collection { e' g' bes' } d'4`: the command stands
+  between two events of a voice, or splits a skip (`s4 \collection { … }
+  s4*3`). Its notes carry no durations. The `.ly` stays the only state.
+- **It takes no time.** The kit makes it a chord of length zero in a voice
+  of its own (`\new Voice` from inside the music, so it stands beside the
+  staff's own note at that moment instead of joining its stem). Only its
+  start is anchored: the moment where it is written. The measure contract,
+  the lens and every editor duration rule treat its body like a grace's
+  (`LensContext.collections`, also in `graces`).
+- **Layout belongs to the kit** (`PondsideLexicon/Core/Lexicon/kit/
+  pondside-collections.ily`). Each head's `X-offset` puts it after the heads
+  and accidentals before it, `collection-gap` apart, so the notes keep their
+  distances whatever the spacing around them. The hidden stem's `X-extent`
+  is the whole row, enclosure included, so spacing makes room for it (and a
+  score's graphics can find collections by it). A collection whose moment
+  has another voice's note starts after that note. Stacked layout places
+  heads as a chord with its stem up and accidentals in columns.
+- **Accidentals from the pitch alone.** The voice sets `nullAccidentals`,
+  so LilyPond's accidental engraver neither prints nor records the notes:
+  the key, earlier notes, the accidental style and later notes are all
+  untouched. The head stencil draws the pitch's own sharp or flat; anything
+  else is natural. The bug this replaced: a collection was a chord in the
+  bar, so D after an earlier D♯ got a natural and the D♯ beside it nothing.
+- **Links and sound.** Each made note keeps its source note's `origin`, so
+  every head links to its own pitch (the old function dropped it: clicking
+  a collection gave no link). Zero-length notes make no MIDI.
+- **`\relative`.** A `to-relative-callback` reads the notes one after
+  another and continues from the last, as the CST does, so editing keeps
+  octaves.
+- **Display options** are `NoteHead.details` (heads, enclosure, layout,
+  gap): Engraving Settings › Collections writes them in the root's `\Score`
+  context; a staff's `\with` can override. Details need no new context
+  property, so they compile on 2.24 and 2.26 alike.
+- **Inclusion.** Every generated `lexicon.ily` contains the kit (written
+  in, not included from the app, §0); inserting
+  or pasting a collection writes `lexicon.ily` and its `\include` when
+  missing. A score's own later `collection` definition still wins (see
+  as-the-wind3's migration note).
+
+### Editing (`PondsideCore/Editing/Collections.swift`)
+
+| Key | What |
+|---|---|
+| `k` (Space a o) | an empty collection where the selection ends, selected; a–g fill it (nearest octave, `=` `-` for sharp and flat; no rests, no durations) |
+| `r` | repeat it the input duration later (a moment inside a note moves to where the note ends, said in the status bar) |
+| `i` | invert the whole collection (any of its notes selected) |
+| `⌥←` `⌥→` | move it by the input duration |
+| `⌥⇧↑` `⌥⇧↓` | move it to the staff above / below at the same moment (`CollectionStaves`: each staff's first music variable, from Score Setup's staff scan); across files it is one undoable structural change |
+| ⌘C ⌘V | copy as `\absolute { \collection { … } }`; paste after the selection, or the input duration after a selected collection |
+| ⌫ | with all its notes selected, the whole collection |
+
+Moments come from the voice's managed bars (`\pondsideMeasure`: bar starts
+from the root's shared definitions, bodies padded), else the voice read in
+order; `<<` inside a bar is refused. A skip is split (`s4*49` → `s4*2 … 
+s4*47`), a padded bar gets a skip before the collection, and a following
+event that inherited its duration gets it written. Every collection edit
+re-parses and restores every other note's absolute pitch (relative chains),
+then collapses to one minimal replacement. Stepping a collection note
+ignores the key; `=` `-` `0` set its pitch directly; a note typed after a
+collection takes no accidental from it (`entryAccidental`, the lens writer).
+
+In the lens, collection notes are stemless graces with their own
+accidentals.
+
+### Timing and SuperCollider
+
+The dump writes `cnote` rows (staff, MIDI, index), so a staff's own note at
+the same moment is never part of its collection (as the old group-based
+reading allowed); `Collections.find` still reads older logs' groups.
+`pondside mockup` writes `renders/<name>.collections.scd` (`~collections`,
+every staff's, each an Event; `~collectionsOn['staff']`) and the engine
+loads it after the cue list. A collection edit changes the playback
+signature (it is custom music), so the file follows every edit.
+
+### Not built
+
+- A collection beamed across by the staff's own beam: allowed, untouched.
+- Selecting a collection's notes in the lens (graces are not selectable).
+- Names (`\collection #'opening`) for the patch: indices shift when one is
+  inserted earlier.
 
 ## Appendix A. Corrections to the brief (decided 2026-10-27)
 

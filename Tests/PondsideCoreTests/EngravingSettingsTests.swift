@@ -74,6 +74,22 @@ final class EngravingSettingsTests: XCTestCase {
         XCTAssertTrue(size.contains("  \\layout {\n    \\context {\n      \\Score\n      autoBeaming = ##f\n    }\n    #(layout-set-staff-size 18)\n  }"), size)
     }
 
+    func testCollectionDisplayIsWrittenAndReadBack() {
+        let bare = "\\version \"2.24.0\"\nmusic = { c'4 }\n\\score {\n  \\music\n}\n"
+        let hollow = change(bare, "score.collectionHeads", .choice("hollow"))
+        XCTAssertTrue(hollow.contains("\\override NoteHead.details.collection-heads = #'hollow"), hollow)
+        let doc = EngravingSettingsDocument(root: hollow)
+        XCTAssertEqual(doc.value(of: setting("score.collectionHeads")).value, .choice("hollow"))
+        XCTAssertEqual(doc.value(of: setting("score.collectionLayout")).value, .choice("row"))
+        let both = change(hollow, "score.collectionEnclosure", .choice("brackets"))
+        XCTAssertEqual(EngravingSettingsDocument(root: both).value(of: setting("score.collectionEnclosure")).value, .choice("brackets"))
+        XCTAssertEqual(EngravingSettingsDocument(root: both).value(of: setting("score.collectionHeads")).value, .choice("hollow"))
+        let gap = change(both, "score.collectionGap", .number(1.5))
+        XCTAssertEqual(EngravingSettingsDocument(root: gap).value(of: setting("score.collectionGap")).value, .number(1.5))
+        // Back to the default removes the line.
+        XCTAssertFalse(change(gap, "score.collectionHeads", .choice("filled")).contains("collection-heads"))
+    }
+
     func testAnotherFileIsReportedAndOutvoted() {
         let part = (file: "flute.ly", text: "\\layout {\n  \\context {\n    \\Score\n    autoBeaming = ##f\n  }\n}\n")
         let doc = EngravingSettingsDocument(root: score, others: [part])

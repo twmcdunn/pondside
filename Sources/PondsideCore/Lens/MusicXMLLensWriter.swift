@@ -118,10 +118,17 @@ struct MusicXMLLensWriter {
             if pitch.alteration % 2 != 0 { flag("quarter tones") }
 
             let slot = PitchKey(step: pitch.step, octave: pitch.octave)
-            let current = accidentals[slot] ?? key.alteration(for: pitch.step)
-            let forced = tree.notes[noteIndex].accidentalMark != nil
-            let accidental = forced || (!tiedIn && pitch.alteration != current) ? accidentalName(pitch.alteration) : nil
-            accidentals[slot] = pitch.alteration
+            let accidental: String?
+            if event.isCollection {
+                // A collection's sharps and flats always show; it neither takes
+                // nor leaves accidentals for the music around it.
+                accidental = pitch.alteration != 0 ? accidentalName(pitch.alteration) : nil
+            } else {
+                let current = accidentals[slot] ?? key.alteration(for: pitch.step)
+                let forced = tree.notes[noteIndex].accidentalMark != nil
+                accidental = forced || (!tiedIn && pitch.alteration != current) ? accidentalName(pitch.alteration) : nil
+                accidentals[slot] = pitch.alteration
+            }
 
             out += "      <note>"
             if event.isGrace { out += "<grace/>" }
@@ -132,9 +139,9 @@ struct MusicXMLLensWriter {
             out += common.duration
             if tiedIn { out += "<tie type=\"stop\"/>" }
             if tieStarts { out += "<tie type=\"start\"/>" }
-            out += "<voice>\(voice + 1)</voice>\(common.type)"
+            out += "<voice>\(voice + 1)</voice>\(event.isCollection ? "<type>quarter</type>" : common.type)"
             if let accidental { out += "<accidental>\(accidental)</accidental>" }
-            out += common.modification
+            out += event.isCollection ? "<stem>none</stem>" : common.modification
             var tied = ""
             if tiedIn { tied += "<tied type=\"stop\"/>" }
             if tieStarts { tied += "<tied type=\"start\"/>" }

@@ -81,7 +81,7 @@ public struct EngravingSetting: Sendable, Identifiable {
 
 extension EngravingSetting {
     /// Every setting, in dialog order. Defaults are LilyPond's own (2.24 and 2.26).
-    public static let all: [EngravingSetting] = page + systems + notes + accidentals + bars + tuplets + text
+    public static let all: [EngravingSetting] = page + systems + notes + accidentals + bars + tuplets + collections + text
 
     public static let groups: [String] = {
         var seen: [String] = []
@@ -230,6 +230,43 @@ extension EngravingSetting {
                          }),
         toggle("score.compressRests", group: "Meters & Bar Lines", "Compress empty bars", key: "skipBars",
                default: false, help: "Draw R1*8 as one multi-bar rest with its count."),
+    ]
+
+    /// `\collection` display (pondside-collections.ily, DESIGN.md §13): read
+    /// from NoteHead details, so a staff can also set its own.
+    static func collectionChoice(_ id: String, _ title: String, detail: String, help: String,
+                                 choices: [EngravingChoice], default value: String) -> EngravingSetting {
+        let key = "\\override NoteHead.details.collection-\(detail)"
+        return EngravingSetting(id, group: "Collections", title: title, help: help, location: .context("Score"),
+                                kind: .choice(choices), default: .choice(value), keys: [key],
+                                render: { ["\(key) = #'\($0.choice ?? value)"] },
+                                parse: { found in
+                                    found[key].flatMap(EngravingSetting.value(of:)).flatMap { v in
+                                        choices.first { v.contains($0.value) }.map { .choice($0.value) }
+                                    }
+                                })
+    }
+
+    static let collections: [EngravingSetting] = [
+        collectionChoice("score.collectionHeads", "Noteheads", detail: "heads",
+                         help: "Filled or white noteheads for the notes of a pitch collection.",
+                         choices: [EngravingChoice("filled", "Filled"), EngravingChoice("hollow", "White")], default: "filled"),
+        collectionChoice("score.collectionEnclosure", "Enclosure", detail: "enclosure",
+                         help: "Around each collection: parentheses, brackets the height of the staff, or nothing.",
+                         choices: [EngravingChoice("parentheses", "Parentheses"), EngravingChoice("brackets", "Brackets (whole staff)"),
+                                   EngravingChoice("none", "None")], default: "parentheses"),
+        collectionChoice("score.collectionLayout", "Layout", detail: "layout",
+                         help: "The notes in a row, a fixed distance apart, or stacked as a chord.",
+                         choices: [EngravingChoice("row", "In a row"), EngravingChoice("stacked", "Stacked")], default: "row"),
+        EngravingSetting("score.collectionGap", group: "Collections", title: "Space between notes",
+                         help: "In a row, the room between one note (and its accidental) and the next, in staff spaces.",
+                         location: .context("Score"), kind: .number(unit: "spaces", range: 0.2...3, step: 0.1), default: .number(0.8),
+                         keys: ["\\override NoteHead.details.collection-gap"],
+                         render: { ["\\override NoteHead.details.collection-gap = #\(format($0.number ?? 0.8))"] },
+                         parse: { found in
+                             found["\\override NoteHead.details.collection-gap"]
+                                 .flatMap { value(of: $0).flatMap(number(in:)) }.map(EngravingValue.number)
+                         }),
     ]
 
     static let tuplets: [EngravingSetting] = [

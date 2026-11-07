@@ -141,7 +141,7 @@ public enum PatchContext {
             let picked = [before, before.map { $0 + 1 } ?? 0].compactMap { $0 }.filter { $0 < collections.count }
             out["collections"] = .array(picked.map { k in
                 let c = collections[k]
-                return ["index": .number(Double(k)), "bar": .number(Double(c.bar)), "seconds": .number(c.seconds),
+                return ["index": .number(Double(k)), "staff": .string(c.staff), "bar": .number(Double(c.bar)), "seconds": .number(c.seconds),
                         "pitch_classes": .array(c.pitchClasses.map { .number(Double($0)) }),
                         "midi": .array(c.midi.map { .number(Double($0)) }), "cue": c.cue.map(JSONValue.string) ?? .null]
             })
@@ -162,9 +162,7 @@ public enum PatchContext {
 
     /// Every staff's pitch collections, in time order.
     public static func collections(in log: TimingLog) -> [Collections.Collection] {
-        var staves: [String] = []
-        for r in log.rows { if case .group(let s, _) = r.kind, !staves.contains(s) { staves.append(s) } }
-        return staves.flatMap { Collections.find(in: log, staff: $0) }.sorted { $0.moment < $1.moment }
+        Collections.all(in: log)
     }
 
     /// Writes `sc-lexicon.scd` for the patch's entries plus `ids`, and the
