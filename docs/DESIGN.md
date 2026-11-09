@@ -1672,8 +1672,22 @@ then collapses to one minimal replacement. Stepping a collection note
 ignores the key; `=` `-` `0` set its pitch directly; a note typed after a
 collection takes no accidental from it (`entryAccidental`, the lens writer).
 
-In the lens, collection notes are stemless graces with their own
-accidentals.
+**In the lens.** The lens's renderer (swift-sheet-music, after MuseScore)
+hangs a grace on the next note of its voice and drops graces with none, so
+collections written as graces vanished from a staff of skips. The writer
+(`MusicXMLLensWriter`) now draws a collection as the page does where it can:
+each note a stemless, unbeamed 128th taken from the skip after it (or
+borrowed from a rest right after it, which is then written by length alone,
+since a `<type>` would give the time back). Sharps and flats always show,
+naturals never. In a bar holding a collection every skip is a hidden chord
+(`LensGraceHost`), so each collection stands at its moment instead of
+packing against the last. A collection with no time after it (right before
+a note) stays graces leaning on that note, small and stemmed. The adapter
+hides the hosts, strips the stems and beams, and skips both when it counts
+a voice's chords (`LensTimedCollectionNote`, `LensGraceHost`). Collection
+notes are selectable either way (a note, or a `GraceNoteID` for graces): a
+click selects the note's source, the lens marks the selection while `k`
+and a–g fill a collection, and ←→ step through its notes.
 
 ### Timing and SuperCollider
 
@@ -1688,7 +1702,9 @@ signature (it is custom music), so the file follows every edit.
 ### Not built
 
 - A collection beamed across by the staff's own beam: allowed, untouched.
-- Selecting a collection's notes in the lens (graces are not selectable).
+- A collection at the very end of a bar in a voice with no note in that
+  bar: the lens has no time to give it and the renderer no note to hang it
+  on, so the lens doesn't draw it (the page does).
 - Names (`\collection #'opening`) for the patch: indices shift when one is
   inserted earlier.
 

@@ -340,4 +340,70 @@ final class LensTests: XCTestCase {
         let text = "\\header { title = \"x\" }\nm = { c'4 }\n"
         XCTAssertNil(LensScoreBuilder.build(tree: SyntaxTree(text), selection: 3..<3))
     }
+
+    /// Total time each voice of each measure takes in the XML, in divisions.
+    private func voiceTimes(_ xml: String) -> [[Int]] {
+        xml.components(separatedBy: "<measure ").dropFirst().map { measure in
+            var times: [Int] = [0]
+            for line in measure.components(separatedBy: "\n") {
+                if line.contains("<backup>") { times.append(0); continue }
+                guard !line.contains("<grace/>"), !line.contains("<chord/>"),
+                      let range = line.range(of: "<duration>"),
+                      let close = line.range(of: "</duration>") else { continue }
+                times[times.count - 1] += Int(line[range.upperBound..<close.lowerBound]) ?? 0
+            }
+            return times
+        }
+    }
+
+    func testACollectionOnSkipsIsDrawnAsATimedRow() throws {
+        let window = try lens("""
+        electronics = {
+          \\time 4/4
+          s4 \\collection { c' e' fis' } s2. |
+          \\collection { d' f' } s4 \\collection { g' a' } s2. |
+        }
+        """, at: "fis'")
+        // Stemless 128ths taken from the skip, not graces the renderer would
+        // drop with no chord to lean on.
+        XCTAssertFalse(window.xml.contains("<grace/>"))
+        XCTAssertEqual(count("<type>128th</type>", in: window.xml), 7)
+        XCTAssertEqual(window.timedCollections.count, 7)
+        XCTAssertEqual(window.timedCollections.map(\.chordIndex), [1, 2, 3, 0, 1, 3, 4])
+        // Every skip around them is a hidden chord, so each stands at its moment.
+        XCTAssertEqual(window.graceHosts.map(\.chordIndex), [0, 4, 2, 5])
+        XCTAssertTrue(window.xml.contains("<accidental>sharp</accidental>"))
+        XCTAssertEqual(voiceTimes(window.xml), [[40320], [40320]])
+        XCTAssertTrue(window.events.filter(\.isCollection).allSatisfy(\.isGrace))
+        XCTAssertEqual(window.target?.isCollection, true)
+    }
+
+    func testACollectionBorrowsFromARestButLeansOnANote() throws {
+        let window = try lens("""
+        flute = \\relative c' {
+          \\time 4/4
+          c4 \\collection { e g } d4 \\collection { a c } r2 |
+        }
+        """, at: "d4")
+        // Before a note it stays graces, which lean on that note.
+        XCTAssertEqual(count("<grace/>", in: window.xml), 2)
+        // Before a rest it takes its slivers from the rest, written by length.
+        XCTAssertEqual(window.timedCollections.count, 2)
+        XCTAssertTrue(window.xml.contains("<note><rest/><duration>\(20160 - 2 * 315)</duration><voice>1</voice></note>"))
+        XCTAssertEqual(voiceTimes(window.xml), [[40320]])
+        XCTAssertTrue(window.graceHosts.isEmpty)
+    }
+
+    func testCollectionNotesAreSteppedThrough() throws {
+        let text = """
+        electronics = {
+          \\time 4/4
+          s4 \\collection { c' e' } s2. |
+        }
+        """
+        let tree = SyntaxTree(text)
+        let window = try lens(text, at: "c'")
+        let next = try XCTUnwrap(window.neighbor(1))
+        XCTAssertEqual(tree.string(tree.events[next].range), "e'")
+    }
 }

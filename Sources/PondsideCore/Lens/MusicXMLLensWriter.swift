@@ -19,6 +19,12 @@ struct MusicXMLLensWriter {
     let tree: SyntaxTree
     /// What the output could not represent, for the badge.
     private(set) var flags: [String] = []
+    /// The hidden chords written for graces with no chord to lean on.
+    private(set) var hosts: [LensGraceHost] = []
+    /// The collection notes written as stemless timed notes.
+    private(set) var timedCollections: [LensTimedCollectionNote] = []
+    /// What each of those takes from the skip after its collection.
+    static let collectionSliver = LensFraction(1, 128)
     private var voices: [Int: VoiceState] = [:]
 
     init(tree: SyntaxTree) {
@@ -61,27 +67,98 @@ struct MusicXMLLensWriter {
                 var accidentals: [PitchKey: Int] = [:]
                 var clefInVoice = clef
                 var cursor = measure.start
+                // How far the voice's output has got: past `cursor` while a
+                // collection's notes take a sliver of the skip after them.
+                var written = measure.start
+                // Graces (or a collection) written since the voice's last
+                // chord, so the next gap is a hidden chord; and how many
+                // chords (rests included) the voice has had in this measure.
+                var waitingGraces = false
+                var chords = 0
                 let events = measure.events.filter { $0.voiceIndex == voice }.sorted { $0.sourceOffset < $1.sourceOffset }
-                for event in events {
-                    if cursor < event.onset {
-                        out += "      <forward><duration>\(units(event.onset - cursor))</duration><voice>\(voice + 1)</voice></forward>\n"
-                        cursor = event.onset
+                // In a bar with a collection every skip is a hidden chord, so
+                // each collection stands at its moment, not packed together.
+                let holdsCollection = events.contains(where: \.isCollection)
+                // Time a collection took from the rest right after it.
+                var borrowed = LensFraction.zero
+                func advance(to time: LensFraction) {
+                    guard written < time else { return }
+                    if waitingGraces || holdsCollection {
+                        out += host(time - written, measure: measure.index, voice: voice, chords: &chords, key: key)
+                        waitingGraces = false
+                    } else {
+                        out += "      <forward><duration>\(units(time - written))</duration><voice>\(voice + 1)</voice></forward>\n"
                     }
+                    written = time
+                }
+                let end = measure.start + measure.length
+                var timedRun = 0
+                for (eventIndex, event) in events.enumerated() {
+                    advance(to: event.onset)
+                    if cursor < event.onset { cursor = event.onset }
                     if position == 0, event.clef != clefInVoice {
                         out += "      <attributes>\(clefXML(event.clef))</attributes>\n"
                         clefInVoice = event.clef
                     }
                     if event.isSpacer {
-                        out += "      <forward><duration>\(units(event.duration))</duration><voice>\(voice + 1)</voice></forward>\n"
+                        advance(to: cursor + event.duration)
                     } else if event.isMeasureRest {
                         out += "      <note><rest measure=\"yes\"/><duration>\(units(measure.length))</duration><voice>\(voice + 1)</voice></note>\n"
+                        chords += 1
+                        waitingGraces = false
                         cursor = cursor + measure.length
+                        written = max(written, cursor)
                         continue
                     } else {
-                        out += note(event, voice: voice, key: key, accidentals: &accidentals)
+                        if event.isCollection, timedRun == 0 {
+                            // The collection's notes, and the time before the
+                            // voice's next note (or the bar's end): with room
+                            // for a sliver each, they are drawn as stemless
+                            // notes in a row, as on the page; else as graces.
+                            let run = events[eventIndex...].prefix { $0.isCollection && $0.onset == event.onset }
+                            let following = events[(eventIndex + run.count)...].first { !$0.isSpacer }
+                            let needed = Self.collectionSliver * LensFraction(run.count)
+                            var room = (following?.onset ?? end) - max(written, event.onset)
+                            // A rest right after it lends the time (the
+                            // renderer hangs graces on notes only).
+                            if let following, following.isRest, !following.isMeasureRest, !following.isGrace,
+                               following.onset == event.onset, room < needed, needed < following.duration {
+                                borrowed = needed
+                                room = needed
+                            }
+                            if !(room < needed) { timedRun = run.count }
+                        }
+                        let timed = timedRun > 0
+                        if timed {
+                            timedRun -= 1
+                            timedCollections.append(LensTimedCollectionNote(
+                                sourceEvent: event.sourceEvent, measureIndex: measure.index, voiceIndex: voice, chordIndex: chords))
+                        }
+                        let lent = event.isRest && !event.isGrace ? borrowed : .zero
+                        if event.isRest && !event.isGrace { borrowed = .zero }
+                        let text = note(event, voice: voice, key: key, accidentals: &accidentals, timed: timed, lent: lent)
+                        out += text
+                        if timed {
+                            chords += 1
+                            written = written + Self.collectionSliver
+                            // The skip after it as a hidden chord too, so the
+                            // next collection stands at its own moment.
+                            if timedRun == 0 { waitingGraces = true }
+                        } else if !text.isEmpty {
+                            if event.isGrace {
+                                waitingGraces = true
+                            } else {
+                                chords += 1
+                                waitingGraces = false
+                            }
+                        }
+                        if !event.isGrace { written = max(written, cursor + event.duration) }
+                        if LensFraction.zero < lent { waitingGraces = false }
                     }
                     cursor = cursor + event.duration
                 }
+                if waitingGraces { advance(to: end) }
+                cursor = max(cursor, written)
                 if position + 1 < voiceIndices.count, measure.start < cursor {
                     out += "      <backup><duration>\(units(cursor - measure.start))</duration></backup>\n"
                 }
@@ -92,14 +169,44 @@ struct MusicXMLLensWriter {
         return out
     }
 
+    /// A hidden chord of `length` (or of the longest plain value inside it,
+    /// the rest as a forward) for the graces just written to lean on. The
+    /// renderer drops graces with no chord after them in their voice, as
+    /// MuseScore does, so a `\\collection` on a staff of skips would vanish.
+    /// Its pitch takes the key's alteration, so it changes no accidental.
+    private mutating func host(
+        _ length: LensFraction, measure: Int, voice: Int, chords: inout Int, key: KeySignature
+    ) -> String {
+        guard let log = (0...7).first(where: { !(length < LensFraction(1, 1 << $0)) }) else {
+            return "      <forward><duration>\(units(length))</duration><voice>\(voice + 1)</voice></forward>\n"
+        }
+        let value = LensFraction(1, 1 << log)
+        hosts.append(LensGraceHost(measureIndex: measure, voiceIndex: voice, chordIndex: chords))
+        chords += 1
+        let alteration = key.alteration(for: 6)
+        var out = "      <note><pitch><step>B</step>"
+        if alteration != 0 { out += "<alter>\(alterText(alteration))</alter>" }
+        out += "<octave>4</octave></pitch><duration>\(units(value))</duration><voice>\(voice + 1)</voice>"
+        out += "<type>\(typeName(log))</type><stem>none</stem></note>\n"
+        if value < length {
+            out += "      <forward><duration>\(units(length - value))</duration><voice>\(voice + 1)</voice></forward>\n"
+        }
+        return out
+    }
+
     private mutating func note(
-        _ event: LensMeasuredEvent, voice: Int, key: KeySignature, accidentals: inout [PitchKey: Int]
+        _ event: LensMeasuredEvent, voice: Int, key: KeySignature, accidentals: inout [PitchKey: Int], timed: Bool = false,
+        lent: LensFraction = .zero
     ) -> String {
         let post = event.isGrace ? [] : tree.events[event.sourceEvent].postEvents.map { normalized(tree.string($0)) }
         var state = voices[voice, default: VoiceState()]
         defer { voices[voice] = state }
 
-        let common = timing(event, voice: voice)
+        var common = timing(event, voice: voice)
+        if timed { common = ("<duration>\(units(Self.collectionSliver))</duration>", "<type>128th</type>", "") }
+        // A rest that lent a collection its time: by length alone, since a
+        // type would give it back.
+        if LensFraction.zero < lent { common = ("<duration>\(units(event.duration - lent))</duration>", "", "") }
         var marks = notations(event, post: post, state: &state)
 
         guard !event.notes.isEmpty else {
@@ -131,7 +238,7 @@ struct MusicXMLLensWriter {
             }
 
             out += "      <note>"
-            if event.isGrace { out += "<grace/>" }
+            if event.isGrace && !timed { out += "<grace/>" }
             if index > 0 { out += "<chord/>" }
             out += "<pitch><step>\(stepName(pitch.step))</step>"
             if pitch.alteration != 0 { out += "<alter>\(alterText(pitch.alteration))</alter>" }
@@ -139,7 +246,7 @@ struct MusicXMLLensWriter {
             out += common.duration
             if tiedIn { out += "<tie type=\"stop\"/>" }
             if tieStarts { out += "<tie type=\"start\"/>" }
-            out += "<voice>\(voice + 1)</voice>\(event.isCollection ? "<type>quarter</type>" : common.type)"
+            out += "<voice>\(voice + 1)</voice>\(event.isCollection && !timed ? "<type>quarter</type>" : common.type)"
             if let accidental { out += "<accidental>\(accidental)</accidental>" }
             out += event.isCollection ? "<stem>none</stem>" : common.modification
             var tied = ""

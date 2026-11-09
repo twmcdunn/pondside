@@ -13,6 +13,7 @@ enum LensScoreAdapter {
 
     static func score(for lens: LensScoreWindow) throws -> Score {
         var score = try MusicXMLParser.parse(Data(lens.xml.utf8))
+        hideGraceHosts(lens, in: &score)
         preserveWrittenAccidentals(lens, in: &score)
         // Before anything that records element indices (tuplets): each
         // dynamic is a voice element of its own, just before its chord.
@@ -23,6 +24,96 @@ enum LensScoreAdapter {
         attachTuplets(lens, to: &score)
         attachTremolos(lens, to: &score)
         return score
+    }
+
+    /// The chords written only for a collection's graces to lean on. Before
+    /// anything that counts chords: `element(of:)` skips hidden ones.
+    static func hideGraceHosts(_ lens: LensScoreWindow, in score: inout Score) {
+        for host in lens.graceHosts {
+            guard let at = chordElement(host.chordIndex, voice: host.voiceIndex, measure: host.measureIndex, in: lens, score: score)
+            else { continue }
+            updateChord(in: &score, measure: host.measureIndex, slot: at.slot, index: at.index) { $0.visible = false }
+        }
+        // A collection drawn as timed notes: stemless and unbeamed, its
+        // sharps and flats always shown and no naturals, as the kit draws it.
+        for timed in lens.timedCollections {
+            guard let at = chordElement(timed.chordIndex, voice: timed.voiceIndex, measure: timed.measureIndex, in: lens, score: score)
+            else { continue }
+            updateChord(in: &score, measure: timed.measureIndex, slot: at.slot, index: at.index) { chord in
+                chord.stemVisible = false
+                chord.beamVisible = false
+                for n in chord.notes.indices {
+                    chord.notes.updateNote(at: n) { note in
+                        if note.accidental == .natural { note.accidental = nil }
+                        note.accidentalRole = .user
+                    }
+                }
+            }
+        }
+    }
+
+    /// The `index`-th chord (rests included) of lens voice `voice` in
+    /// `measure`, counting the writer's auxiliary chords too.
+    private static func chordElement(_ index: Int, voice: Int, measure: Int, in lens: LensScoreWindow, score: Score)
+        -> (slot: Int, index: Int)? {
+        guard let slot = slot(of: voice, measure: measure, in: lens),
+              let measures = score[staff]?.measures, measures.indices.contains(measure),
+              measures[measure].voices.indices.contains(slot) else { return nil }
+        var seen = 0
+        for (at, element) in measures[measure].voices[slot].elements.enumerated() {
+            guard case .chord = element else { continue }
+            if seen == index { return (slot, at) }
+            seen += 1
+        }
+        return nil
+    }
+
+    /// The parsed voice slot of lens voice `voice` in `measure`: the
+    /// importer numbers voices by first appearance.
+    private static func slot(of voice: Int, measure: Int, in lens: LensScoreWindow) -> Int? {
+        Set(lens.events.filter { $0.measureIndex == measure }.map(\.voiceIndex)).sorted().firstIndex(of: voice)
+    }
+
+    /// Where a collection's note landed: the grace chord the importer hung
+    /// on a chord of its voice (before it, or after the voice's last chord).
+    /// Graces keep their order, so the measure's graces in the voice, in
+    /// source order, are the voice's grace chords in reading order.
+    static func grace(of event: LensEvent, in lens: LensScoreWindow, score: Score) -> GraceNoteID? {
+        let timed = Set(lens.timedCollections.map(\.sourceEvent))
+        guard event.isGrace, !timed.contains(event.sourceEvent), let measures = score[staff]?.measures, measures.indices.contains(event.measureIndex),
+              let slot = slot(of: event.voiceIndex, measure: event.measureIndex, in: lens),
+              measures[event.measureIndex].voices.indices.contains(slot) else { return nil }
+        let graces = lens.events.filter { $0.isGrace && !timed.contains($0.sourceEvent) && $0.measureIndex == event.measureIndex && $0.voiceIndex == event.voiceIndex }
+            .map(\.sourceEvent).sorted()
+        guard let wanted = graces.firstIndex(of: event.sourceEvent) else { return nil }
+        var seen = 0
+        for (index, element) in measures[event.measureIndex].voices[slot].elements.enumerated() {
+            guard case let .chord(chord) = element else { continue }
+            let parent = VoiceElementID(staff: staff, measureIndex: event.measureIndex, voiceIndex: slot, elementIndex: index)
+            for (side, count) in [(GraceNoteID.Side.before, chord.graceNotesBefore.count), (.after, chord.graceNotesAfter.count)] {
+                if wanted < seen + count {
+                    return GraceNoteID(parent: parent, side: side, graceIndex: wanted - seen, noteIndexInGraceChord: 0)
+                }
+                seen += count
+            }
+        }
+        return nil
+    }
+
+    /// The lens event a clicked grace note belongs to.
+    static func event(at grace: GraceNoteID, in lens: LensScoreWindow, score: Score) -> LensEvent? {
+        lens.events.first { event in
+            guard event.isCollection, let id = self.grace(of: event, in: lens, score: score) else { return false }
+            return id.parent == grace.parent && id.side == grace.side && id.graceIndex == grace.graceIndex
+        }
+    }
+
+    /// Every note of a collection event's grace chord.
+    private static func graceItems(of event: LensEvent, in lens: LensScoreWindow, score: Score) -> [ScoreItemID] {
+        guard event.isCollection, let id = grace(of: event, in: lens, score: score) else { return [] }
+        return event.notes.indices.map {
+            .graceNote(GraceNoteID(parent: id.parent, side: id.side, graceIndex: id.graceIndex, noteIndexInGraceChord: $0))
+        }
     }
 
     /// MusicXML import loses LilyPond's !/? display intent. Mark only those
@@ -64,15 +155,24 @@ enum LensScoreAdapter {
     /// found by counting chords (a rest is an empty chord) in the voice's
     /// slot, not by trusting indices.
     static func element(of event: LensEvent, in lens: LensScoreWindow, score: Score) -> (slot: Int, index: Int)? {
+        if event.isCollection {
+            guard let timed = lens.timedCollections.first(where: { $0.sourceEvent == event.sourceEvent }) else { return nil }
+            return chordElement(timed.chordIndex, voice: timed.voiceIndex, measure: timed.measureIndex, in: lens, score: score)
+        }
         guard !event.isGrace, let measures = score[staff]?.measures,
               measures.indices.contains(event.measureIndex) else { return nil }
         let voicesHere = Set(lens.events.filter { $0.measureIndex == event.measureIndex }.map(\.voiceIndex)).sorted()
         let voices = measures[event.measureIndex].voices
         guard let slot = voicesHere.firstIndex(of: event.voiceIndex), voices.indices.contains(slot) else { return nil }
 
-        var seen = 0
+        // The writer's own chords (hosts, timed collection notes) don't count.
+        let auxiliary = Set(lens.graceHosts.filter { $0.measureIndex == event.measureIndex && $0.voiceIndex == event.voiceIndex }.map(\.chordIndex))
+            .union(lens.timedCollections.filter { $0.measureIndex == event.measureIndex && $0.voiceIndex == event.voiceIndex }.map(\.chordIndex))
+        var seen = 0, chords = -1
         for (index, element) in voices[slot].elements.enumerated() {
             guard case .chord = element else { continue }
+            chords += 1
+            if auxiliary.contains(chords) { continue }
             if seen == event.ordinal { return (slot, index) }
             seen += 1
         }
@@ -89,8 +189,11 @@ enum LensScoreAdapter {
 
     /// The parsed score's address for the lens target.
     static func target(of lens: LensScoreWindow, in score: Score) -> (VoiceElementID, ScoreItemID)? {
-        guard let event = lens.target, let (slot, index, chord) = chord(of: event, in: lens, score: score)
-        else { return nil }
+        guard let event = lens.target else { return nil }
+        if event.isCollection, element(of: event, in: lens, score: score) == nil, let item = graceItems(of: event, in: lens, score: score).first, case let .graceNote(id) = item {
+            return (id.parent, item)
+        }
+        guard let (slot, index, chord) = chord(of: event, in: lens, score: score) else { return nil }
         if chord.notes.isEmpty {
             let rest = RestID(staff: staff, measureIndex: event.measureIndex, voiceIndex: slot, elementIndex: index)
             return (VoiceElementID(rest), .rest(rest))
@@ -105,6 +208,10 @@ enum LensScoreAdapter {
     static func items(of lens: LensScoreWindow, in score: Score) -> Set<ScoreItemID> {
         var out = Set<ScoreItemID>()
         for event in lens.events where lens.selected.contains(event.sourceEvent) {
+            if event.isCollection, element(of: event, in: lens, score: score) == nil {
+                out.formUnion(graceItems(of: event, in: lens, score: score))
+                continue
+            }
             guard let (slot, index, chord) = chord(of: event, in: lens, score: score) else { continue }
             if chord.notes.isEmpty {
                 out.insert(.rest(RestID(staff: staff, measureIndex: event.measureIndex,

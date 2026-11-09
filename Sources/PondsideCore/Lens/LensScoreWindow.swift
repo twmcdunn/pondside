@@ -24,6 +24,9 @@ public struct LensEvent: Sendable, Hashable {
     public var isRest: Bool
     public var isGrace: Bool
     public var isTarget: Bool
+    /// A note of a `\collection` (a grace too): the lens draws, marks and
+    /// steps through these, unlike other graces.
+    public var isCollection = false
 
     public init(
         sourceEvent: Int, measureIndex: Int, voiceIndex: Int, ordinal: Int,
@@ -88,6 +91,28 @@ public struct LensHairpin: Sendable, Hashable {
     public var crescendo: Bool
 }
 
+/// A hidden chord the MusicXML carries only so that the graces before it
+/// (a collection on a staff of skips) have a chord to lean on: the
+/// `chordIndex`-th chord or rest of voice `voiceIndex` in measure
+/// `measureIndex`. The renderer's import can't read `print-object`, so the
+/// adapter hides it.
+public struct LensGraceHost: Sendable, Hashable {
+    public var measureIndex: Int
+    public var voiceIndex: Int
+    public var chordIndex: Int
+}
+
+/// A collection note the MusicXML writes as a timed note (a 128th taken
+/// from the skip after it, so the notes stand in a row as on the page): the
+/// `chordIndex`-th chord of voice `voiceIndex` in measure `measureIndex`.
+/// The adapter hides its stem and beam.
+public struct LensTimedCollectionNote: Sendable, Hashable {
+    public var sourceEvent: Int
+    public var measureIndex: Int
+    public var voiceIndex: Int
+    public var chordIndex: Int
+}
+
 /// A few measures of one staff around the selection, as MusicXML.
 public struct LensScoreWindow: Sendable {
     public var xml: String
@@ -104,6 +129,10 @@ public struct LensScoreWindow: Sendable {
     /// Dynamics and hairpins, which the lens's MusicXML leaves out.
     public var dynamics: [LensDynamic] = []
     public var hairpins: [LensHairpin] = []
+    /// Hidden chords for graces to lean on, which the renderer must hide.
+    public var graceHosts: [LensGraceHost] = []
+    /// Collection notes written as timed, stemless notes.
+    public var timedCollections: [LensTimedCollectionNote] = []
     /// What the lens can't show faithfully, for a badge.
     public var unsupported: [String]
     public var targetEvent: Int
@@ -143,13 +172,13 @@ public struct LensScoreWindow: Sendable {
     /// The source event one step after (`step > 0`) or before the target,
     /// for ←→ in the lens. The walk stays in the target's voice and falls
     /// back to the nearest event of any voice where that voice ends; nil at
-    /// the edge of the music. Graces are stepped over: the lens can't mark
-    /// them.
+    /// the edge of the music. Graces are stepped over, except a
+    /// collection's notes, which the lens marks.
     public func neighbor(_ step: Int, inserting: Bool = false) -> Int? {
         guard let target, step != 0 else { return nil }
         if inserting && step < 0 { return target.sourceEvent }
         let ahead = events
-            .filter { !$0.isGrace && (step > 0 ? $0.sourceEvent > target.sourceEvent : $0.sourceEvent < target.sourceEvent) }
+            .filter { (!$0.isGrace || $0.isCollection) && (step > 0 ? $0.sourceEvent > target.sourceEvent : $0.sourceEvent < target.sourceEvent) }
             .sorted { step > 0 ? $0.sourceEvent < $1.sourceEvent : $0.sourceEvent > $1.sourceEvent }
         return (ahead.first { $0.voiceIndex == target.voiceIndex } ?? ahead.first)?.sourceEvent
     }
@@ -275,7 +304,7 @@ public enum LensScoreBuilder {
                         tremolos.append(LensTremoloMark(event: index, bars: tremolo.bars, between: tremolo.between))
                     }
                 }
-                events.append(LensEvent(
+                var made = LensEvent(
                     sourceEvent: event.sourceEvent,
                     measureIndex: measure.index,
                     voiceIndex: event.voiceIndex,
@@ -284,7 +313,9 @@ public enum LensScoreBuilder {
                     isRest: event.isRest,
                     isGrace: event.isGrace,
                     isTarget: event.sourceEvent == target
-                ))
+                )
+                made.isCollection = event.isCollection
+                events.append(made)
             }
         }
 
@@ -302,6 +333,8 @@ public enum LensScoreBuilder {
         window.updateSelectedSlur(selection: selection, tree: tree)
         window.tuplets = tuplets.sorted { $0.start < $1.start }
         window.tremolos = tremolos
+        window.graceHosts = writer.hosts
+        window.timedCollections = writer.timedCollections
         (window.dynamics, window.hairpins) = dynamicMarks(events, tree: tree)
         return window
     }

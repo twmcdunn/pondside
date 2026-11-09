@@ -184,7 +184,10 @@ final class LensScoreHostView: NSView {
             displayedMarkHandler?(event.sourceEvent, kind)
             return
         }
-        if let item = document.editingHitTest(at: point, activeVoice: 0, nearMissTolerance: 4),
+        if case .graceNote(let grace)? = document.editingHitTest(at: point, activeVoice: 0, nearMissTolerance: 4),
+           let source = LensScoreAdapter.event(at: grace, in: lensWindow, score: renderedScore) {
+            displayedSelectionHandler?(source.sourceEvent, event.modifierFlags.contains(.shift))
+        } else if let item = document.editingHitTest(at: point, activeVoice: 0, nearMissTolerance: 4),
            let source = lensWindow.events.first(where: { source in
                guard source.measureIndex == item.measureIndex,
                      let element = LensScoreAdapter.element(of: source, in: lensWindow, score: renderedScore) else { return false }
