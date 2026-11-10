@@ -83,8 +83,8 @@ The context's `selection` has `kind: "graphic-section"`. It gives:
 **Canonical system moments identify systems; interpolated edge moments do
 not.** For a drawing window use `systems.first.moments[0]` as `m0` and
 `systems.last.moments[0]` as `m1`; on one system `m0 == m1`. The edge itself
-is always `from.x` / `to.x` (or page x). Use `from.at`/`to.at` only for music
-placement such as a new graphic. Never substitute a cue, bar or named range.
+is always `from.x` / `to.x` (or page x). Use `from.at.moment`/`to.at.moment`
+only for music placement such as a new graphic. Never substitute a cue, bar or named range.
 
 If the context has no `graphic`, the marked stretch has no drawing yet. If the
 request is a drawing, add one (see "A new graphic" below), not a window; if it

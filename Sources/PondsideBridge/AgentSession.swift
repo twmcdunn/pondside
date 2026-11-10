@@ -326,7 +326,7 @@ public final class AgentSession: @unchecked Sendable {
 
     private func sendToOpencode(_ prompt: String, onActivity: (@Sendable (String) -> Void)?) async -> AgentRun.Outcome {
         do { try await startOpencodeIfNeeded() } catch {
-            locked { log }?.log("exit", "\(agent.harness.title) didn't start: \(error.localizedDescription)", level: .error)
+            locked { self.log }?.log("exit", "\(agent.harness.title) didn't start: \(error.localizedDescription)", level: .error)
             close()
             return AgentRun.Outcome(summary: "\(agent.harness.title) didn't start: \(error.localizedDescription)", failed: true, costUSD: nil)
         }
@@ -422,7 +422,7 @@ public final class AgentSession: @unchecked Sendable {
     private func startOpencodeIfNeeded() async throws {
         let running = locked { () -> Bool in
             if let process, process.isRunning, ready {
-                log?.log("reuse", "Continuing \(agent.harness.title)'s running session (process \(process.processIdentifier))", level: .debug)
+                self.log?.log("reuse", "Continuing \(agent.harness.title)'s running session (process \(process.processIdentifier))", level: .debug)
                 return true
             }
             return false

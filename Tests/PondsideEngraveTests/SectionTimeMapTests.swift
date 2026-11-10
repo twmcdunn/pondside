@@ -100,7 +100,8 @@ final class SectionTimeMapTests: XCTestCase {
             pages: [page], from: (0, Point(20, 52)), to: (0, Point(50, 52)), link: link))
         let map = SectionTimeMap(log: log, pages: [page])
         let edge = try XCTUnwrap(map.edge(at: section.to, staffName: "electronicsGraphics"))
-        XCTAssertEqual(edge.moment, Rational(31, 2))
+        // x = 50 is ¾ of the way from the note at 20 (moment 14) to the one at 60 (17).
+        XCTAssertEqual(edge.moment, Rational(65, 4))
         XCTAssertEqual(edge.bar, 7)
         let moments = try XCTUnwrap(map.systemMoments(page: section.to.page, system: section.to.system))
         XCTAssertEqual(moments.first, Rational(14))

@@ -39,11 +39,11 @@ final class EngravedPageTests: XCTestCase {
         XCTAssertEqual(page.linkedPositions(onLine: 4), [1, 4, 6, 7, 9, 14, 16, 19, 23, 25, 28, 31])
     }
 
-    /// A texture of dots broken across two systems: a click between its
-    /// dots finds it, a click between the systems doesn't.
+    /// A texture of dots (closer than `clusterGap`) broken across two
+    /// systems: a click between its dots finds it, a click between the systems doesn't.
     func testRegionHitFindsTexturesBetweenTheirParts() {
         func dots(_ ys: [Double]) -> String {
-            ys.flatMap { y in [20.0, 24, 28].map { x in "<g transform=\"translate(\(x), \(y))\"><circle r=\"0.06\" fill=\"currentColor\"/></g>" } }
+            ys.flatMap { y in [20.0, 21.2, 22.4].map { x in "<g transform=\"translate(\(x), \(y))\"><circle r=\"0.06\" fill=\"currentColor\"/></g>" } }
                 .joined(separator: "\n")
         }
         let svg = """
@@ -58,10 +58,10 @@ final class EngravedPageTests: XCTestCase {
         </svg>
         """
         let page = EngravedPage(svg: Data(svg.utf8))
-        XCTAssertNil(page.hitTest(Point(22, 11)), "nothing is directly under the click")
-        XCTAssertEqual(page.regionHit(Point(22, 11))?.link?.position, SourcePosition(line: 3, character: 20))
-        XCTAssertEqual(page.regionHit(Point(26, 41))?.link?.position, SourcePosition(line: 3, character: 20))
-        XCTAssertNil(page.regionHit(Point(22, 25)), "between the systems")
+        XCTAssertNil(page.hitTest(Point(20.6, 11)), "nothing is directly under the click")
+        XCTAssertEqual(page.regionHit(Point(20.6, 11))?.link?.position, SourcePosition(line: 3, character: 20))
+        XCTAssertEqual(page.regionHit(Point(20.6, 41))?.link?.position, SourcePosition(line: 3, character: 20))
+        XCTAssertNil(page.regionHit(Point(20.6, 25)), "between the systems")
         XCTAssertNil(page.regionHit(Point(60, 60)), "a single graphic is hit-tested directly, not as a region")
         let linked = page.graphics.filter { $0.link?.line == 3 }
         XCTAssertEqual(EngravedPage.regions(of: linked).count, 2)

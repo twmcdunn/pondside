@@ -53,9 +53,9 @@ final class NoteInputTests: XCTestCase {
         XCTAssertFalse(input.isBuffering)
         // ⎋ places an expression as ⏎ does; so does a click away.
         for c in "\\mf" { _ = input.handle(ch(c), now: 0) }
-        XCTAssertEqual(input.handle(KeyInput(.escape), now: 0), [.addExpression("\\mf", each: false), .buffer("")])
+        XCTAssertEqual(input.handle(KeyInput(.escape), now: 0), [.addExpression("\\mf", each: true), .buffer("")])
         for c in "\\p" { _ = input.handle(ch(c), now: 0) }
-        XCTAssertEqual(input.commitExpression(), [.addExpression("\\p", each: false), .buffer("")])
+        XCTAssertEqual(input.commitExpression(), [.addExpression("\\p", each: true), .buffer("")])
         XCTAssertEqual(input.commitExpression(), [])
         // A direction followed by a non-articulation key falls through.
         _ = input.handle(ch("_"), now: 0)
