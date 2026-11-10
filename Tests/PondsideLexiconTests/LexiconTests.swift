@@ -350,7 +350,8 @@ final class LexiconEngravingTests: XCTestCase {
         let inserted = try XCTUnwrap(ScoreEditor(tree).shiftCollection(collection, by: measured, forward: true, copy: true, root: tree))
         let second = inserted.edit.edits.apply(to: text)
         try second.write(to: file, atomically: true, encoding: .utf8)
-        let lily = try XCTUnwrap(ToolchainDetector.select(from: await ToolchainDetector().detectLilyPond(), for: nil))
+        let installations = await ToolchainDetector().detectLilyPond()
+        let lily = try XCTUnwrap(ToolchainDetector.select(from: installations, for: nil))
         let again = try await LilyPondEngraver(installation: lily).engrave(file, purpose: .canvas,
                                                                           outputDirectory: file.deletingLastPathComponent().appendingPathComponent("out2"))
         XCTAssertTrue(again.succeeded && again.errors.isEmpty, again.log)
