@@ -24,6 +24,7 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
     func showFeedback(_ message: String) { card?.showFeedback(message) }
     func showRejection(_ message: String) { card?.showRejection(message) }
     var onClose: (() -> Void)?
+    var expressionEntry: LensExpressionEntry? { didSet { card?.setExpressionEntry(expressionEntry) } }
     var onEscape: (() -> Bool)?
     private var handlingEscape = false
     var onFailure: ((String) -> Void)?
@@ -37,6 +38,7 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
         card.setDuration(armedDuration)
         card.setArmedAccidental(armedAccidental)
         card.tabTarget = LensMode.notation.next(among: available)?.title.lowercased()
+        card.setExpressionEntry(expressionEntry)
         card.modes.configure(current: .notation, available: available, unavailable: unavailable)
         card.modes.onSelect = { [weak self] m in
             guard let self, m != .notation else { return }
@@ -69,8 +71,11 @@ final class NotationLensController: NSObject, NotationLensSession, NSPopoverDele
             // Following the cursor note by note is too much motion: the
             // arrow keeps pointing where the lens opened, and the strip's
             // highlight shows the cursor. Only a move to another staff
-            // line, where the arrow would point at the wrong music, moves it.
-            if let anchor, anchor.view === anchorView, !Self.sameLine(anchor.rect, popover.positioningRect) {
+            // line, where the arrow would point at the wrong music, moves it,
+            // and so does an anchor reaching higher (a collection's anchor
+            // line over its whole system), which the lens would cover.
+            if let anchor, anchor.view === anchorView,
+               !Self.sameLine(anchor.rect, popover.positioningRect) || anchor.rect.minY < popover.positioningRect.minY - 1 {
                 popover.positioningRect = anchor.rect
             }
             card.layoutSubtreeIfNeeded()

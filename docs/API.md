@@ -264,9 +264,51 @@ same voice when available, and checks that destination measure. Overflow
 and too-short meters are blocked with feedback in the lens,
 without a dialog. Meter shortening checks that measure across voices; an
 opaque generated passage cannot be shortened without known timing.
+When unmetered entry changes a bar's length (shorter notes shorten it, more
+notes lengthen it), the bar's other voices that hold only skips, full-bar
+rests and zero-length marks (cues on `s4*0`, collections, `\edesc`) follow:
+their skips are rewritten through a map from the edited voice's old moments
+to its new ones, so a cue under a note stays under it and marks past the
+music spread over the new length (`StructuralEditing.timeMap`,
+`rescaleEdits`). Skips keep their written base (`s4*54` becomes `s4*27`); a
+lone full-bar rest becomes the new bar's length. A voice with notes keeps
+its timing, and the bar can't get shorter than it. A length that doesn't
+change keeps its written meter (4/4 is not rewritten as 1/1).
+
+⌥T beams the selection together, ⌥F fans its beam
+(`\once \override Beam.grow-direction = #RIGHT`, an accelerando; ⌥⇧F
+`#LEFT`), and ⌥H wraps it in `\hideNotes … \unHideNotes`, so it's hidden on
+the page but keeps its time and still plays. Each again undoes it. Follow
+Playback moved to ⌥⌘F.
+
 Unmetered entry requires explicit note durations and updates the shared
 length without revalidating the whole contract. Shortening leaves room for
 other voices' existing music; edit opaque generated passages in Source.
+
+A bar is measured from source unless something in it may take time that the
+source can't show: generated or simultaneous music, or a custom command.
+Scheme that only sets a value doesn't count (`-\tweak stencil #(…)`,
+`\override X.y = #(…)`, anything in a post-event), and neither does markup.
+The score's own commands that take no time don't count either
+(`TimelessCommands`, read from their definitions in any of the score's
+files):
+
+- `#(define-event-function …)` without a `ly:music?` argument, and
+  `#(make-dynamic-script …)`;
+- music with no notes, rests or skips whose commands take no time
+  themselves (`caes = { \once \override … \breathe }`,
+  `featherOnce = \once \override …`, `accelSpan = -\tweak … \startTextSpan`);
+- any definition on the line after a `% pondside: no time` comment, for a
+  function whose length the source can't show:
+
+  ```lilypond
+  % pondside: no time
+  accTrill = #(define-music-function (above) (string?) …)
+  ```
+
+A name defined more than once counts only if every definition does. Music
+functions (`\improvisation 1 { … }`), `\scaleDurations` and the like keep a
+bar out of unmetered entry; edit those bars in Source.
 
 The edit planner is portable (`PondsideCore/Editing/StructuralEditing`).
 The app checks buffer and disk revisions before applying a project edit,

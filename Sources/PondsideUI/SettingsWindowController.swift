@@ -17,7 +17,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private var models: [String]?
     private var loadingModels = false
     private let lightsOut = NSButton(checkboxWithTitle: "Lights Out: dim the paper for night work", target: nil, action: nil)
-    private let followPlayback = NSButton(checkboxWithTitle: "Follow playback: glide each new system to the middle (⌥F)", target: nil, action: nil)
+    private let followPlayback = NSButton(checkboxWithTitle: "Follow playback: glide each new system to the middle (⌥⌘F)", target: nil, action: nil)
     private let hearNotes = NSButton(checkboxWithTitle: "Hear selected notes: play each new selection's pitch (⌥N)", target: nil, action: nil)
     private let cliStatus = NSTextField(wrappingLabelWithString: "")
     private var found: [(AgentHarness, String?)] = []

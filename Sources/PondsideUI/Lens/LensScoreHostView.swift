@@ -180,7 +180,9 @@ final class LensScoreHostView: NSView {
             displayedSlurHandler?(lensWindow.events[slur.start].sourceEvent, slur.phrasing)
             return
         }
-        if let (anchor, kind) = Self.mark(hit), let event = LensScoreAdapter.event(at: anchor, in: lensWindow, score: renderedScore) {
+        if let (anchor, kind) = Self.mark(hit),
+           let event = kind == .hairpin ? LensScoreAdapter.event(afterSpanner: anchor, in: lensWindow, score: renderedScore)
+                                        : LensScoreAdapter.event(at: anchor, in: lensWindow, score: renderedScore) {
             displayedMarkHandler?(event.sourceEvent, kind)
             return
         }

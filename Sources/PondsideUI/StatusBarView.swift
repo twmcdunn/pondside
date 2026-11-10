@@ -204,10 +204,10 @@ final class StatusBarView: NSView {
     }
 
     /// Note-input state: the armed duration and any half-typed input.
-    func setInput(armed: String?, buffer: String) {
+    func setInput(armed: String?, buffer: String, completion: String? = nil) {
         var parts: [String] = []
         if let armed { parts.append("Next: \(armed)") }
-        if !buffer.isEmpty { parts.append(buffer + "▏") }
+        if !buffer.isEmpty { parts.append(buffer + "▏" + (completion.map { "\($0)  ⇥" } ?? "")) }
         inputText = parts.joined(separator: "   ")
         renderRight()
     }

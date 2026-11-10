@@ -186,6 +186,14 @@ final class PatchAgentTests: XCTestCase {
         let emptyFollow = AgentRun.graphicsPrompt(request: "again", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
                                                   followUp: true, target: .emptySection)
         XCTAssertTrue(emptyFollow.contains("no drawing") && emptyFollow.contains("skill://lilypond"))
+        let notes = AgentRun.graphicsPrompt(request: "staccato", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
+                                            target: .notes)
+        XCTAssertTrue(notes.contains("kind \"notes\"") && notes.contains("# LilyPond"), "notes get the LilyPond skill")
+        XCTAssertTrue(notes.contains("Change only those notes") && notes.contains("graphic_insert"))
+        XCTAssertFalse(notes.contains("# Graphic notation in Pondside"), "the graphic skill is only referenced")
+        let notesFollow = AgentRun.graphicsPrompt(request: "again", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
+                                                  followUp: true, target: .notes)
+        XCTAssertTrue(notesFollow.contains("notes now selected") && !notesFollow.contains("# LilyPond"))
         let patch = AgentRun.patchPrompt(request: "more reverb", context: "{}", score: URL(fileURLWithPath: "/s.ly"),
                                          patch: URL(fileURLWithPath: "/patch/s.scd"))
         XCTAssertTrue(patch.contains("patch_check") && patch.contains("patch_note") && patch.contains("never .ly"))

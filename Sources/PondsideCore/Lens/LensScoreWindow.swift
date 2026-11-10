@@ -81,6 +81,20 @@ public struct LensTremoloMark: Sendable, Hashable {
 public struct LensDynamic: Sendable, Hashable {
     public var event: Int
     public var text: String
+    /// Dynamics and words, for an expression (`mf dolce`); empty for a plain dynamic.
+    public var elements: [Expression.Element] = []
+    /// The one being typed after `\`, not yet in the source.
+    public var isPreview = false
+    /// The mark the selection is.
+    public var isSelected = false
+
+    public init(event: Int, text: String, elements: [Expression.Element] = [], isPreview: Bool = false, isSelected: Bool = false) {
+        self.event = event
+        self.text = text
+        self.elements = elements
+        self.isPreview = isPreview
+        self.isSelected = isSelected
+    }
 }
 
 /// A hairpin from event `start` to the event that ends it (its `\\!`, the
@@ -335,14 +349,16 @@ public enum LensScoreBuilder {
         window.tremolos = tremolos
         window.graceHosts = writer.hosts
         window.timedCollections = writer.timedCollections
-        (window.dynamics, window.hairpins) = dynamicMarks(events, tree: tree)
+        (window.dynamics, window.hairpins) = dynamicMarks(events, tree: tree, reachesEnd: window.reachesEnd)
         return window
     }
 
     /// Each dynamic, and each hairpin that ends inside the window: at the
     /// next `\\!`, dynamic or hairpin start in its voice, as in LilyPond.
-    /// Grace notes are skipped, as for slurs.
-    static func dynamicMarks(_ events: [LensEvent], tree: SyntaxTree) -> ([LensDynamic], [LensHairpin]) {
+    /// Grace notes are skipped, as for slurs. One still open where the
+    /// window stops short of the music's end runs to its voice's last event
+    /// here; at the very end it never ends, and LilyPond draws none.
+    static func dynamicMarks(_ events: [LensEvent], tree: SyntaxTree, reachesEnd: Bool = true) -> ([LensDynamic], [LensHairpin]) {
         var dynamics: [LensDynamic] = []
         var hairpins: [LensHairpin] = []
         var open: [Int: (start: Int, crescendo: Bool)] = [:]
@@ -352,16 +368,26 @@ public enum LensScoreBuilder {
                 guard text.count > 1, let first = text.first, "-^_".contains(first) else { return text }
                 return String(text.dropFirst())
             }
-            let ends = marks.contains { $0 == "\\!" || ScoreEditor.dynamics.contains($0) || ScoreEditor.hairpinStarts.contains($0) }
+            let ends = marks.contains { $0 == "\\!" || ScoreEditor.dynamics.contains($0) || ScoreEditor.hairpinStarts.contains($0) || Expression.isScript($0) }
             if ends, let hairpin = open[event.voiceIndex], hairpin.start != index {
                 hairpins.append(LensHairpin(start: hairpin.start, end: index, crescendo: hairpin.crescendo))
                 open[event.voiceIndex] = nil
             }
             for mark in marks {
                 if ScoreEditor.dynamics.contains(mark) { dynamics.append(LensDynamic(event: index, text: String(mark.dropFirst()))) }
+                else if Expression.isScript(mark), let elements = Expression.elements(of: mark) {
+                    dynamics.append(LensDynamic(event: index, text: Expression.display(elements), elements: elements))
+                }
                 if ScoreEditor.hairpinStarts.contains(mark) {
                     open[event.voiceIndex] = (index, ["\\<", "\\cr", "\\cresc"].contains(mark))
                 }
+            }
+        }
+        if !reachesEnd {
+            for (voice, hairpin) in open.sorted(by: { $0.key < $1.key }) {
+                guard let last = events.indices.last(where: { events[$0].voiceIndex == voice && !events[$0].isGrace }),
+                      last != hairpin.start else { continue }
+                hairpins.append(LensHairpin(start: hairpin.start, end: last, crescendo: hairpin.crescendo))
             }
         }
         return (dynamics, hairpins)

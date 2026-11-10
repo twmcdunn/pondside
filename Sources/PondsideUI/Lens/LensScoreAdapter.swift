@@ -187,6 +187,14 @@ enum LensScoreAdapter {
         }
     }
 
+    /// The event a hairpin starts on: the first chord after its own element.
+    static func event(afterSpanner anchor: VoiceElementID, in lens: LensScoreWindow, score: Score) -> LensEvent? {
+        lens.events.filter { event in
+            guard event.measureIndex == anchor.measureIndex, let at = element(of: event, in: lens, score: score) else { return false }
+            return at.slot == anchor.voiceIndex && at.index > anchor.elementIndex
+        }.min { (element(of: $0, in: lens, score: score)?.index ?? .max) < (element(of: $1, in: lens, score: score)?.index ?? .max) }
+    }
+
     /// The parsed score's address for the lens target.
     static func target(of lens: LensScoreWindow, in score: Score) -> (VoiceElementID, ScoreItemID)? {
         guard let event = lens.target else { return nil }
@@ -245,11 +253,48 @@ enum LensScoreAdapter {
             guard !event.notes.isEmpty, let at = element(of: event, in: lens, score: score) else { continue }
             updateVoice(in: &score, measure: event.measureIndex, slot: at.slot) { voice in
                 var elements = Array(voice.elements)
-                elements.insert(.dynamic(Dynamic(subtype: mark.text, velocity: velocity(mark.text))), at: at.index)
+                elements.insert(.dynamic(dynamic(for: mark)), at: at.index)
                 voice.elements = IdentifiedArray(elements)
             }
         }
     }
+
+    /// A dynamic, or an expression drawn as one: its dynamics in the music
+    /// font's glyphs (`<sym>`), its words in the dynamics' italic. The one
+    /// being typed and the selected one in the accent colour.
+    static func dynamic(for mark: LensDynamic) -> Dynamic {
+        let first = mark.elements.lazy.compactMap { e -> String? in if case .dynamic(let d) = e { d } else { nil } }.first
+        let subtype = mark.elements.isEmpty ? mark.text : (first ?? "other-dynamics")
+        var dynamic = Dynamic(subtype: subtype, velocity: velocity(subtype))
+        if mark.elements.count > 1 || first == nil, !mark.elements.isEmpty {
+            var content: [PreservedTextMarkup.ContentItem] = []
+            for (i, e) in mark.elements.enumerated() {
+                if i > 0 { content.append(.characters(" ")) }
+                switch e {
+                case .dynamic(let d):
+                    for letter in d {
+                        guard let name = symbolNames[letter] else { continue }
+                        content.append(.element(.init(name: "sym", content: [.characters(name)])))
+                    }
+                case .text(let t):
+                    content.append(.characters(t))
+                }
+            }
+            let derived = RichText(content: content).plainText
+            dynamic.text = derived
+            dynamic.preservedTextMarkup = PreservedTextMarkup(content: content, derivedText: derived)
+            dynamic.playsBack = first != nil
+        }
+        if mark.isPreview || mark.isSelected {
+            dynamic.elementProperties.color = ScoreColor(red: 102, green: 194, blue: 181)
+        }
+        return dynamic
+    }
+
+    private static let symbolNames: [Character: String] = [
+        "p": "dynamicPiano", "m": "dynamicMezzo", "f": "dynamicForte", "r": "dynamicRinforzando",
+        "s": "dynamicSforzando", "z": "dynamicZ", "n": "dynamicNiente",
+    ]
 
     /// MuseScore's velocities for the common dynamics; playback in the lens
     /// is not the score's, so the rest share mezzo-forte's.
@@ -261,19 +306,22 @@ enum LensScoreAdapter {
         attachSpanners(lens.slurs.map { ($0.start, $0.end, Spanner(kind: .slur, rawType: "Slur")) }, lens: lens, to: &score)
     }
 
+    /// Hairpins are voice elements of their own, just before their start
+    /// chord (after its dynamic): the layout collects them only there, not
+    /// from a chord's spanners as it does slurs.
     static func attachHairpins(_ lens: LensScoreWindow, to score: inout Score) {
         attachSpanners(lens.hairpins.map { hairpin in
             (hairpin.start, hairpin.end, Spanner(kind: .hairpin, rawType: "HairPin",
                                                  hairpin: .init(subtype: hairpin.crescendo ? .crescendo : .decrescendo)))
-        }, lens: lens, to: &score)
+        }, lens: lens, to: &score, asVoiceElements: true)
     }
 
-    /// Slurs and hairpins hang on their start chord with the distance to
+    /// Slurs hang on their start chord, hairpins just before it, with the distance to
     /// their end, in measures plus time from the start chord's place in its
     /// bar, counted the way the layout counts (chord durations, not
     /// `<forward>` gaps).
     private static func attachSpanners(_ spans: [(start: Int, end: Int, spanner: Spanner)], lens: LensScoreWindow,
-                                       to score: inout Score) {
+                                       to score: inout Score, asVoiceElements: Bool = false) {
         guard !spans.isEmpty, let staffValue = score[staff] else { return }
         let durations = score.effectiveMeasureDurations()
         let division = score.division
@@ -301,6 +349,14 @@ enum LensScoreAdapter {
             var spanner = span.spanner
             spanner.nextMeasuresOffset = last.measureIndex - first.measureIndex
             spanner.nextFractionsOffset = Fraction(numerator: distance, denominator: 4 * division)
+            if asVoiceElements {
+                updateVoice(in: &score, measure: first.measureIndex, slot: start.slot) { voice in
+                    var elements = Array(voice.elements)
+                    elements.insert(.spanner(spanner), at: start.index)
+                    voice.elements = IdentifiedArray(elements)
+                }
+                continue
+            }
             updateChord(in: &score, measure: first.measureIndex, slot: start.slot, index: start.index) {
                 $0.spanners.append(spanner)
             }

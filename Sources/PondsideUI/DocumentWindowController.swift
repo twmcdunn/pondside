@@ -24,6 +24,13 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// The playback head: the audio's place in the score, ticked while the
     /// mockup or mix plays.
     private var playheadTimer: Timer?
+    /// The score pane's transport (play/pause, stop, the time stamp).
+    private let transport = TransportView()
+    private var playbackSource: TransportView.Source = .mockup
+    /// Paused: the player keeps its place and the head stays on the page.
+    private var playbackPaused = false
+    /// Where the selection starts, for the transport's stamp when not playing.
+    private var selectionMoment: LensFraction?
     private var playheadTrack: PlayheadTrack?
     private var playheadStart: Double = 0
     private var playheadSystem: (page: Int, top: Double, bottom: Double)?
@@ -105,6 +112,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private var agentUndoCookie: AgentUndoCookie?
     private weak var agentUndoManager: UndoManager?
     private var keyMonitor: Any?
+    private var clickMonitor: Any?
     private let statusBar = StatusBarView(frame: .zero)
 
     private var noteInput = NoteInput()
@@ -136,6 +144,18 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         statusBar.flash("Unmetered entry · next measure")
     }
 
+    private var timelessCache: (keys: [ObjectIdentifier], names: Set<String>)?
+
+    /// The score's commands that take no time (`TimelessCommands`), cached
+    /// until a file is reparsed.
+    private var timelessCommands: Set<String> {
+        let keys = score.files.map { ObjectIdentifier($0.tree.root) }
+        if let cache = timelessCache, cache.keys == keys { return cache.names }
+        let names = TimelessCommands.names(in: score.files.map(\.tree))
+        timelessCache = (keys, names)
+        return names
+    }
+
     private func toggleUnmetered() {
         if hasPendingNoteInput { afterNoteInput { [weak self] in self?.toggleUnmetered() }; return }
         synchronizeScoreSource()
@@ -149,7 +169,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 statusBar.flash("Select a shared measure before enabling unmetered input")
                 return
             }
-            guard !StructuralEditing.needsInterpreter(in: tree, body: measure.body) else {
+            guard !StructuralEditing.needsInterpreter(in: tree, body: measure.body, timeless: timelessCommands) else {
                 rejectEdit("Unmetered entry needs explicit durations here · edit generated timing in Source")
                 return
             }
@@ -225,7 +245,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         get { canvas.lightsOut }
         set { canvas.lightsOut = newValue }
     }
-    /// While playing, each new system glides to the middle of the view (⌥F).
+    /// While playing, each new system glides to the middle of the view (⌥⌘F).
     var followsPlayback = true
 
     func flash(_ message: String) { statusBar.flash(message) }
@@ -321,6 +341,17 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         // The empty pane's "engraving" animation floats over the clip view.
         canvasScroll.addSubview(firstEngraving)
+        // The transport floats over the score, top right until dragged.
+        canvasScroll.addSubview(transport)
+        transport.onPlayPause = { [weak self] in self?.transportPlayPause() }
+        transport.onStop = { [weak self] in self?.stopPlayback() }
+        transport.onSource = { [weak self] in self?.switchPlaybackSource($0) }
+        transport.onSeek = { [weak self] in self?.seekPlayback(to: $0) }
+        canvas.onAnchorMoment = { [weak self] m in
+            self?.selectionMoment = m
+            self?.updateTransportPosition()
+        }
+        refreshTransportHints()
 
         // The source pane: a one-line file bar over the editor.
         let fileBar = NSView()
@@ -359,6 +390,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         split.translatesAutoresizingMaskIntoConstraints = false
         help.register(fileMenu, "go.file")
         help.register(statusBar, "help.context")
+        help.registerReveal(transport.mockupControl, "view.play")
+        help.registerReveal(transport.mixControl, "view.playMix")
 
         statusBar.translatesAutoresizingMaskIntoConstraints = false
         statusBar.onStopAgent = { [weak self] in self?.stopAgent() }
@@ -505,7 +538,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// stepping stops (and any render it waits for has landed).
     private func showLens(closesOnRender: Bool, navigating: Bool = false) {
         let selection = selectionUTF8()
-        guard let content = lensContent() else {
+        guard var content = lensContent() else {
             lensLog.debug("no lens for selection \(selection.lowerBound)..<\(selection.upperBound)")
             if closesOnRender {
                 if !lensWasExplicit { closeLens() }
@@ -534,6 +567,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             lens = session
         }
         guard let lens else { return }
+        markExpressions(&content)
         let modes = lensModes
         lens.unmetered = unmeteredStart != nil
         lens.enteringNotes = enteringNotes || mouseInsertion != nil
@@ -650,6 +684,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         if let rect = canvas.graphicSectionAnchor, visible.intersects(rect) {
             return LensAnchor(rect: rect, view: canvas)
         }
+        // A collection being moved: its anchor line's system, so the lens
+        // sits beside the line rather than over it.
+        if selectedCollection() != nil, let rect = canvas.collectionAnchorRect, visible.intersects(rect) {
+            return LensAnchor(rect: rect, view: canvas)
+        }
         if let rect = canvas.selectionAnchor ?? lastPageAnchor, visible.intersects(rect) {
             return LensAnchor(rect: rect, view: canvas)
         }
@@ -697,6 +736,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             if lastLensEscapeTime == event.timestamp { return true }
             lastLensEscapeTime = event.timestamp
         }
+        // ⎋ places an expression being typed; the lens stays this time.
+        if noteInput.expression != nil { placeExpression(); return true }
         noteInput.cancelPendingInput()
         chord.cancel()
         statusBar.endChord()
@@ -740,7 +781,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     /// lands and it has been up for the minimum time; it fades out over the
     /// page's cross-fade.
     private func closeLensIfRendered() {
-        guard lensClosesOnRender, lens?.isOpen == true,
+        guard lensClosesOnRender, lens?.isOpen == true, noteInput.expression == nil,
               score.completedRenderGeneration >= lensAwaitingGeneration else { return }
         let remaining = Self.lensMinimumOpen - Date().timeIntervalSince(lensChangedAt)
         guard remaining <= 0 else {
@@ -847,6 +888,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
 
     private func refreshHighlight(reveal: Bool) {
         mouseInsertion = nil
+        defer {
+            updateCollectionAnchor()
+            scheduleEmptyCollectionCheck()
+        }
         let selected = targets()
         hasSelection = !selected.events.isEmpty || !selected.notes.isEmpty
         // A selected time signature (in a shared bar's definition, say)
@@ -926,9 +971,11 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private var preparedScoreTree: SyntaxTree?
 
     /// Applies a score edit as one undoable change, then selects its result.
-    private func apply(_ edit: ScoreEdit?) {
+    private func apply(_ edit: ScoreEdit?, collection: Bool = false) {
         guard let edit, !edit.isEmpty else { NSSound.beep(); return }
-        if unmeteredStart != nil {
+        // A collection is zero-length music: it never grows the unmetered
+        // bar, so its edits apply directly, as in metered entry.
+        if unmeteredStart != nil, !collection, !selectionInCollection {
             enqueueUnmeteredEdit(edit)
             return
         }
@@ -936,7 +983,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         if StructuralEditing.isManaged(score.root.tree) {
             do {
                 try StructuralEditing.verifyContentEdit(in: activeFile.url.path, before: tree,
-                    proposed: proposed, root: score.root.tree)
+                    proposed: proposed, root: score.root.tree, timeless: timelessCommands)
             } catch let overflow as StructuralEditing.Overflow {
                 showLens(closesOnRender: false)
                 lens?.showFeedback("Doesn’t fit in \(overflow.meter.beats)/\(overflow.meter.beatType) · ⌥U for unmetered entry")
@@ -1041,7 +1088,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             apply(edit)
             return
         }
-        let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
+        let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree, timeless: timelessCommands) : nil
         guard let edit = ScoreEditor(tree).pasteNotation(text, after: anchor, insertionAt: next?.body.lowerBound, parsing: structuralFile(activeFile).parse) else {
             statusBar.flash("The clipboard does not contain supported LilyPond notation")
             return
@@ -1058,7 +1105,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             statusBar.flash("Select notes to repeat")
             return
         }
-        let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
+        let next = unmeteredStart == nil ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree, timeless: timelessCommands) : nil
         guard let edit = ScoreEditor(tree).repeatNotation(events: events, insertionAt: next?.body.lowerBound, parsing: structuralFile(activeFile).parse) else {
             statusBar.flash("Select notes or rests in one voice to repeat")
             NSSound.beep()
@@ -1075,11 +1122,27 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         ScoreEditor(tree).selectedCollection(events: targets().events, offset: selectionUTF8().lowerBound)
     }
 
-    /// `k`: an empty collection where the selection ends, selected so a–g fill it.
+    /// Whether the selection is in (or is) a collection.
+    private var selectionInCollection: Bool {
+        if tree.collection(at: selectionUTF8().lowerBound) != nil { return true }
+        return targets().events.contains { tree.collection(containingEvent: $0) != nil }
+    }
+
+    /// `k`: an empty collection at the selection's start on the collections staff, selected so a–g fill it.
     private func insertCollection() {
         if hasPendingNoteInput { afterNoteInput { [weak self] in self?.insertCollection() }; return }
         synchronizeScoreSource()
         let r = selectionUTF8()
+        // At a collection: the next one starts where this one's engraving
+        // ends, not at its moment (where the two would print on top of each other).
+        if mouseInsertion == nil,
+           let current = selectedCollection() ?? targets().events.max().flatMap({ tree.collection(containingEvent: $0) }) {
+            insertCollection(following: current)
+            return
+        }
+        // Music selected: a collection at its start, on the score's
+        // collections staff (⌥⇧↑↓ then moves it to another).
+        if mouseInsertion == nil, let first = targets().events.min(), insertCollection(atStartOf: first) { return }
         let anchor = mouseInsertion.flatMap { tree.events.indices.contains($0.event) ? $0.event : nil }
             ?? targets().events.max()
             ?? tree.events.lastIndex { $0.range.upperBound <= r.lowerBound && $0.acceptsNoteEntry }
@@ -1090,16 +1153,214 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         }
         mouseInsertion = nil
         ensureCollectionsKit()
-        apply(edit)
+        apply(edit, collection: true)
         if let at = edit.selectionAnchors.first, let made = tree.collection(at: at) {
             setSelection(utf8: made.command)
+            watchEmptyCollection(made)
         }
         enteringNotes = true
         updateInputStatus()
         statusBar.flash("Collection: type a–g · = - for sharp and flat · ⌥←→ moves it · ⎋ ends")
     }
 
-    /// ⌥←/⌥→ (move) and r (copy): the input duration later or earlier.
+    /// An empty collection at the moment `event` starts, on the staff the
+    /// score keeps its collections on (`CollectionStaves.collectionStaff`),
+    /// else on the event's own; selected for entry with the lens open.
+    /// False when neither can take one (the caller falls back).
+    private func insertCollection(atStartOf event: Int) -> Bool {
+        let files = score.files
+        guard let file = files.firstIndex(where: { $0 === activeFile }), tree.events.indices.contains(event) else { return false }
+        let parsers = files.map { structuralFile($0) }
+        let trees = parsers.map(\.tree)
+        let offset = tree.events[event].range.lowerBound
+        let detected = CollectionStaves.collectionStaff(trees: trees)
+        guard let target = detected ?? CollectionStaves.voices(trees: trees).first(where: { $0.file == file && $0.value.contains(offset) }),
+              let made = CollectionStaves.insertEmpty(at: offset, file: file, into: target, trees: trees,
+                                                      parse: { parsers[$0].parse($1) }) else { return false }
+        ensureCollectionsKit()
+        let changes = made.edits.map { StructuralEditing.Change(file: files[$0.key].url.path, edits: $0.value) }
+        // The file it changes first: its undo is that file's, which ⌘Z reaches.
+        let destination = files[made.anchor.file]
+        if destination !== activeFile { showFile(destination) }
+        guard applyStructural(changes, name: "Insert Collection") else { return true }
+        if let inserted = tree.collection(at: made.anchor.offset) {
+            setSelection(utf8: inserted.command)
+            watchEmptyCollection(inserted)
+        }
+        enteringNotes = true
+        updateInputStatus()
+        statusBar.flash("Collection on \\\(made.staffName)\(made.snapped ? " where the note there ends" : "")"
+                        + " · type a–g · ⌥⇧↑↓ another staff · ⎋ ends")
+        return true
+    }
+
+    private func insertCollection(following current: ScoreCollection) {
+        let step = noteInput.armedDuration ?? .quarter
+        let measured = engravedSpan(of: current)
+        guard let (edit, snapped) = ScoreEditor(tree).insertCollection(following: current,
+                                                                      later: measured ?? LensFraction(step.wholeNotes.0, step.wholeNotes.1),
+                                                                      root: score.root.tree,
+                                                                      parse: structuralFile(activeFile).parse) else {
+            statusBar.flash("No room for another collection later in this voice")
+            NSSound.beep()
+            return
+        }
+        ensureCollectionsKit()
+        apply(edit, collection: true)
+        if let at = edit.selectionAnchors.first, let made = tree.collection(at: at) {
+            setSelection(utf8: made.command)
+            watchEmptyCollection(made)
+        }
+        enteringNotes = true
+        updateInputStatus()
+        statusBar.flash(snapped ? "Collection where the note there ends · type a–g · ⎋ ends"
+                        : measured == nil ? "Collection the input duration later (nothing engraved to measure) · type a–g · ⎋ ends"
+                        : "Collection after the last one · type a–g · ⌥←→ moves it · ⎋ ends")
+    }
+
+    private var engravedTrees: [String: (text: String, tree: SyntaxTree)] = [:]
+
+    /// The score's files as last engraved (what the pages' links point
+    /// into), the root first; nil before every file has been engraved.
+    private func engravedFileTrees() -> [SyntaxTree]? {
+        var trees: [SyntaxTree] = []
+        for f in score.files {
+            guard let text = f.engravedText else { return nil }
+            let key = f.url.path
+            if let cached = engravedTrees[key], cached.text == text {
+                trees.append(cached.tree)
+            } else {
+                let parsed = structuralFile(f).parse(text)
+                engravedTrees[key] = (text, parsed)
+                trees.append(parsed)
+            }
+        }
+        return trees
+    }
+
+    /// A link's path to its index in `score.files`, memoized.
+    private func engravedFileIndex() -> (String) -> Int? {
+        let files = score.files
+        let score = score
+        var indices: [String: Int?] = [:]
+        return { path in
+            if let known = indices[path] { return known }
+            let found = score.file(for: path).flatMap { f in files.firstIndex { $0 === f } }
+            indices[path] = found
+            return found
+        }
+    }
+
+    /// Moments to x on the current engraving, for the anchor line.
+    private var momentMap: MomentMap?
+
+    /// The dashed line where the selected collection is anchored, at its
+    /// moment in the current text drawn on the latest engraving: a move
+    /// shows at once, before the engraving that prints it.
+    private func updateCollectionAnchor() {
+        let files = score.files
+        guard let file = files.firstIndex(where: { $0 === activeFile }) else {
+            canvas.setCollectionAnchor(nil, reveal: false)
+            return
+        }
+        var moment: LensFraction?
+        if let collection = selectedCollection() {
+            // Read from the text: a collection just moved or made has no glyphs yet.
+            var moments = VoiceMoments(trees: files.map(\.tree))
+            moment = moments.moment(file: file, offset: collection.command.lowerBound)
+        } else if let first = targets().events.min() {
+            // Engraved music: a lookup. Typed since: read from the text.
+            moment = momentMap?.moment(file: file, positions: highlighted)
+            if moment == nil {
+                var moments = VoiceMoments(trees: files.map(\.tree))
+                moment = moments.event(file: file, index: first)?.onset
+            }
+        }
+        selectionMoment = moment
+        updateTransportPosition()
+        guard let moment else {
+            canvas.setCollectionAnchor(nil, reveal: false)
+            return
+        }
+        // The map may be the previous engraving's for a moment after a new
+        // one lands; it is close, and replaced as soon as it's built.
+        canvas.setCollectionAnchor(momentMap?.position(at: moment), reveal: true)
+    }
+
+    /// Bars, beats and seconds of the latest timing log, for the line's stamp.
+    private var clock: ScoreClock?
+
+    private var momentMapGeneration = 0
+
+    /// Builds the moment map for the pages just shown, off the main thread
+    /// (it parses every engraved file and reads every system), so the
+    /// first collection selected after an engraving shows its line at once.
+    private func prepareMomentMap() {
+        // The last engraving's map stays in use until this one is ready: the
+        // line never blinks out while the new map is built.
+        momentMapGeneration += 1
+        let generation = momentMapGeneration
+        var inputs: [(file: StructuralEditing.File, text: String)] = []
+        for f in score.files {
+            guard let text = f.engravedText else { return }
+            inputs.append((structuralFile(f), text))
+        }
+        let pages = score.pages
+        let log = score.timingLog
+        let paths = score.files.map(\.url.path)
+        let folder = score.url.deletingLastPathComponent()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let trees = inputs.map { $0.file.parse($0.text) }
+            var known: [String: Int?] = [:]
+            let map = MomentMap(trees: trees, pages: pages, fileIndex: { path in
+                if let k = known[path] { return k }
+                // As `ScoreDocument.file(for:)`: some paths are relative to the root's folder.
+                let full = path.hasPrefix("/") ? path : folder.appendingPathComponent(path).path
+                let found = paths.firstIndex { PathMatching.same(path, $0) || PathMatching.same(full, $0) }
+                known[path] = found
+                return found
+            })
+            let clock = log.map { ScoreClock(log: $0) }
+            await MainActor.run { [weak self] in
+                guard let self, self.momentMapGeneration == generation else { return }
+                self.momentMap = map
+                self.clock = clock
+                self.canvas.momentMap = map
+                self.updateCollectionAnchor()
+                self.refreshTransportHints()
+            }
+        }
+    }
+
+    /// How long after `collection` the first note column clear of its
+    /// engraving comes (nil when the engraving can't say: none yet, or the
+    /// collection runs off its system's end).
+    private func engravedSpan(of collection: ScoreCollection) -> LensFraction? {
+        let files = score.files
+        var currentMoments = VoiceMoments(trees: files.map(\.tree))
+        guard let file = files.firstIndex(where: { $0 === activeFile }), let engravedActive = activeFile.engravedText,
+              let moment = currentMoments.moment(file: file, offset: collection.command.lowerBound)
+        else { return nil }
+        guard let trees = engravedFileTrees() else { return nil }
+        // The collection's command in the engraved text (if it was engraved).
+        let current = tree.text
+        let utf16 = current.utf16.distance(from: current.startIndex,
+                                           to: current.utf8.index(current.startIndex, offsetBy: collection.command.lowerBound))
+        let engravedUTF16 = EngravingMap(engraved: engravedActive, current: current).engravedOffset(forCurrent: utf16)
+        var offset: Int?
+        if engravedUTF16 <= engravedActive.utf16.count {
+            let index = engravedActive.utf16.index(engravedActive.startIndex, offsetBy: engravedUTF16)
+            offset = engravedActive.utf8.distance(from: engravedActive.startIndex, to: index)
+        }
+        return CollectionFollow.span(ofCollectionAt: offset, moment: moment, file: file, trees: trees, pages: score.pages,
+                                     fileIndex: engravedFileIndex(),
+                                     noteCount: collection.notes.count,
+                                     accidentals: collection.notes.filter { tree.notes[$0].absolute.alteration != 0 }.count)
+    }
+
+    /// ⌥←/⌥→: move by the input duration. r: a copy at the first note
+    /// column clear of this one's engraving (the input duration later when
+    /// nothing can be measured).
     private func shiftCollection(forward: Bool, copy: Bool) {
         if hasPendingNoteInput { afterNoteInput { [weak self] in self?.shiftCollection(forward: forward, copy: copy) }; return }
         synchronizeScoreSource()
@@ -1109,15 +1370,74 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let step = noteInput.armedDuration ?? .quarter
-        guard let (edit, snapped) = ScoreEditor(tree).shiftCollection(collection, by: step, forward: forward, copy: copy,
+        let measured = copy ? engravedSpan(of: collection) : nil
+        guard let (edit, snapped) = ScoreEditor(tree).shiftCollection(collection,
+                                                                     by: measured ?? LensFraction(step.wholeNotes.0, step.wholeNotes.1),
+                                                                     forward: forward, copy: copy,
                                                                      root: score.root.tree, parse: structuralFile(activeFile).parse) else {
             statusBar.flash(forward ? "No room for the collection later in this voice" : "No room for the collection earlier in this voice")
             NSSound.beep()
             return
         }
+        let wasEmpty = collection.events.isEmpty
         enteringNotes = false
         apply(edit)
+        // An empty one has no note to select: keep its command selected (and
+        // watched), or it would count as clicked away from.
+        if wasEmpty, let at = edit.selectionAnchors.first, let made = tree.collection(at: at) {
+            setSelection(utf8: made.command, scroll: false)
+            if !copy { watchEmptyCollection(made) }
+        }
         if snapped { statusBar.flash("That moment is inside a note: the collection goes where the note ends") }
+    }
+
+    // MARK: Empty collections
+
+    /// A collection `k` made that has no notes yet: removed once the
+    /// selection leaves it still empty (clicked away from, or ⎋ then an
+    /// arrow), so abandoned ones never pile up in the source.
+    private var emptyCollection: (url: URL, offset: Int)?
+    private var emptyCheckScheduled = false
+
+    private func watchEmptyCollection(_ collection: ScoreCollection) {
+        guard collection.events.isEmpty else { return }
+        emptyCollection = (activeFile.url, collection.command.lowerBound)
+    }
+
+    /// After the selection changes: on the next turn of the run loop, so a
+    /// command that passes through other selections on its way (an insert,
+    /// a move to another staff) has finished first.
+    private func scheduleEmptyCollectionCheck(after delay: Double = 0) {
+        guard emptyCollection != nil, !emptyCheckScheduled else { return }
+        emptyCheckScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.emptyCheckScheduled = false
+            self.removeAbandonedEmptyCollection()
+        }
+    }
+
+    private func removeAbandonedEmptyCollection() {
+        guard let watched = emptyCollection else { return }
+        guard !hasPendingNoteInput, !applyingScoreEdit, !applyingStructuralEdit else { scheduleEmptyCollectionCheck(after: 0.1); return }
+        guard let file = score.files.first(where: { $0.url == watched.url }),
+              let collection = file.tree.collection(at: watched.offset),
+              collection.command.lowerBound == watched.offset, collection.events.isEmpty else {
+            emptyCollection = nil   // filled, undone or edited away
+            return
+        }
+        if file === activeFile, selectedCollection()?.command.lowerBound == watched.offset { return }   // still on it
+        emptyCollection = nil
+        guard let edit = ScoreEditor(file.tree).deleteCollection(collection, parse: structuralFile(file).parse) else { return }
+        // Its own undo step; the selection the user just made stays.
+        let keep = selectionUTF8()
+        let same = file === activeFile
+        let entering = enteringNotes
+        guard applyStructural([StructuralEditing.Change(file: file.url.path, edits: edit.edits)],
+                              name: "Remove Empty Collection") else { return }
+        let range = same ? edit.edits.mapOffset(keep.lowerBound)..<max(edit.edits.mapOffset(keep.lowerBound), edit.edits.mapOffset(keep.upperBound)) : keep
+        setSelection(utf8: range, scroll: false)
+        enteringNotes = entering
     }
 
     /// ⌥⇧↑/⌥⇧↓: to the staff above or below, at the same moment.
@@ -1139,13 +1459,27 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let changes = move.edits.map { StructuralEditing.Change(file: files[$0.key].url.path, edits: $0.value) }
+        // Typing into it: keep typing on the new staff.
+        let entering = enteringNotes
         enteringNotes = false
-        guard applyStructural(changes, name: "Move Collection") else { return }
+        // Show the staff it goes to first: the undo is registered with the
+        // visible file's history, the one ⌘Z reaches.
         let target = files[move.anchor.file]
         if target !== activeFile { showFile(target) }
+        guard applyStructural(changes, name: "Move Collection") else { return }
         if let made = tree.collection(at: move.anchor.offset) {
-            if made.events.isEmpty { setSelection(utf8: made.command) } else { selectEvents(made.events) }
+            if made.events.isEmpty {
+                setSelection(utf8: made.command)
+                if emptyCollection != nil { watchEmptyCollection(made) }
+            }
+            else if entering, let last = made.events.last { selectEvents([last]) }
+            else { selectEvents(made.events) }
         }
+        if entering {
+            enteringNotes = true
+            updateInputStatus()
+        }
+        if lens?.isOpen == true { showLens(closesOnRender: false, navigating: true) }
         statusBar.flash("Collection moved to \\\(move.staffName)" + (move.snapped ? " (where the note there ends)" : ""))
     }
 
@@ -1192,6 +1526,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         case .rightArrow?: return k(.right)
         case .delete?, .deleteForward?, .backspace?: return k(.delete)
         case .carriageReturn?, .enter?, .newline?: return k(.enter)
+        case .tab?: return k(.tab)
         default: break
         }
         if event.keyCode == 53 { return k(.escape) }
@@ -1469,7 +1804,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     private var enteringNotes = false
 
     private func perform(_ action: InputAction) {
-        if hasPendingNoteInput, unmeteredStart == nil {
+        // Collection edits bypass the unmetered draft: let it land first.
+        if hasPendingNoteInput, unmeteredStart == nil || selectionInCollection {
             afterNoteInput { [weak self] in self?.perform(action) }
             return
         }
@@ -1546,7 +1882,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             enteringNotes = true
             insert(step: step)
         case .insertRest:
-            // A selected collection: r repeats it, the input duration later.
+            // A selected collection: r repeats it at the first column clear of it.
             if mouseInsertion == nil, selectedCollection() != nil {
                 shiftCollection(forward: true, copy: true)
                 return
@@ -1566,6 +1902,10 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
                 mouseInsertion = nil
                 updateInputStatus()
                 statusBar.flash("Insertion point cleared")
+                return
+            }
+            if let cue = selectedCue() {
+                deleteCue(cue)
                 return
             }
             if let mark = selectedSlurMark() {
@@ -1615,6 +1955,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             apply(edit)
         case .insertCollection:
             insertCollection()
+        case .insertCue:
+            addCue()
         case .shiftCollection(let direction):
             shiftCollection(forward: direction > 0, copy: false)
         case .moveCollectionToStaff(let direction):
@@ -1623,8 +1965,21 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
             let pitched = events.filter { !tree.events[$0].notes.isEmpty }
             apply(scoreEditor.toggleSpan(open: "(", close: ")", events: pitched, name: "Slur"))
         case .togglePostEvent(let text):
+            if expressionShown { expressionPlaced = true }
             let eligible = events.filter { tree.events[$0].acceptsNoteEntry }
             apply(scoreEditor.togglePostEvent(text, events: eligible))
+        case .addExpression(let text, let each):
+            if expressionOpenedLens {
+                // The lens the expression opened closes once the page shows it.
+                lensWasExplicit = false
+                lensClosesOnRender = false
+            }
+            expressionPlaced = true
+            let eligible = events.filter { tree.events[$0].acceptsNoteEntry }.sorted()
+            apply(scoreEditor.setExpression(text, events: each ? eligible : Array(eligible.prefix(1))))
+        case .hairpin(let crescendo):
+            apply(scoreEditor.toggleSpan(open: crescendo ? "\\<" : "\\>", close: "\\!", events: events,
+                                         name: crescendo ? "Crescendo" : "Decrescendo"))
         case .select(let step, let extend):
             if lens?.isOpen == true, !extend { stepLens(step); return }
             if step < 0, !extend, enteringNotes || mouseInsertion != nil {
@@ -1667,7 +2022,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func insert(step: Int?) {
-        if unmeteredStart != nil { enqueueUnmeteredNote(step: step); return }
+        if unmeteredStart != nil, mouseInsertion != nil || !selectionInCollection { enqueueUnmeteredNote(step: step); return }
         let r = selectionUTF8()
         // The first note typed into an empty collection (k makes one).
         if mouseInsertion == nil, let collection = tree.collection(at: r.lowerBound), collection.events.isEmpty,
@@ -1703,7 +2058,7 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         let emptyMeasureAnchor = tree.events[anchor].kind == .spacer && tree.string(tree.events[anchor].range) == "s1*0"
         let entryDuration = noteInput.armedDuration ?? (emptyMeasureAnchor ? DurationValue.quarter : nil)
         let next = unmeteredStart == nil && tree.collection(containingEvent: anchor) == nil
-            ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree) : nil
+            ? StructuralEditing.nextMeasureForEntry(after: anchor, in: tree, root: score.root.tree, timeless: timelessCommands) : nil
         let edit = ScoreEditor(tree).insert(step: step, after: anchor, duration: entryDuration,
                                             octave: step != nil ? mouse?.octave : nil, accidental: noteInput.armedAccidental,
                                             insertionAt: next?.body.lowerBound)
@@ -1773,10 +2128,54 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func updateInputStatus() {
+        updateExpressionEntry()
         let accidental = noteInput.armedAccidental.map { $0 == 2 ? "♯ next" : ($0 == -2 ? "♭ next" : "♮ next") }
-        statusBar.setInput(armed: [noteInput.armedDuration?.text, accidental].compactMap { $0 }.joined(separator: " "), buffer: noteInput.bufferText)
+        statusBar.setInput(armed: [noteInput.armedDuration?.text, accidental].compactMap { $0 }.joined(separator: " "), buffer: noteInput.bufferText,
+                           completion: noteInput.completion)
         updateHints()
-        if lens?.isOpen == true { showLens(closesOnRender: false, navigating: true) }
+        if lens?.isOpen == true || expressionShown { showLens(closesOnRender: false, navigating: true) }
+        if noteInput.expression == nil { expressionShown = false }
+    }
+
+    /// Whether the lens is showing an expression typed after `\`.
+    private var expressionShown = false
+    private var expressionOpenedLens = false
+    private var expressionPlaced = false
+
+    /// `\` with music selected: the lens opens and shows the expression as
+    /// it is typed, on the note it goes to, and the entry line above it.
+    private func updateExpressionEntry() {
+        guard let typed = noteInput.expression else {
+            if expressionShown { lens?.expressionEntry = nil }
+            // An expression that placed nothing closes the lens it opened;
+            // a placed one leaves it to close on the render.
+            if expressionShown, expressionOpenedLens, !expressionPlaced { closeLens() }
+            expressionOpenedLens = false
+            expressionPlaced = false
+            return
+        }
+        guard !targets().events.isEmpty else { return }
+        if !expressionShown, lens?.isOpen != true {
+            showLens(closesOnRender: false)
+            expressionOpenedLens = lens?.isOpen == true
+        }
+        expressionShown = true
+        lens?.expressionEntry = LensExpressionEntry(typed: typed, completion: noteInput.completion)
+    }
+
+    /// The lens's dynamics with the one being typed and the selected one marked.
+    private func markExpressions(_ content: inout LensScoreWindow) {
+        if let mark = selectedMark(), mark.kind == .dynamic {
+            for i in content.dynamics.indices where content.events[content.dynamics[i].event].sourceEvent == mark.event {
+                content.dynamics[i].isSelected = true
+            }
+        }
+        guard let typed = noteInput.expression, !typed.isEmpty, let first = targets().events.min(),
+              let index = content.events.firstIndex(where: { $0.sourceEvent == first }) else { return }
+        let elements = Expression.parse(typed + (noteInput.completion ?? ""))
+        guard !elements.isEmpty else { return }
+        content.dynamics.removeAll { $0.event == index }
+        content.dynamics.append(LensDynamic(event: index, text: Expression.display(elements), elements: elements, isPreview: true))
     }
 
     // MARK: Status
@@ -1921,6 +2320,8 @@ final class DocumentWindowController: NSWindowController, NSWindowDelegate {
         NotificationCenter.default.removeObserver(self)
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
+        if let clickMonitor { NSEvent.removeMonitor(clickMonitor) }
+        clickMonitor = nil
         saveLayout()
         score.files.forEach { $0.undoManager.removeAllActions(withTarget: self) }
         score.close()
@@ -1972,6 +2373,7 @@ extension DocumentWindowController: ScoreCanvasDelegate {
         // ignored here; the note under the click (or the nearest one) wins.
         if let link, !isGraphicLink(link) {
             guard let file = score.file(for: link.path) else {
+                refreshHighlight(reveal: false)
                 statusBar.flash("That object comes from \((link.path as NSString).lastPathComponent), outside this score's files")
                 return
             }
@@ -1979,12 +2381,17 @@ extension DocumentWindowController: ScoreCanvasDelegate {
                 showFile(file)
                 statusBar.flash("Editing \(file.displayName)")
             }
-            guard let offset = currentOffset(of: link) else { return }
+            // Nothing to select: undo the outline the canvas drew at the click.
+            guard let offset = currentOffset(of: link) else { refreshHighlight(reveal: false); return }
             // LilyPond links a slur to its `(`, a time signature to its
             // `\time`, an articulation, dynamic or hairpin to its own
             // post-event: the click selects that, and ⌫ deletes it.
             if !extending, file === activeFile {
                 let scoreEditor = ScoreEditor(tree)
+                if let cue = tree.cue(at: offset) {
+                    selectCue(cue, name: "Cue \(cue.label) selected")
+                    return
+                }
                 if let mark = scoreEditor.slurMark(at: offset) {
                     selectSlur(mark)
                     window?.makeFirstResponder(canvas)
@@ -2008,6 +2415,7 @@ extension DocumentWindowController: ScoreCanvasDelegate {
             } else if let e = tree.eventIndex(at: offset) {
                 range = tree.events[e].range
             } else {
+                refreshHighlight(reveal: false)
                 return
             }
             if extending {
@@ -2318,6 +2726,7 @@ extension DocumentWindowController: ScoreDocumentDelegate {
     }
     func documentDidLoadCachedRender(_ document: ScoreDocument) {
         canvas.setPages(score.pages)
+        prepareMomentMap()
         canvas.fitWidth()
         rebuildEngravingMap()
         refreshHighlight(reveal: false)
@@ -2327,6 +2736,7 @@ extension DocumentWindowController: ScoreDocumentDelegate {
     func documentDidEngrave(_ document: ScoreDocument) {
         let first = canvas.pages.isEmpty
         canvas.setPages(score.pages)
+        prepareMomentMap()
         canvas.setOverflows(score.overflows)
         announceOverflows(score.overflows)
         if let generation = breakAwaitingGeneration, score.completedRenderGeneration >= generation {
@@ -2439,6 +2849,9 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
             if let first = selected.min() { toggleStructuralBreak(before: first) }
         case "add.slur": perform(.toggleSlur)
         case "add.beam": apply(editor.toggleSpan(open: "[", close: "]", events: pitched, name: "Beam"))
+        case "add.fanBeam": apply(editor.fanBeam(.accelerando, events: selected))
+        case "add.fanBeamBack": apply(editor.fanBeam(.ritardando, events: selected))
+        case "edit.hide": apply(editor.toggleHidden(events: selected))
         case "add.crescendo": apply(editor.toggleSpan(open: "\\<", close: "\\!", events: selected, name: "Crescendo"))
         case "add.decrescendo": apply(editor.toggleSpan(open: "\\>", close: "\\!", events: selected, name: "Decrescendo"))
         case "add.tie": apply(editor.togglePostEvent("~", events: pitched))
@@ -2453,7 +2866,7 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         case "add.key": showKeyPicker(events: selected)
         case "add.tempo": showTempoPicker(events: selected)
         case "add.text": showTextPicker(events: selected)
-        case "add.cue": addCue(events: selected)
+        case "add.cue": addCue()
         case "add.note": statusBar.flash("Type a–g with the score focused: the note goes after the selection")
         case "add.rest": insert(step: nil)
         case "add.repeat": repeatSelection()
@@ -2604,6 +3017,21 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
             let consumed = MainActor.assumeIsolated { self?.intercept(event) ?? false }
             return consumed ? nil : event
         }
+        // A click away from an expression being typed places it, as ⏎ does,
+        // on the music it was typed for, before the click moves the selection.
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            MainActor.assumeIsolated {
+                guard let self, event.window === self.window, self.noteInput.expression != nil else { return }
+                self.placeExpression()
+            }
+            return event
+        }
+    }
+
+    /// Places the expression typed after `\`: ⏎, ⎋ and a click away all do.
+    private func placeExpression() {
+        let actions = noteInput.commitExpression()
+        for action in actions { perform(action) }
     }
 
     /// Window-wide keys: the leader (Space in the score, ⌥Space anywhere —
@@ -2635,6 +3063,8 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         if event.keyCode == 53, flags.subtracting([.numericPad, .function]).isEmpty,
            window.attachedSheet == nil, SettingsPanels.closeFloating() { return true }
         if event.keyCode == 53, requestPopover.isOpen { requestPopover.close(); return true }
+        // ⎋ while typing an expression places it (as ⏎ does), not the lens.
+        if event.keyCode == 53, noteInput.expression != nil { placeExpression(); return true }
         if event.keyCode == 53, escapeNotationLens(event: event) { return true }
         if event.keyCode == 53, canvas.graphicSectionSelection != nil, !canvas.legendArranging {
             canvas.clearGraphicSection()
@@ -2642,7 +3072,7 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
             return true
         }
         // ⇥ in the lens: the request line for this passage.
-        if event.keyCode == 48, lens?.isOpen == true, flags.subtracting([.numericPad, .function]).isEmpty {
+        if event.keyCode == 48, lens?.isOpen == true, !noteInput.isBuffering, flags.subtracting([.numericPad, .function]).isEmpty {
             closeLens()
             openLens(LensMode.notation.next(among: lensModes.available) ?? .graphics)
             return true
@@ -3153,7 +3583,17 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
     /// Plays the mockup, or with `electronics` the mix, from the selection's
     /// bar; either command stops whatever is playing.
     private func togglePlayback(electronics: Bool = false) {
+        let wanted: TransportView.Source = electronics ? .mix : .mockup
+        if playbackPaused, player != nil, wanted == playbackSource { resumePlayback(); return }
         if stopPlayback() { return }
+        startPlayback(wanted)
+    }
+
+    /// Starts `source` at `time` (seconds), else from the selection's bar.
+    private func startPlayback(_ source: TransportView.Source, at time: Double? = nil) {
+        let electronics = source == .mix
+        playbackSource = source
+        transport.setSource(source)
         let found = electronics ? mixURL : mockupURL
         guard let url = found else {
             if !electronics {
@@ -3170,8 +3610,8 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
             return
         }
         // Start at the selected bar, timed as the MIDI the mockup came from.
-        var start = 0.0
-        if let log = score.timingLog, let first = targets().events.first,
+        var start = time ?? 0.0
+        if time == nil, let log = score.timingLog, let first = targets().events.first,
            let window = LensScoreBuilder.build(tree: tree, selection: tree.events[first].range, structure: score.root.tree), let target = window.target {
             let bar = window.bars.lowerBound + target.measureIndex
             if let row = log.rows.first(where: { $0.bar >= bar }) { start = TempoMap(log).seconds(at: row.moment) }
@@ -3185,7 +3625,10 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
                 return
             }
             player = p
+            playbackPaused = false
+            transport.setState(.playing)
             startPlayhead(from: p.currentTime)
+            if time != nil { return }
             statusBar.flash("Playing \(url.lastPathComponent) from \(String(format: "%.1f", p.currentTime)) s — ⎋ or \(electronics ? "⌘⌥P" : "⌘⇧P") stops")
         } catch {
             statusBar.flash("Can't play \(url.lastPathComponent): \(error.localizedDescription)")
@@ -3196,12 +3639,117 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
     /// again, or ⎋). False when nothing was playing.
     @discardableResult
     private func stopPlayback() -> Bool {
-        guard let player, player.isPlaying else { return false }
+        guard let player, player.isPlaying || playbackPaused else { return false }
         player.stop()
         self.player = nil
+        playbackPaused = false
         stopPlayhead()
+        transport.setState(.stopped)
+        updateTransportPosition()
         statusBar.flash("Stopped")
         return true
+    }
+
+    // MARK: Transport
+
+    /// The play button: start the chosen recording, pause it, or resume.
+    private func transportPlayPause() {
+        if let player, player.isPlaying {
+            player.pause()
+            playbackPaused = true
+            playheadTimer?.invalidate()
+            playheadTimer = nil
+            transport.setState(.paused)
+            updateTransportPosition()
+        } else if playbackPaused, player != nil {
+            resumePlayback()
+        } else {
+            startPlayback(playbackSource)
+        }
+    }
+
+    private func resumePlayback() {
+        guard let player, player.play() else { return }
+        playbackPaused = false
+        transport.setState(.playing)
+        startPlayheadTimer()
+    }
+
+    /// The other recording, at the same moment if one is playing or paused:
+    /// the mockup and the mix share their timing.
+    private func switchPlaybackSource(_ source: TransportView.Source) {
+        guard source != playbackSource else { return }
+        guard let player, player.isPlaying || playbackPaused else {
+            playbackSource = source
+            return
+        }
+        guard (source == .mix ? mixURL : mockupURL) != nil else {
+            // Not rendered yet: keep playing what was, and say why.
+            transport.setSource(playbackSource)
+            statusBar.flash(source == .mix ? "No mix yet: it renders after each mockup (SuperCollider needed)"
+                                           : "No mockup yet: it renders after each engraving")
+            NSSound.beep()
+            return
+        }
+        let at = player.currentTime, wasPaused = playbackPaused
+        player.stop()
+        self.player = nil
+        playbackPaused = false
+        stopPlayhead()
+        startPlayback(source, at: at)
+        if wasPaused, self.player?.isPlaying == true { transportPlayPause() }
+    }
+
+    /// A click on the timeline: there, while playing or paused.
+    private func seekPlayback(to fraction: Double) {
+        guard let player, player.isPlaying || playbackPaused, player.duration > 0 else {
+            // Stopped: play from there (the timeline shows the piece by its timing).
+            if let total = clock?.totalSeconds, total > 0 { startPlayback(playbackSource, at: min(max(0, fraction), 1) * total) }
+            return
+        }
+        let t = min(max(0, fraction), 1) * player.duration
+        player.currentTime = min(t, max(0, player.duration - 0.05))
+        playheadStart = player.currentTime
+        if playbackPaused {
+            if let track = playheadTrack, let position = track.position(at: player.currentTime, from: playheadStart) {
+                canvas.setPlayhead(position)
+            }
+            updateTransportPosition()
+        } else {
+            tickPlayhead()
+        }
+    }
+
+    /// The stamp: the playing (or paused) head, else the selection's start.
+    private func updateTransportPosition() {
+        guard let clock else {
+            transport.setPosition(nil, fraction: nil)
+            return
+        }
+        if let player, player.isPlaying || playbackPaused {
+            let t = player.currentTime
+            transport.setPosition(clock.label(at: clock.moment(atSeconds: t)),
+                                  fraction: player.duration > 0 ? t / player.duration : nil)
+        } else if let m = selectionMoment {
+            let total = clock.totalSeconds
+            transport.setPosition(clock.label(at: m), fraction: total > 0 ? clock.seconds(at: m) / total : nil)
+        } else {
+            transport.setPosition(nil, fraction: nil)
+        }
+    }
+
+    /// Hints from the keymap (shortcuts can be rebound) and which
+    /// recordings exist yet.
+    private func refreshTransportHints() {
+        let specs = CommandCenter.shared.keymap.specs
+        // The keymap's (rebindable) shortcut, else the catalog's default.
+        func key(_ id: CommandID) -> String? {
+            (specs.first { $0.id == id }?.shortcut ?? CommandCatalog.standard.first { $0.id == id }?.shortcut)?.description
+        }
+        transport.setHints(play: key("view.play"), playMix: key("view.playMix"), stop: "⎋")
+        let mix: String? = mixURL != nil ? nil
+            : score.patchURL == nil ? "no patch yet" : (score.mixProblem ?? "no mix yet (it renders after each mockup)")
+        transport.setAvailable(mockup: mockupURL == nil ? "no mockup yet (it renders after each engraving)" : nil, mix: mix)
     }
 
     // MARK: Playback head
@@ -3213,7 +3761,13 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         stopPlayhead()
         playheadStart = start
         rebuildPlayheadTrack()
-        guard playheadTrack?.stops.isEmpty == false else { return }
+        startPlayheadTimer()
+    }
+
+    /// Ticks the head and the transport's stamp; without a track (no
+    /// timing log yet) the stamp still follows the audio.
+    private func startPlayheadTimer() {
+        playheadTimer?.invalidate()
         let timer = Timer(timeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tickPlayhead() }
         }
@@ -3231,14 +3785,22 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
     }
 
     private func tickPlayhead() {
-        guard let player, let track = playheadTrack else {
+        guard let player else {
             stopPlayhead()
             return
         }
         guard player.isPlaying else {
             stopPlayhead()
+            // Played to the end.
+            if !playbackPaused {
+                self.player = nil
+                transport.setState(.stopped)
+                updateTransportPosition()
+            }
             return
         }
+        updateTransportPosition()
+        guard let track = playheadTrack, !track.stops.isEmpty else { return }
         guard let position = track.position(at: player.currentTime, from: playheadStart) else {
             canvas.setPlayhead(nil)
             return
@@ -4036,7 +4598,8 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
 
     private func showRequest(fromLens: Bool) {
         guard canvas.graphicSectionSelection != nil else {
-            statusBar.flash("⌥drag across the staff to mark a graphics range")
+            if hasNoteSelection { showNotesRequest() }
+            else { statusBar.flash("Select notes, or ⌥drag across the staff to mark a graphics range") }
             return
         }
         closeLens()
@@ -4085,6 +4648,127 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         }
     }
 
+    /// Whether the selection is notes the score's agent can be asked about.
+    private var hasNoteSelection: Bool {
+        let t = targets()
+        return !t.notes.isEmpty || t.events.contains { tree.string(tree.events[$0].range) != "s1*0" }
+    }
+
+    /// What a notes request is about, taken on the main thread; the context
+    /// itself is built from it in the background.
+    private struct NotesRequestSnapshot: @unchecked Sendable {
+        var file: String
+        var text: String
+        var range: Range<Int>
+        var events: [String]
+        var files: [(path: String, text: String)]
+        var root: (path: String, text: String)
+        var cues: CueSheet?
+        var system: JSONValue?
+
+        func matches(_ other: NotesRequestSnapshot) -> Bool {
+            file == other.file && range == other.range && text == other.text
+        }
+
+        /// `score_context` at the selection's start, plus the selection itself:
+        /// its two ends (bar and moment from the files) and its source.
+        func describe() -> JSONValue {
+            let source = SourceText(text)
+            func position(_ o: Int) -> SourcePosition {
+                source.position(of: text.utf8.index(text.utf8.startIndex, offsetBy: min(o, text.utf8.count)))
+            }
+            let start = position(range.lowerBound)
+            let context = ScoreContext.describe(text: text, file: file, line: start.line, character: start.character,
+                                                files: files, cues: cues, root: root, includeGraphic: false)
+            guard case var .object(o) = context else { return context }
+            func end(_ o: Int) -> JSONValue {
+                let p = position(o)
+                var out: [String: JSONValue] = ["file": .string(file), "line": .number(Double(p.line)),
+                                                "character": .number(Double(p.character))]
+                let here = p == start ? context
+                    : ScoreContext.describe(text: text, file: file, line: p.line, character: p.character, includeGraphic: false)
+                if let bar = here["bar"] { out["bar"] = bar }
+                if let moment = here["moment"] { out["moment"] = moment }
+                return .object(out)
+            }
+            // The last event's start, so `to` is on the last selected note.
+            let last = range.isEmpty ? range.lowerBound : max(range.lowerBound, range.upperBound - 1)
+            let tree = SyntaxTree(text)
+            let lastStart = tree.eventIndex(at: last).map { tree.events[$0].range.lowerBound } ?? range.lowerBound
+            let utf8 = Array(text.utf8)
+            let selected = String(decoding: utf8[min(range.lowerBound, utf8.count)..<min(range.upperBound, utf8.count)], as: UTF8.self)
+            o["selection"] = [
+                "kind": "notes",
+                "from": end(range.lowerBound),
+                "to": end(lastStart),
+                "events": .array(events.prefix(200).map(JSONValue.string)),
+                "count": .number(Double(events.count)),
+                "text": .string(selected.count > 4000 ? String(selected.prefix(4000)) + " …" : selected),
+            ]
+            o["hint"] = nil
+            if let system { o["system"] = system }
+            return .object(o)
+        }
+    }
+
+    private func captureNotesRequest() -> NotesRequestSnapshot? {
+        guard hasNoteSelection else { return nil }
+        let t = targets()
+        let text = editor.text
+        var range = selectionUTF8()
+        // A caret on a note means that note.
+        if range.isEmpty, let e = t.events.first { range = tree.events[e].range }
+        let events = t.events.isEmpty ? t.notes.map { tree.string(tree.notes[$0].spelledRange) }
+            : t.events.map { tree.string(tree.events[$0].range) }
+        let path = activeFile.url.path
+        return NotesRequestSnapshot(file: path, text: text, range: range, events: events,
+            files: score.files.map { (path: $0.url.path, text: $0.url.path == path ? text : $0.text) },
+            root: (path: score.root.url.path, text: score.root.url.path == path ? text : score.root.text),
+            cues: score.cueSheet, system: systemOfSelection(text: text))
+    }
+
+    /// The score's agent's request line for the selected notes: a notation
+    /// change ("staccato", "up an octave", "slur these") made by LilyPond's
+    /// rules, or a drawing over them.
+    private func showNotesRequest() {
+        closeLens()
+        guard let anchor = lensAnchor(), let snapshot = captureNotesRequest() else { return }
+        let agent = Self.agent(UserDefaults.standard.string(forKey: Self.agentKey))
+        let count = snapshot.events.count
+        let what = count == 1 ? "the selected note" : "the \(count) selected notes"
+        requestPopover.placeholder = "Describe a change to these notes… e.g. staccato, up an octave, slur them"
+        requestPopover.mode = .graphics
+        configureLensModes(requestPopover)
+        requestPopover.detail = "The score's agent changes only \(what)."
+            + "\nTry: staccato · a slur over these · up an octave · accent the first of each beat"
+        // Built in the background; the field takes the keyboard at once.
+        let task = Task.detached(priority: .userInitiated) { snapshot.describe() }
+        requestPopover.onSubmit = { [weak self] request in
+            guard let self else { return }
+            guard let current = self.captureNotesRequest(), current.matches(snapshot) else {
+                self.statusBar.flash("The score or selection changed. Open the request again.")
+                return
+            }
+            guard let agent = agent ?? AgentRun.choose(preference: UserDefaults.standard.string(forKey: Self.agentKey)) else {
+                self.statusBar.flash("No agent: choose one in Settings (⌘,)")
+                return
+            }
+            self.statusBar.flash("Preparing request…")
+            Task { @MainActor [weak self] in
+                let context = await task.value
+                guard let self else { return }
+                guard let now = self.captureNotesRequest(), now.matches(snapshot) else {
+                    self.statusBar.flash("The score or selection changed. Open the request again.")
+                    return
+                }
+                self.runRequest(request, agent: agent, context: context, target: .notes)
+            }
+        }
+        let turns = requestSession.map { $0.agent.harness == agent?.harness ? $0.turns : 0 } ?? 0
+        let who = agent.map { $0.harness.title + (turns > 0 ? " (continuing, ␣ e n new)" : "") } ?? "the agent"
+        requestPopover.present(title: what, agent: who, anchor: anchor.rect, in: anchor.view)
+    }
+
     /// The request line for the patch agent: a change to the SuperCollider
     /// patch at the selection's point in the score (its cue).
     private func showPatchRequest(fromLens: Bool) {
@@ -4122,8 +4806,8 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
     private var lensModes: (available: Set<LensMode>, unavailable: [LensMode: String]) {
         var available: Set<LensMode> = []
         var unavailable: [LensMode: String] = [:]
-        if canvas.graphicSectionSelection != nil { available.insert(.graphics) }
-        else { unavailable[.graphics] = "⌥drag across the staff to mark a graphics range" }
+        if canvas.graphicSectionSelection != nil || hasNoteSelection { available.insert(.graphics) }
+        else { unavailable[.graphics] = "Select notes, or ⌥drag across the staff to mark a graphics range" }
         if inputProvisional != nil || LensScoreBuilder.hasTarget(tree: tree, selection: selectionUTF8()) { available.insert(.notation) }
         else { unavailable[.notation] = "No notes here to show (a graphic, or a part the lens can't draw)" }
         if score.patchURL != nil { available.insert(.patch) }
@@ -4334,9 +5018,12 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         let graphic = context["graphic"]
         let selection = context["selection"]
         if let selection {
-            log.log("selection", "Marked graphics section", detail: selection.jsonString(pretty: true))
+            log.log("selection", target == .notes ? "Selected notes" : "Marked graphics section", detail: selection.jsonString(pretty: true))
         }
-        let contextNote = graphic == nil
+        let contextNote = target == .notes
+            ? "Notes selected: " + (selection?["count"]?.number.map { "\(Int($0)) events" } ?? "the selection")
+              + (selection?["from"]?["bar"]?.int.map { " from bar \($0)" } ?? "")
+            : graphic == nil
             ? "Section marked; no drawing at its start: the agent gets the range and staff"
             : "Section: " + (graphic?["command"]?.string ?? graphic?["entry"]?.string ?? "a graphic")
               + (graphic?["drawing"] == nil ? "" : " with its drawing code")
@@ -4973,31 +5660,89 @@ extension DocumentWindowController: CommandResponder, NSMenuItemValidation {
         }
     }
 
-    /// The next cue number on the selection, if the score defines `\ecue`.
-    private func addCue(events: [Int]) {
-        let texts = score.files.map(\.text)
-        guard texts.contains(where: { $0.contains("ecue =") || $0.contains("ecue=") }) else {
+    /// `q`: the next cue at the selection's start, on the voice the score
+    /// keeps its cues in (`CueStaves.cueVoice`), selected so ⌫ takes it back.
+    private func addCue() {
+        if hasPendingNoteInput { afterNoteInput { [weak self] in self?.addCue() }; return }
+        synchronizeScoreSource()
+        let files = score.files
+        guard CueStaves.defined(texts: files.map(\.text)) else {
             statusBar.flash("Cues need \\ecue, from the electronics staff library (lilypond-electronics-staff)")
             NSSound.beep()
             return
         }
-        var highest = 0
-        for text in texts {
-            var rest = Substring(text)
-            while let r = rest.range(of: "\\ecue \"") {
-                rest = rest[r.upperBound...]
-                if let n = Int(rest.prefix { $0.isNumber }) { highest = max(highest, n) }
-            }
+        let parsers = files.map { structuralFile($0) }
+        let trees = parsers.map(\.tree)
+        guard let file = files.firstIndex(where: { $0 === activeFile }),
+              let first = targets().events.min(), tree.events.indices.contains(first) else {
+            statusBar.flash("Select the music where the cue goes")
+            NSSound.beep()
+            return
         }
-        guard let first = events.min() else { return }
-        apply(ScoreEditor(tree).togglePostEvent("\\ecue \"\(highest + 1)\"", events: [first]))
-        statusBar.flash("Cue \(highest + 1)")
+        guard let target = CueStaves.cueVoice(trees: trees) else {
+            statusBar.flash("No electronics staff or cue voice for the cue")
+            NSSound.beep()
+            return
+        }
+        let label = CueStaves.nextLabel(trees: trees)
+        guard let placed = CueStaves.insert(label: label, at: tree.events[first].range.lowerBound, file: file, into: target,
+                                            trees: trees, parse: { parsers[$0].parse($1) }) else {
+            statusBar.flash("No place for a cue at this moment in \\\(target.name)")
+            NSSound.beep()
+            return
+        }
+        let destination = files[placed.file]
+        if let existing = placed.existing {
+            if destination !== activeFile { showFile(destination) }
+            selectCue(existing, name: "Cue \(existing.label) is already here")
+            return
+        }
+        let changes = placed.edits.map { StructuralEditing.Change(file: files[$0.key].url.path, edits: $0.value) }
+        if destination !== activeFile { showFile(destination) }
+        guard applyStructural(changes, name: "Add Cue \(label)") else { return }
+        enteringNotes = false
+        if let made = tree.cues.first(where: { $0.label == label }) {
+            selectCue(made, name: "Cue \(label) on \\\(placed.voiceName)\(placed.snapped ? " where the note there ends" : "")")
+        } else {
+            statusBar.flash("Cue \(label)")
+        }
     }
 
+    /// The cue the selection is, exactly (its `\ecue "12"`), as a click on its box selects it.
+    private func selectedCue() -> ScoreCue? {
+        let r = selectionUTF8()
+        guard !r.isEmpty, let cue = tree.cue(at: r.lowerBound), cue.command == r else { return nil }
+        return cue
+    }
+
+    private func selectCue(_ cue: ScoreCue, name: String) {
+        enteringNotes = false
+        mouseInsertion = nil
+        setSelection(utf8: cue.command)
+        window?.makeFirstResponder(canvas)
+        statusBar.flash("\(name) · ⌫ deletes it")
+    }
+
+    private func deleteCue(_ cue: ScoreCue) {
+        let gone = highlighted
+        let edit = ScoreEditor(tree).deleteCue(cue, parse: structuralFile(activeFile).parse)
+        apply(edit)
+        if edit != nil {
+            canvas.provisionalDelete(gone, path: activeFile.url.path)
+            refreshHighlight(reveal: false)
+            statusBar.flash("Cue \(cue.label) deleted")
+        }
+    }
+
+    /// The menu's way to the `\\mf dolce⏎` expression typed in the score.
     private func showDynamicPicker(events: [Int]) {
-        showPicker(placeholder: "Dynamic", choices: Self.dynamics.map { (title: "\\" + $0, detail: nil as String?) }) { [weak self] i in
-            guard let self else { return }
-            self.apply(ScoreEditor(self.tree).togglePostEvent("\\" + Self.dynamics[i], events: events))
+        let presets = (Self.dynamics + Expression.vocabulary).map { (title: $0, value: $0, detail: nil as String?) }
+        showEntryPicker(placeholder: "Expression — dynamics and words: mf, pppp, mf dolce, poco f", presets: presets,
+                        custom: { Expression.postEvent($0) == nil ? nil : $0 }) { [weak self] typed in
+            guard let self, let text = Expression.postEvent(typed) else { return }
+            let eligible = events.filter { self.tree.events[$0].acceptsNoteEntry }
+            let targets = Expression.appliesToEach(typed) ? eligible : Array(eligible.sorted().prefix(1))
+            self.apply(ScoreEditor(self.tree).setExpression(text, events: targets))
         }
     }
 

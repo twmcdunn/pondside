@@ -317,6 +317,38 @@ public struct ScoreEditor: Sendable {
         return ScoreEdit(name: "Toggle \(text)", edits: edits, selectionAnchors: anchorsAfter(edits, events: eventIndices))
     }
 
+    /// A dynamic or expression on each event, replacing the dynamics and
+    /// expressions already there; where `text` is there already, removes it.
+    public func setExpression(_ text: String, events eventIndices: [Int]) -> ScoreEdit? {
+        let wanted = Self.core(ofText: text)
+        var edits: [TextEdit] = []
+        for e in Set(eventIndices).sorted() {
+            let ev = events[e]
+            let present = ev.postEvents.filter { Expression.isExpression(core(of: $0)) }
+            let same = present.contains { tree.string($0) == text }
+            for r in present {
+                let joins = isWordByte(at: r.lowerBound - 1) && isWordByte(at: r.upperBound)
+                edits.append(TextEdit(r, joins ? " " : ""))
+            }
+            if !same, !wanted.isEmpty {
+                let at = ev.range.upperBound
+                let separate = isWordByte(text.utf8.last) && isWordByte(at: at)
+                edits.append(.insert(separate ? text + " " : text, at: at))
+            }
+        }
+        guard !edits.isEmpty else { return nil }
+        return ScoreEdit(name: "Expression", edits: edits, selectionAnchors: anchorsAfter(edits, events: eventIndices))
+    }
+
+    static func core(ofText s: String) -> String {
+        if s.count > 1, let first = s.first, "-^_".contains(first) {
+            let rest = s.dropFirst()
+            if rest.count == 1, ".^-_>!+|".contains(rest.first!) { return s }
+            return String(rest)
+        }
+        return s
+    }
+
     /// A spanner over the selection: `open` after its first event and
     /// `close` after its last (slur `( )`, beam `[ ]`, hairpin `\< \!`).
     /// When both ends are already there, removes them.
@@ -474,7 +506,7 @@ public struct ScoreEditor: Sendable {
             // The hairpin ends at the next `\!`, dynamic or hairpin.
             if let end = closingPostEvent(after: mark.range, event: mark.event, where: { _, r in
                 let t = core(of: r)
-                return t == "\\!" || Self.hairpinStarts.contains(t) || Self.dynamics.contains(t)
+                return t == "\\!" || Self.hairpinStarts.contains(t) || Self.dynamics.contains(t) || Expression.isScript(t)
             }), core(of: end.range) == "\\!" {
                 ranges.append(end.range)
             }
@@ -518,7 +550,7 @@ public struct ScoreEditor: Sendable {
     ]
 
     static func markKind(_ text: String) -> Mark.Kind {
-        if dynamics.contains(text) { return .dynamic }
+        if dynamics.contains(text) || Expression.isScript(text) { return .dynamic }
         if hairpinStarts.contains(text) { return .hairpin }
         switch text {
         case "\\!": return .hairpinEnd
@@ -546,6 +578,7 @@ public struct ScoreEditor: Sendable {
 
     static func markName(_ text: String) -> String {
         if dynamics.contains(text) { return "Dynamic \(text.dropFirst())" }
+        if Expression.isScript(text) { return "Expression" }
         if hairpinStarts.contains(text) { return text == "\\>" || text == "\\decr" || text == "\\dim" || text == "\\decresc" ? "Diminuendo" : "Crescendo" }
         switch text {
         case "\\!": return "Hairpin End"
@@ -918,12 +951,12 @@ public struct ScoreEditor: Sendable {
     }
 
     /// Letters, digits and octave marks: bytes that would fuse into one token.
-    private func isWordByte(_ c: UInt8?) -> Bool {
+    func isWordByte(_ c: UInt8?) -> Bool {
         guard let c else { return false }
         return Lexer.isLetter(c) || Lexer.isDigit(c) || c == UInt8(ascii: "'") || c == UInt8(ascii: ",")
     }
 
-    private func isWordByte(at i: Int) -> Bool {
+    func isWordByte(at i: Int) -> Bool {
         isWordByte(tree.bytes[safe: i])
     }
 
@@ -956,7 +989,7 @@ public struct ScoreEditor: Sendable {
         return anchor + shift
     }
 
-    private func anchorsAfter(_ edits: [TextEdit], events eventIndices: [Int]) -> [Int] {
+    func anchorsAfter(_ edits: [TextEdit], events eventIndices: [Int]) -> [Int] {
         eventIndices.sorted().map { edits.mapOffset(events[$0].range.lowerBound) }
     }
 }

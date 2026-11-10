@@ -12,3 +12,6 @@ opencode.json
 Tests/Scores/.codex/
 Tests/Scores/patch/
 Tests/Scores/renders/
+Tests/Scores/*/.codex/
+Tests/Scores/*/patch/
+Tests/Scores/*/renders/

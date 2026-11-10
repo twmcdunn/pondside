@@ -28,6 +28,9 @@ final class NotationLensOverlayView: NSView {
     private let notices = PassthroughFlippedView()
     private var rejection: EditRejectionFeedback?
     private let badge = NSTextField(labelWithString: "")
+    /// The expression typed after `\`, above the strip that previews it.
+    private let entry = NSTextField(labelWithString: "")
+    private let entryPill = NSView()
     /// The same switch as the request lines', so ⇥ between them only
     /// changes what is below it.
     let modes = LensModeBar()
@@ -88,6 +91,27 @@ final class NotationLensOverlayView: NSView {
         inputGroup.addArrangedSubview(duration)
         for hint in accidentalHints { inputGroup.addArrangedSubview(hint) }
         addSubview(inputGroup)
+        entryPill.wantsLayer = true
+        entryPill.layer?.cornerRadius = 6
+        entryPill.layer?.backgroundColor = Theme.accent.withAlphaComponent(0.20).cgColor
+        entryPill.layer?.borderColor = Theme.accent.cgColor
+        entryPill.layer?.borderWidth = 1.5
+        entryPill.translatesAutoresizingMaskIntoConstraints = false
+        entryPill.isHidden = true
+        entry.lineBreakMode = .byTruncatingHead
+        entry.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        entry.translatesAutoresizingMaskIntoConstraints = false
+        entryPill.addSubview(entry)
+        addSubview(entryPill)
+        NSLayoutConstraint.activate([
+            entryPill.leadingAnchor.constraint(greaterThanOrEqualTo: modes.trailingAnchor, constant: 10),
+            entryPill.trailingAnchor.constraint(equalTo: meterGroup.leadingAnchor, constant: -10),
+            entryPill.centerYAnchor.constraint(equalTo: meterGroup.centerYAnchor),
+            entryPill.heightAnchor.constraint(equalToConstant: 28),
+            entry.leadingAnchor.constraint(equalTo: entryPill.leadingAnchor, constant: 9),
+            entry.trailingAnchor.constraint(equalTo: entryPill.trailingAnchor, constant: -9),
+            entry.centerYAnchor.constraint(equalTo: entryPill.centerYAnchor),
+        ])
         NSLayoutConstraint.activate([
             inputGroup.trailingAnchor.constraint(equalTo: meterGroup.leadingAnchor, constant: -10),
             duration.widthAnchor.constraint(equalToConstant: 44),
@@ -160,6 +184,28 @@ final class NotationLensOverlayView: NSView {
         let strip = notices.convert(paper.bounds, from: paper)
         let anchor = NSRect(x: strip.midX - 4, y: strip.minY + 28, width: 2, height: 36)
         rejection = EditRejectionFeedback(message: message, anchor: anchor, in: notices)
+    }
+
+    /// The expression being typed: `\mf dol` then the completion in grey,
+    /// and its keys. Replaces the duration and accidental hints meanwhile.
+    func setExpressionEntry(_ value: LensExpressionEntry?) {
+        entryPill.isHidden = value == nil
+        inputGroup.isHidden = value != nil
+        guard let value else { return }
+        let text = NSMutableAttributedString(string: "\\" + value.typed, attributes: [
+            .font: NSFont.monospacedSystemFont(ofSize: Theme.bodySize, weight: .medium), .foregroundColor: Theme.text,
+        ])
+        text.append(NSAttributedString(string: "▏", attributes: [.font: Theme.bodyFont, .foregroundColor: Theme.accent]))
+        if let more = value.completion {
+            text.append(NSAttributedString(string: more, attributes: [
+                .font: NSFont.monospacedSystemFont(ofSize: Theme.bodySize, weight: .regular), .foregroundColor: Theme.glassSecondaryText.withAlphaComponent(0.6),
+            ]))
+        }
+        let keys = (value.completion == nil ? "" : "⇥ complete   ") + "⏎ place   ⎋ cancel"
+        text.append(NSAttributedString(string: "    " + keys, attributes: [.font: Theme.secondaryFont, .foregroundColor: Theme.glassSecondaryText]))
+        entry.attributedStringValue = text
+        entryPill.toolTip = "Expression: dynamics (p, mf, ffff…) and words, separated by spaces"
+        setAccessibilityValue("Expression \(value.typed)\(value.completion ?? "")")
     }
 
     func showFeedback(_ message: String) {

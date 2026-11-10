@@ -467,6 +467,7 @@ public enum StructuralEditing {
               source.tree.text.contains(runtime) else { throw Failure("The shared-measure helper is missing or modified. Restore its definition before structural editing.") }
         let all = definitions(in: source.tree)
         guard !all.isEmpty else { throw Failure("No shared measure definitions were found.") }
+        let timeless = TimelessCommands.names(in: files.map(\.tree))
         var seen: Set<String> = []
         for (id, node) in all {
             guard index(of: id) != nil, seen.insert(id).inserted, let meter = time(in: source.tree, name: id),
@@ -507,17 +508,16 @@ public enum StructuralEditing {
                       slots.isEmpty || (source.tree.text.contains(spaceRuntime) && file.tree.events.filter({ measure.body.contains($0.range.lowerBound) }).allSatisfy({ isEmptyChord($0) || $0.kind == .spacer && duration($0, in: file.tree, context: LensContext()) == .zero })) else {
                     throw Failure("\(file.id): proportional layout spaces must reference their own shared measure and fit its length.")
                 }
-                let context = LensContextScanner.scan(file.tree, block: measure.body)
+                let context = LensContextScanner.scan(file.tree, block: measure.body, timeless: timeless)
                 guard isInterpreted(source.tree) || (context.custom.isEmpty && context.unsupported.allSatisfy({ $0 == "markup" })) else {
                     throw Failure("\(file.id): custom or unsupported timing was added to a shared measure.")
                 }
                 var invalid: String?
+                if !isInterpreted(source.tree), generatesMusic(file.tree, body: measure.body) { invalid = "generated or simultaneous music" }
                 file.tree.root.forEachNode { node in
                     guard measure.body.contains(node.range.lowerBound) else { return }
                     let text = file.tree.string(node.range)
-                    if (node.kind == .command && text == "\\score") || (!isInterpreted(source.tree) && (node.kind == .simultaneous || (node.kind == .scheme && (text.hasPrefix("#(") || text.hasPrefix("$"))))) {
-                        invalid = "generated or simultaneous music"
-                    }
+                    if node.kind == .command && text == "\\score" { invalid = "generated or simultaneous music" }
                     if node.kind == .command && ["\\time", "\\partial", "\\cadenzaOn", "\\cadenzaOff", "\\noBreak", "\\noPageBreak"].contains(text) { invalid = text }
                     if managesBreaks(source.tree), node.kind == .command && ["\\break", "\\pageBreak"].contains(text) { invalid = "a local break" }
                 }
@@ -596,9 +596,12 @@ public enum StructuralEditing {
               let rootIndex = files.firstIndex(where: { $0.id == root }) else { throw Failure("The edited file or root is missing.") }
         let old = measures(in: files[index].tree)
         let new = measures(in: proposed)
+        var trees = files.map(\.tree)
+        trees[index] = proposed
+        let timeless = TimelessCommands.names(in: trees)
         if isInterpreted(files[rootIndex].tree) {
             for (before, after) in zip(old, new) where files[index].tree.string(before.body) != proposed.string(after.body) {
-                let context = LensContextScanner.scan(proposed, block: after.body)
+                let context = LensContextScanner.scan(proposed, block: after.body, timeless: timeless)
                 if !context.custom.isEmpty || !context.unsupported.filter({ $0 != "markup" }).isEmpty {
                     throw Failure("This passage has generated timing. Edit it in Source and rerun Make Score Pondside-Ready; unmetered entry needs explicit note durations.")
                 }
@@ -608,24 +611,50 @@ public enum StructuralEditing {
             throw Failure("A content edit cannot add, remove or reorder shared measures.")
         }
         var affected: [String: LensTime] = [:]
-        for (before, after) in zip(old, new) where files[index].tree.string(before.body) != proposed.string(after.body) {
-            guard let meter = contentMeter(in: proposed, measure: after),
-                  meter != contentMeter(in: files[index].tree, measure: before) else { continue }
+        // The edited bars, by position among the file's bars, for the time map.
+        var edited: [String: (position: Int, before: Measure, after: Measure)] = [:]
+        for (position, (before, after)) in zip(old, new).enumerated() where files[index].tree.string(before.body) != proposed.string(after.body) {
+            guard let meter = contentMeter(in: proposed, measure: after, timeless: timeless),
+                  meter != contentMeter(in: files[index].tree, measure: before, timeless: timeless) else { continue }
             if affected[after.name].map({ $0.wholeNotes < meter.wholeNotes }) ?? true { affected[after.name] = meter }
+            if edited[after.name] == nil { edited[after.name] = (position, before, after) }
         }
         var projected = files
         projected[index].tree = proposed
         let initial = projected[rootIndex].tree
+        let starting = projected.map(\.tree.text)
         for name in affected.keys.sorted() {
             var desired = affected[name]!
+            let previous = time(in: initial, name: name)
             // Unmetered deletion may shrink this voice, but must leave room
             // for the other voices' existing music. Opaque timing retains the
             // current length when a shorter length cannot be proved safe.
-            for file in projected {
-                for measure in measures(in: file.tree) where measure.name == name {
-                    let needed = needsInterpreter(in: file.tree, body: measure.body)
-                        ? time(in: initial, name: name) : contentMeter(in: file.tree, measure: measure)
+            // Voices of skips and marks follow the new length instead.
+            var anchors: [(file: Int, measure: Measure)] = []
+            for (f, file) in projected.enumerated() {
+                for (position, measure) in measures(in: file.tree).enumerated() where measure.name == name {
+                    if f == index, position == edited[name]?.position { continue }
+                    if previous != nil, isAnchorVoice(file.tree, body: measure.body, timeless: timeless) {
+                        anchors.append((f, measure))
+                        continue
+                    }
+                    let needed = needsInterpreter(in: file.tree, body: measure.body, timeless: timeless)
+                        ? previous : contentMeter(in: file.tree, measure: measure, timeless: timeless)
                     if let needed, desired.wholeNotes < needed.wholeNotes { desired = needed }
+                }
+            }
+            // The same length keeps its written meter (4/4 stays 4/4, not 1/1).
+            if let previous, previous.wholeNotes == desired.wholeNotes { continue }
+            if let previous, let bar = edited[name], !anchors.isEmpty {
+                let map = timeMap(before: files[index].tree, body: bar.before.body, after: proposed, body: bar.after.body,
+                                  oldLength: previous.wholeNotes, newLength: desired.wholeNotes, timeless: timeless)
+                var byFile: [Int: [TextEdit]] = [:]
+                for anchor in anchors {
+                    byFile[anchor.file, default: []] += rescaleEdits(projected[anchor.file].tree, body: anchor.measure.body,
+                                                                    map: map, timeless: timeless)
+                }
+                for (f, edits) in byFile where !edits.isEmpty && edits.normalized.isNonOverlapping {
+                    projected[f].tree = projected[f].parse(edits.apply(to: projected[f].tree.text))
                 }
             }
             let changes = try changeMeter(desired, measure: name, files: projected, root: root, validatingContract: false)
@@ -634,20 +663,28 @@ public enum StructuralEditing {
                 projected[i].tree = projected[i].parse(change.edits.apply(to: projected[i].tree.text))
             }
         }
-        guard let difference = TextDiff.minimalReplacement(from: initial.text, to: projected[rootIndex].tree.text) else { return [] }
-        let lower = OffsetConversion.utf8(fromUTF16: difference.location, in: initial.text)
-        let upper = OffsetConversion.utf8(fromUTF16: difference.location + difference.length, in: initial.text)
-        return [Change(file: root, edits: [TextEdit(lower..<upper, difference.replacement)])]
+        // One minimal replacement per changed file: the root's meters, and
+        // the voices that followed the new lengths.
+        var result: [Change] = []
+        for (f, file) in projected.enumerated() where file.tree.text != starting[f] {
+            let before = starting[f]
+            guard let difference = TextDiff.minimalReplacement(from: before, to: file.tree.text) else { continue }
+            let lower = OffsetConversion.utf8(fromUTF16: difference.location, in: before)
+            let upper = OffsetConversion.utf8(fromUTF16: difference.location + difference.length, in: before)
+            result.append(Change(file: file.id, edits: [TextEdit(lower..<upper, difference.replacement)]))
+        }
+        return result
     }
 
     public static func verifyLengths(_ files: [File], root: String) throws {
         try validate(files, root: root)
         guard let source = files.first(where: { $0.id == root }) else { throw Failure("The root score is missing.") }
+        let timeless = TimelessCommands.names(in: files.map(\.tree))
         for file in files {
             for measure in measures(in: file.tree) {
                 guard let meter = time(in: source.tree, name: measure.name) else { throw Failure("The shared meter is missing.") }
-                let context = LensContextScanner.scan(file.tree, block: measure.body)
-                if isInterpreted(source.tree), needsInterpreter(in: file.tree, body: measure.body) { continue }
+                let context = LensContextScanner.scan(file.tree, block: measure.body, timeless: timeless)
+                if isInterpreted(source.tree), needsInterpreter(in: file.tree, body: measure.body, timeless: timeless) { continue }
                 guard contentLength(file.tree, body: measure.body, context: context) <= meter.wholeNotes else {
                     throw Overflow(file: file.id, measure: measure.name, meter: meter)
                 }
@@ -670,15 +707,16 @@ public enum StructuralEditing {
     /// Keystroke validation trusts the migrated wrapper structure and checks
     /// only bodies changed by this edit. Opaque functions are checked by the
     /// normal background engraving, never by a synchronous preflight.
-    public static func verifyContentEdit(in file: String, before: SyntaxTree, proposed: SyntaxTree, root: SyntaxTree) throws {
+    public static func verifyContentEdit(in file: String, before: SyntaxTree, proposed: SyntaxTree, root: SyntaxTree,
+                                         timeless: Set<String> = []) throws {
         let old = measures(in: before), new = measures(in: proposed)
         guard old.count == new.count, zip(old, new).allSatisfy({ $0.name == $1.name }) else {
             throw Failure("A note edit cannot add, delete or reorder shared measures.")
         }
         for (previous, measure) in zip(old, new) where before.string(previous.body) != proposed.string(measure.body) {
             guard let meter = time(in: root, name: measure.name) else { throw Failure("The shared meter is missing.") }
-            if needsInterpreter(in: proposed, body: measure.body) { continue }
-            let context = LensContextScanner.scan(proposed, block: measure.body)
+            if needsInterpreter(in: proposed, body: measure.body, timeless: timeless) { continue }
+            let context = LensContextScanner.scan(proposed, block: measure.body, timeless: timeless)
             if contentLength(proposed, body: measure.body, context: context) > meter.wholeNotes {
                 throw Overflow(file: file, measure: measure.name, meter: meter)
             }
@@ -687,13 +725,14 @@ public enum StructuralEditing {
 
     /// At the end of a complete metered bar, entry continues in the next
     /// wrapper of the same voice. Never borrow a measure from another voice.
-    public static func nextMeasureForEntry(after event: Int, in tree: SyntaxTree, root: SyntaxTree) -> Measure? {
+    public static func nextMeasureForEntry(after event: Int, in tree: SyntaxTree, root: SyntaxTree,
+                                           timeless: Set<String> = []) -> Measure? {
         guard tree.events.indices.contains(event),
               let current = measure(in: tree, at: tree.events[event].range.lowerBound),
-              !needsInterpreter(in: tree, body: current.body),
+              !needsInterpreter(in: tree, body: current.body, timeless: timeless),
               let meter = time(in: root, name: current.name),
               let block = LensBlockFinder.block(in: tree, at: tree.events[event].range.lowerBound) else { return nil }
-        let context = LensContextScanner.scan(tree, block: current.body)
+        let context = LensContextScanner.scan(tree, block: current.body, timeless: timeless)
         let members = tree.events.filter { current.body.contains($0.range.lowerBound) }
         let fullRest = members.count == 1 && members[0].kind == .multiMeasureRest && members[0].postEvents.isEmpty
         guard (fullRest || contentLength(tree, body: current.body, context: context) == meter.wholeNotes),
@@ -730,14 +769,15 @@ public enum StructuralEditing {
         let shortening = previous.map { time.wholeNotes < $0.wholeNotes } ?? true
         var unverified: [ProbeSite] = []
         var knownFits = true
+        let timeless = TimelessCommands.names(in: files.map(\.tree))
         for source in files {
             for measure in measures(in: source.tree) where measure.name == name {
-                let context = LensContextScanner.scan(source.tree, block: measure.body)
+                let context = LensContextScanner.scan(source.tree, block: measure.body, timeless: timeless)
                 guard isInterpreted(file.tree) || (context.unsupported.allSatisfy({ $0 == "markup" }) && context.custom.isEmpty) else {
                     throw Failure("\(source.id): this measure contains timing that needs LilyPond validation.")
                 }
                 let length = contentLength(source.tree, body: measure.body, context: context)
-                if isInterpreted(file.tree), needsInterpreter(in: source.tree, body: measure.body) {
+                if isInterpreted(file.tree), needsInterpreter(in: source.tree, body: measure.body, timeless: timeless) {
                     guard shortening else { continue }
                     unverified.append(probeSite(source, measure))
                     if length > time.wholeNotes { knownFits = false }
@@ -802,8 +842,8 @@ public enum StructuralEditing {
         return length
     }
 
-    public static func contentMeter(in tree: SyntaxTree, measure: Measure) -> LensTime? {
-        let context = LensContextScanner.scan(tree, block: measure.body)
+    public static func contentMeter(in tree: SyntaxTree, measure: Measure, timeless: Set<String> = []) -> LensTime? {
+        let context = LensContextScanner.scan(tree, block: measure.body, timeless: timeless)
         guard context.unsupported.allSatisfy({ $0 == "markup" }), context.custom.isEmpty else { return nil }
         let length = contentLength(tree, body: measure.body, context: context)
         guard length > .zero else { return nil }
@@ -908,13 +948,14 @@ public enum StructuralEditing {
         guard let source = files.first(where: { $0.id == root }), isManaged(source.tree) else { return [] }
         try validate(files, root: root)
         guard !files.contains(where: { !layoutRegions(in: $0.tree).isEmpty }) else { throw Failure("Interpreted layout anchors must be expanded through LilyPond, not by a source-only opt-out.") }
+        let timeless = TimelessCommands.names(in: files.map(\.tree))
         var changes: [Change] = []
         for file in files {
             var edits: [TextEdit] = []
             for measure in measures(in: file.tree) {
                 guard let meter = time(in: source.tree, name: measure.name),
                       let (_, definitionNode) = definitions(in: source.tree).first(where: { $0.0 == measure.name }) else { throw Failure("The shared measure definition is missing.") }
-                let context = LensContextScanner.scan(file.tree, block: measure.body)
+                let context = LensContextScanner.scan(file.tree, block: measure.body, timeless: timeless)
                 guard context.unsupported.allSatisfy({ $0 == "markup" }), context.custom.isEmpty else { throw Failure("\(file.id): resolve custom timing before removing shared measures.") }
                 let slots = spaces(in: file.tree, body: measure.body)
                 let spaceLength = slots.reduce(LensFraction.zero) { $0 + $1.fraction * meter.wholeNotes }

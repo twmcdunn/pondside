@@ -1,8 +1,9 @@
-struct LensFraction: Sendable, Hashable, Comparable {
-    var numerator: Int
-    var denominator: Int
+/// A rational number of whole notes.
+public struct LensFraction: Sendable, Hashable, Comparable {
+    public var numerator: Int
+    public var denominator: Int
 
-    init(_ numerator: Int, _ denominator: Int = 1) {
+    public init(_ numerator: Int, _ denominator: Int = 1) {
         let sign = denominator < 0 ? -1 : 1
         let n = numerator * sign
         let d = denominator * sign
@@ -11,28 +12,28 @@ struct LensFraction: Sendable, Hashable, Comparable {
         self.denominator = d / g
     }
 
-    static let zero = LensFraction(0)
-    static let one = LensFraction(1)
+    public static let zero = LensFraction(0)
+    public static let one = LensFraction(1)
 
-    var isZero: Bool { numerator == 0 }
-    var double: Double { Double(numerator) / Double(denominator) }
+    public var isZero: Bool { numerator == 0 }
+    public var double: Double { Double(numerator) / Double(denominator) }
 
-    static func * (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
+    public static func * (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
         LensFraction(lhs.numerator * rhs.numerator, lhs.denominator * rhs.denominator)
     }
 
-    static func + (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
+    public static func + (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
         LensFraction(
             lhs.numerator * rhs.denominator + rhs.numerator * lhs.denominator,
             lhs.denominator * rhs.denominator
         )
     }
 
-    static func - (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
+    public static func - (lhs: LensFraction, rhs: LensFraction) -> LensFraction {
         lhs + LensFraction(-rhs.numerator, rhs.denominator)
     }
 
-    static func < (lhs: LensFraction, rhs: LensFraction) -> Bool {
+    public static func < (lhs: LensFraction, rhs: LensFraction) -> Bool {
         lhs.numerator * rhs.denominator < rhs.numerator * lhs.denominator
     }
 

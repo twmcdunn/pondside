@@ -786,6 +786,18 @@ terminal:
   swell"). ⌘L reopens it for the marked range; a normal click never opens a
   graphics request. On notes, ⇥ switches the Notation Lens to the request
   line when a range is marked, and ⇥ switches back.
+- **Notes too (2026-11-09).** The request line also opens on a note
+  selection: ⇥ from the Notation Lens, or the mode bar's Graphics segment,
+  whenever notes are selected (a caret on a note means that note), with no
+  ⌥-drag. Its placeholder asks for a notation change ("staccato, up an
+  octave, slur them"). `selection.kind` is `"notes"`: `from`/`to` (file,
+  line, character, bar, moment of the first and last selected event), the
+  selected `events` and source `text`, plus the root `\layout` and the
+  definitions index, built off the main thread. The prompt
+  (`AgentRun.RequestTarget.notes`) carries the LilyPond skill, changes only
+  the selected notes and what is attached to them, and sends a drawing over
+  them to `graphic_insert` by the graphic skill's reference. A marked range
+  still wins when both exist; the selection is checked again on ↩.
 - **What runs.** ↩ sends the request to the agent chosen in Settings
   (`AgentSession`: Claude Code or opencode, each kept running between
   requests). Its prompt holds the
@@ -1195,7 +1207,10 @@ schedules its own). A flush that must finish before returning (closing,
 quitting, resolving a conflict) still saves synchronously. Shared meter lookup indexes the root once per lens
 build, and mode availability reuses that lens instead of building it again.
 Note entry does not invoke migration or a blocking interpreter compile. Opaque timing remains LilyPond's job
-during normal background engraving. Unmetered changes update the shared
+during normal background engraving. Custom commands the score defines as
+taking no time, and Scheme that only sets values, are not opaque
+(`TimelessCommands`, docs/API.md); the window caches that set per parse of
+the score's files. Unmetered changes update the shared
 length and preserve enough room for other voices' music. At a completed
 metered bar's final event, entry continues at the next wrapper in that voice.
 A meter shortened in a bar whose music comes from functions (`\showStaff`,
@@ -1302,7 +1317,7 @@ the selected shared measure's definition.
   leading edge stays clear of the traffic lights.
 - **⌥ shortcuts are window-wide:** the window's key monitor runs a
   catalog command whose shortcut is ⌥ or ⌥⇧ plus a key (⌥C, ⌥B, ⌥⇧B, ⌥U,
-  ⌥F, ⌥N) before the first responder sees the key, so they work in the
+  ⌥T, ⌥F, ⌥⇧F, ⌥H, ⌥N) before the first responder sees the key, so they work in the
   source editor instead of typing "ç", "∫" and so on. Those characters
   can't be typed there; other ⌥ keys still type theirs.
 - **Source colouring** from the CST's token kinds (commands, strings,
@@ -1335,7 +1350,7 @@ score.
   a delimiter (single-staff systems) group staves by their gaps as before.
 - **Motion and following.** Between two notes on one system the line
   glides; crossing a system or page it jumps. With View › Follow Playback
-  (⌥F, on by default, also in Settings › Playback) each new system glides
+  (⌥⌘F, on by default, also in Settings › Playback) each new system glides
   to the middle of the view (0.45 s ease; Reduce Motion jumps); between
   systems nothing scrolls, so the user can scroll freely and the next
   system brings the view back. Off, the view never moves by itself. The
@@ -1654,13 +1669,14 @@ lilypond-electronics-staff library); it is now Pondside's.
 
 | Key | What |
 |---|---|
-| `k` (Space a o) | an empty collection where the selection ends, selected; a–g fill it (nearest octave, `=` `-` for sharp and flat; no rests, no durations) |
-| `r` | repeat it the input duration later (a moment inside a note moves to where the note ends, said in the status bar) |
+| `k` (Space a o) | an empty collection at the moment the selected music starts, on the score's collections staff (`CollectionStaves.collectionStaff`: the staff whose music holds the most collections, else one whose declaration has `\collectionStyle`, else one named for electronics/tape; none: the selection's own), selected (the line shows where; the lens opens once a note is typed); a–g fill it (nearest octave, `=` `-` for sharp and flat; no rests, no durations). A moment inside a note there moves to where it ends. A click on a staff (no selection): where the click falls |
+| `k` at a collection | the next one, at the first note column the latest engraving shows clear of this one's right edge (`CollectionFollow`); notes typed since that engraving are extrapolated from the engraved ones' spacing, and a collection it doesn't show yet is placed by its moment and an estimated width. Nothing to measure (no engraving, or it runs off its system): the input duration later |
+| `r` | repeat it at the first note column clear of it, as `k` (a moment inside a note moves to where the note ends, said in the status bar) |
 | `i` | invert the whole collection (any of its notes selected) |
 | `⌥←` `⌥→` | move it by the input duration |
-| `⌥⇧↑` `⌥⇧↓` | move it to the staff above / below at the same moment (`CollectionStaves`: each staff's first music variable, from Score Setup's staff scan); across files it is one undoable structural change |
+| `⌥⇧↑` `⌥⇧↓` | move it to the staff above / below at the same moment (`CollectionStaves`: each staff's first music variable, from Score Setup's staff scan); across files it is one undoable structural change. While typing into it, typing goes on there |
 | ⌘C ⌘V | copy as `\absolute { \collection { … } }`; paste after the selection, or the input duration after a selected collection |
-| ⌫ | with all its notes selected, the whole collection |
+| ⌫ | with all its notes selected, the whole collection; the event before it in its voice (else after) is selected, so the lens follows |
 
 Moments come from the voice's managed bars (`\pondsideMeasure`: bar starts
 from the root's shared definitions, bodies padded), else the voice read in
@@ -1671,6 +1687,36 @@ re-parses and restores every other note's absolute pitch (relative chains),
 then collapses to one minimal replacement. Stepping a collection note
 ignores the key; `=` `-` `0` set its pitch directly; a note typed after a
 collection takes no accidental from it (`entryAccidental`, the lens writer).
+
+A dashed line in the accent over the system marks where the selection starts in
+time: a collection's anchor, else its first event's moment
+(`MomentMap`, PondsideEngrave, built off the main thread once per
+engraving). It is placed on the latest engraving between the note columns
+around that moment, so a move, repeat or new collection shows before the
+engraving that prints it; a click places it from the clicked glyph's
+moment (a lookup) before the source is consulted. Its time stamp is in the transport. While a collection is
+selected the lens points at the line's system, beside the line, not over
+it. A collection `k` made that the selection leaves still empty is removed
+("Remove Empty Collection", its own undo step; the new selection stays).
+
+### Transport (`PondsideUI/TransportView.swift`)
+
+A HUD-style floating control over the score pane (HIG: a panel-like
+control on glass over content, not a toolbar): top right by default,
+dragged by its background anywhere in the pane and remembered there
+(`transport.offset`), with a soft shadow; `GlassView` turns solid under
+Reduce Transparency. Its controls refuse first responder, so typing stays
+in the score. From left: the two recordings as icon toggles (♪ the mockup,
+waveform the mix with the patch's electronics; the chosen one in the
+accent, so the colour still means "selected"), play/pause, stop, the time
+stamp and a slim timeline. The stamp (`ScoreClock`: bar, beat, clock time
+from the timing log) shows the selection's start when nothing plays and
+the head when playing or paused. Tooltips carry the keymap's shortcuts
+(⌘⇧P, ⌘⌥P, ⎋ stops). Pausing keeps the head on the page; ⌘⇧P/⌘⌥P on the
+paused recording resume it. Switching recordings while playing continues
+at the same time in the other (they share their timing); one not rendered
+yet is refused with the reason, the other playing on. A click on the
+timeline seeks, or when stopped starts there.
 
 **In the lens.** The lens's renderer (swift-sheet-music, after MuseScore)
 hangs a grace on the next note of its voice and drops graces with none, so
@@ -1707,6 +1753,26 @@ signature (it is custom music), so the file follows every edit.
   on, so the lens doesn't draw it (the page does).
 - Names (`\collection #'opening`) for the patch: indices shift when one is
   inserted earlier.
+
+## 14. Cues from the keyboard (2026-11-09)
+
+`q` puts the next electronics cue at the moment the selected music starts,
+the way `k` places a collection: `s4*0\ecue "N"` on the voice the score
+keeps its cues in (`CueStaves.cueVoice`: the music variable holding the most
+`\ecue`s, else one named `…Cues`, else the collections staff), with N one
+past the highest numbered cue. A skip there is split; before an event with
+no written duration, that event gains its own (the `s4*0` would otherwise
+lend it `4*0`). A moment inside a note moves to where the note ends. A cue
+already at that moment is selected instead of doubled. The old chord
+(Space a q) is gone: `add.cue` has only the key.
+
+LilyPond links a cue's box to its `\ecue`, so a click selects
+`\ecue "N"` (`SyntaxTree.cue(at:)`); ⌫ deletes it, and the `s4*0` that
+carried it when nothing else (`\edesc`, a dynamic) rides on that skip
+(`ScoreEditor.deleteCue`). Labels are not renumbered: the patch's handlers
+are named by them (`~cue[\cue12]`). The patch gains the new cue's stub,
+and comments out a deleted cue's handler, at the next mockup
+(`HandlerSync`, docs/SUPERCOLLIDER.md).
 
 ## Appendix A. Corrections to the brief (decided 2026-10-27)
 
@@ -2008,3 +2074,26 @@ visible but disabled. The primary button names the current choice, and No
 Agent / Refactor Only leaves manual work marked. Native controls preserve
 keyboard and accessibility behavior without additional animation or focus
 changes (HIG sheets, choices and feedback).
+
+## 15. Hairpins and expressions from the keyboard (2026-11-09)
+
+`<` and `>` toggle a crescendo / decrescendo hairpin over the selection
+(`\< … \!`, `\> … \!`; one note: the opening half alone). The chords
+Space a c, Space a r and Space a d are gone.
+
+`\` starts an expression, typed after it and placed with ⏎
+(`Expression`, in `PondsideCore`). Space separates its elements: a dynamic
+is any number of p's or f's, mp, mf or one of LilyPond's sforzandi; every
+other word is text, and neighbouring words join into one phrase. A lone
+predefined dynamic is written as itself (`\mf`), on every selected note,
+as before; anything else is one `-#(make-dynamic-script (markup …))` on the
+selection's first note, words in `#:normal-text #:italic` (the expression
+font), dynamics in `#:dynamic`, so text sits on the dynamics line with the
+dynamics and hairpins. `^\` and `_\` direct it. A single word that names a
+LilyPond post-event command (`\trill`, `\fermata`) stays that command,
+except for words in `Expression.vocabulary` (`espressivo` is text, not the
+articulation). While typing, the status line shows the completion from the
+vocabulary (multi-word: `poco a p` → `poco a poco`), then commands; ⇥ or →
+accepts it. A dynamic ending the input is not completed. The menu's Add
+Expression takes the same syntax. A click on an expression selects it as a
+dynamic mark ("Expression"), so ⌫ deletes it.

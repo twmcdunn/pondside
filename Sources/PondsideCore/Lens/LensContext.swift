@@ -70,7 +70,10 @@ struct LensContext: Sendable {
     /// `\collection { … }` bodies: no time, like graces (and in `graces`).
     var collections: [Range<Int>] = []
     var unsupported: [String] = []
+    /// Custom commands whose length can't be read from source: they may take time.
     var custom: [String] = []
+    /// Custom commands the score defines as taking no time (`TimelessCommands`).
+    var timeless: [String] = []
     var managedMeasures: [(body: Range<Int>, time: LensTime)] = []
 
     func clef(at offset: Int) -> LensClef {
@@ -105,9 +108,10 @@ struct LensContext: Sendable {
 
     /// The badges to show, custom commands summarised last.
     var badges: [String] {
-        guard !custom.isEmpty else { return unsupported }
-        let names = custom.prefix(3).map { "\\" + $0 }.joined(separator: " ")
-        let more = custom.count > 3 ? " +\(custom.count - 3)" : ""
+        let shown = custom + timeless
+        guard !shown.isEmpty else { return unsupported }
+        let names = shown.prefix(3).map { "\\" + $0 }.joined(separator: " ")
+        let more = shown.count > 3 ? " +\(shown.count - 3)" : ""
         return unsupported + ["graphic: \(names)\(more)"]
     }
 }
@@ -157,9 +161,12 @@ enum LensContextScanner {
         var leaves: [Leaf] = []
         var variables: [String: Range<Int>]
         var bodies: [Int: Range<Int>]
+        /// Commands defined elsewhere in the score as taking no time.
+        var timeless: Set<String> = []
 
-        init(_ tree: SyntaxTree) {
+        init(_ tree: SyntaxTree, timeless: Set<String> = []) {
             self.tree = tree
+            self.timeless = timeless
             var leaves: [Leaf] = []
             tree.root.forEachLeaf { node in
                 guard !node.kind.isTrivia else { return }
@@ -183,9 +190,9 @@ enum LensContextScanner {
         }
     }
 
-    static func scan(_ tree: SyntaxTree, block: Range<Int>) -> LensContext {
+    static func scan(_ tree: SyntaxTree, block: Range<Int>, timeless: Set<String> = []) -> LensContext {
         var context = LensContext()
-        scan(Source(tree), range: block, at: nil, into: &context, depth: 0)
+        scan(Source(tree, timeless: timeless), range: block, at: nil, into: &context, depth: 0)
         return context
     }
 
@@ -257,13 +264,15 @@ enum LensContextScanner {
             case "markup", "markuplist":
                 // Markup is text, and its commands are not music.
                 context.flag("markup")
-                index = skipArgument(in: leaves, after: index)
+                index = skipMarkup(in: leaves, after: index)
             case "pondsideMeasure", "pondsideSpace", "pondsideLayout", "pondsideTimeline":
                 break
             default:
                 if name.hasPrefix("pondsideBar") { continue }
                 if unsupportedCommands.contains(name) {
                     context.flag(name)
+                } else if source.timeless.contains(name) {
+                    if !context.timeless.contains(name) { context.timeless.append(name) }
                 } else if let value = source.variables[name] {
                     // `\global`: its clefs and meters count where it is used.
                     // Music in a variable is not drawn, so say so.
@@ -320,6 +329,23 @@ enum LensContextScanner {
             if leaf.kind == .command { return nil }
         }
         return nil
+    }
+
+    /// Index of the last leaf of the markup after `\markup` at `index`: its
+    /// commands and their Scheme or number arguments, up to and including a
+    /// braced group, a string or a word (`\markup \concat { … }`,
+    /// `\markup \fontsize #-3 \flat`).
+    private static func skipMarkup(in leaves: [Leaf], after index: Int) -> Int {
+        var i = index + 1
+        while i < leaves.count {
+            switch leaves[i].kind {
+            case .openBrace: return skipArgument(in: leaves, after: i - 1)
+            case .string, .markupWord, .word: return i
+            case .command, .hash, .schemeText, .number: i += 1
+            default: return i - 1
+            }
+        }
+        return leaves.count - 1
     }
 
     /// Index of the last leaf of the argument after `index`.

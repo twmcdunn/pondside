@@ -3,7 +3,7 @@ public struct KeyInput: Hashable, Sendable {
     public enum Key: Hashable, Sendable {
         case character(Character)
         case up, down, left, right
-        case delete, escape, enter
+        case delete, escape, enter, tab
     }
 
     public var key: Key
@@ -32,11 +32,18 @@ public enum InputAction: Hashable, Sendable {
     case insertRest
     case delete
     case togglePostEvent(String)
+    /// A dynamic or expression (`\mf⏎`, `\mf dolce⏎`), replacing the one
+    /// there: on each selected note (`each`), or once at the selection's start.
+    case addExpression(String, each: Bool)
+    /// A crescendo (`<`) or decrescendo (`>`) hairpin over the selection.
+    case hairpin(crescendo: Bool)
     case toggleSlur
     /// Mirror the selected pitches about the centre of their range.
     case invert
-    /// A pitch collection where the selection ends (`k`).
+    /// A pitch collection at the selection's start, on the collections staff (`k`).
     case insertCollection
+    /// The next electronics cue at the selection's start, on the cue voice (`q`).
+    case insertCue
     /// The selected collection later (+1) or earlier (−1) by the input duration (⌥→ ⌥←).
     case shiftCollection(Int)
     /// The selected collection to the staff below (+1) or above (−1) (⌥⇧↓ ⌥⇧↑).
@@ -62,13 +69,16 @@ public enum InputAction: Hashable, Sendable {
 /// | `↑` `↓` | diatonic step · `⇧` octave · `⌥` chromatic |
 /// | `←` `→` | previous / next object · `⇧` extends |
 /// | `i` | invert the selection about the centre of its range |
-/// | `k` | a pitch collection where the selection ends; a–g then fill it |
+/// | `k` | a pitch collection at the selection's start, on the collections staff; a–g then fill it |
+/// | `q` | the next electronics cue at the selection's start, on the score's cue voice |
 /// | `⌥←` `⌥→` | move the selected collection by the input duration |
 /// | `⌥⇧↑` `⌥⇧↓` | move the selected collection to the staff above / below |
 /// | `s` | toggle a slur over the selection (same as Space a s) |
 /// | `( ) ~ [ ]` | slur endpoints, tie, beam: toggled on the selection |
 /// | `=`, `-`, `0` | visible sharp, flat, natural: toggle selection or arm next note |
 /// | `^.` `^>` `^-` `_1` … | directed articulations and fingerings |
+/// | `<` `>` | crescendo / decrescendo hairpin over the selection |
+/// | `\mf dolce⏎` | expression: dynamics (any p's or f's, mp, mf, sfz…) and words, space separated; ⇥ completes a phrase |
 /// | `\trill⏎` | any post-event command, typed as in LilyPond |
 /// | `⌫` | delete · `⎋` cancel / deselect / disarm · `⏎` edit in source |
 ///
@@ -95,6 +105,12 @@ public struct NoteInput: Sendable {
         return digits
     }
 
+    /// What ⇥ would add to the expression being typed (`\dol` → "ce").
+    public var completion: String? { command.flatMap { Expression.completion(for: $0) } }
+
+    /// The expression being typed after `\`, nil when none.
+    public var expression: String? { command }
+
     public var isBuffering: Bool { command != nil || direction != nil || !digits.isEmpty }
 
     private static let durations = [1, 2, 4, 8, 16, 32, 64, 128]
@@ -102,25 +118,24 @@ public struct NoteInput: Sendable {
     public mutating func handle(_ input: KeyInput, now: Double) -> [InputAction] {
         if input.command || input.control { return [] }
 
-        // Command buffer: \name⏎
-        if command != nil {
+        // Expression / command buffer: \mf dolce⏎, \trill⏎
+        if let typed = command {
             switch input.key {
-            case .character(let c) where c.isLetter:
+            case .character(let c) where c == " ":
+                if !typed.isEmpty && typed.last != " " { command! += " " }
+                return [.buffer(bufferText)]
+            case .character(let c) where !c.isNewline && c != "\\" && !(c.asciiValue.map { $0 < 32 || $0 == 127 } ?? false):
                 command! += String(c)
                 return [.buffer(bufferText)]
-            case .delete:
-                if command!.isEmpty { command = nil; direction = nil } else { command!.removeLast() }
+            case .tab, .right:
+                if let more = completion { command! += more }
                 return [.buffer(bufferText)]
-            case .enter:
-                let text = (direction.map(String.init) ?? "") + "\\" + command!
-                let done = !command!.isEmpty
-                command = nil
-                direction = nil
-                return done ? [.togglePostEvent(text), .buffer("")] : [.buffer("")]
-            case .escape:
-                command = nil
-                direction = nil
-                return [.buffer("")]
+            case .delete:
+                if typed.isEmpty { command = nil; direction = nil } else { command!.removeLast() }
+                return [.buffer(bufferText)]
+            case .enter, .escape:
+                // ⎋ places the expression as ⏎ does: there is no cancel.
+                return commitExpression()
             default:
                 return []
             }
@@ -172,6 +187,8 @@ public struct NoteInput: Sendable {
         case .enter:
             digits = ""
             return [input.shift ? .togglePageBreak : .toggleSystemBreak]
+        case .tab:
+            return []
         case .character(let c):
             return handleCharacter(c, now: now)
         }
@@ -211,9 +228,13 @@ public struct NoteInput: Sendable {
             return [.invert]
         case "k":
             return [.insertCollection]
+        case "q":
+            return [.insertCue]
         case ".":
             if var armed = armedDuration { armed.dots = armed.dots == 0 ? 1 : 0; armedDuration = armed }
             return [.toggleDot]
+        case "<", ">":
+            return [.hairpin(crescendo: c == "<")]
         case "(", ")", "~", "[", "]":
             return [.togglePostEvent(String(c))]
         case "^", "_":
@@ -229,6 +250,18 @@ public struct NoteInput: Sendable {
 
     static func isDurationPrefix(_ s: String) -> Bool {
         durations.contains { String($0).hasPrefix(s) }
+    }
+
+    /// Places the expression being typed, as ⏎ does (also ⎋ and a click
+    /// away); an empty or unknown one is dropped. Empty when none is typed.
+    public mutating func commitExpression() -> [InputAction] {
+        guard let typed = command else { return [] }
+        let dir = direction
+        command = nil
+        direction = nil
+        guard let text = Expression.postEvent(typed, direction: dir) else { return [.buffer("")] }
+        if Expression.isCommand(typed.split(separator: " ").joined(separator: " ")) { return [.togglePostEvent(text), .buffer("")] }
+        return [.addExpression(text, each: Expression.appliesToEach(typed)), .buffer("")]
     }
 
     /// Cancel an unfinished key sequence without changing armed values.

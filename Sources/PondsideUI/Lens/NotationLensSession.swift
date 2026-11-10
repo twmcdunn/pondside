@@ -26,6 +26,12 @@ enum LensMarkKind: Sendable {
     }
 }
 
+/// An expression being typed after `\`: what is typed, and what ⇥ would add.
+struct LensExpressionEntry: Equatable {
+    var typed: String
+    var completion: String?
+}
+
 /// The Notation Lens as the window controller sees it. Available on every
 /// macOS the app runs on; the implementation needs macOS 15.
 @MainActor
@@ -45,6 +51,8 @@ protocol NotationLensSession: AnyObject {
     /// An edit was refused or taken back: the red inline notice, in the lens.
     func showRejection(_ message: String)
     var onClose: (() -> Void)? { get set }
+    /// The expression entry line; nil hides it.
+    var expressionEntry: LensExpressionEntry? { get set }
     var onFailure: ((String) -> Void)? { get set }
     /// The mode bar was clicked: open that lens instead.
     var onSwitch: ((LensMode) -> Void)? { get set }

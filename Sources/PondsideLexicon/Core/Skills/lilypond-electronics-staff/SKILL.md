@@ -46,7 +46,7 @@ elec = {
 - Display is score-wide in Engraving Settings › Collections (or per staff): `\override NoteHead.details.collection-heads = #'hollow` (`filled`), `collection-enclosure` `parentheses` (note-head sized, level with the first and last notes; stacked: spanning the chord) / `brackets` (the staff's height) / `none`, `collection-layout` `row` / `stacked`, `collection-gap` (staff spaces).
 - In `\relative` music the notes are read one after another and the music after continues from the last.
 - Each note links to its own pitch (point-and-click). Collections are not in the MIDI. The timing dump reports them (`cnote` rows), so the patch gets them as `~collections` (lilypond-supercollider).
-- In the app: `k` makes one where the selection ends, then a–g fill it; `r` repeats it the input duration later, `i` inverts it, `⌥←`/`⌥→` move it by the input duration, `⌥⇧↑`/`⌥⇧↓` move it to the staff above/below, ⌘C/⌘V copy it.
+- In the app: `k` makes one at the start of the selected music, on the score's collections staff (the staff with the most collections, else one with `\collectionStyle`, else one named for electronics; else the selection's own), then a–g fill it in the lens; `r` repeats it (and `k` at a collection starts the next one) at the first note column clear of its engraving, `i` inverts it, `⌥←`/`⌥→` move it by the input duration, `⌥⇧↑`/`⌥⇧↓` move it to the staff above/below, ⌘C/⌘V copy it.
 - The hidden stem carries the whole row's width, so spacing makes room for it (graphics can find collections the same way).
 
 ## Checking

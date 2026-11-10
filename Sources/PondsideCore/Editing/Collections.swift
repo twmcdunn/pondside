@@ -187,7 +187,9 @@ struct CollectionTimeline {
 
     /// Edits that put `text` (a collection) at `spot`. Returns the edits and
     /// the single edit that carries `text`, with `text`'s place inside it.
-    func insertion(of text: String, at spot: Spot) -> (edits: [TextEdit], carrier: TextEdit, prefix: Int) {
+    /// `timed`: `text` ends in a written duration (a cue's `s4*0`), so the
+    /// event after it keeps its own duration wherever it is inserted.
+    func insertion(of text: String, at spot: Spot, timed: Bool = false) -> (edits: [TextEdit], carrier: TextEdit, prefix: Int) {
         let bytes = tree.bytes
         /// The next event at or after `at` must not inherit a new skip's duration.
         let zeroBodies = tree.collections.map(\.body)
@@ -202,7 +204,7 @@ struct CollectionTimeline {
         case .before(let e):
             let at = tree.events[e].range.lowerBound
             let carrier = TextEdit.insert(text + " ", at: at)
-            return ([carrier], carrier, 0)
+            return ([carrier] + (timed ? keepDuration(after: at) : []), carrier, 0)
         case .split(let e, let into):
             let event = tree.events[e]
             let total = LensFraction(event.effectiveDuration.wholeNotes.0, event.effectiveDuration.wholeNotes.1)
@@ -212,7 +214,13 @@ struct CollectionTimeline {
             let carrier = TextEdit.insert(prefix + text + " s" + Self.durationText(rest), at: event.range.upperBound)
             return ([first, carrier] + keepDuration(after: event.range.upperBound), carrier, prefix.utf8.count)
         case .end(let body, let after, let gap):
-            let at = after.map { tree.events[$0].range.upperBound } ?? body.lowerBound
+            // After the last music and any collections after it (they stand at
+            // the music's end, before the new skip); inside the braces.
+            var at = after.map { tree.events[$0].range.upperBound }
+                ?? (bytes.indices.contains(body.lowerBound) && bytes[body.lowerBound] == 0x7B ? body.lowerBound + 1 : body.lowerBound)
+            for c in tree.collections where body.contains(c.command.lowerBound) && c.command.lowerBound >= at {
+                at = max(at, c.command.upperBound)
+            }
             let lead = " "
             if gap > .zero {
                 let skip = "s" + Self.durationText(gap) + " "
@@ -220,8 +228,43 @@ struct CollectionTimeline {
                 return ([carrier] + keepDuration(after: at), carrier, lead.utf8.count + skip.utf8.count)
             }
             let carrier = TextEdit.insert(lead + text, at: at)
-            return ([carrier], carrier, lead.utf8.count)
+            return ([carrier] + (timed ? keepDuration(after: at) : []), carrier, lead.utf8.count)
         }
+    }
+}
+
+/// The moments of a score's events, voice by voice, read as collections are
+/// placed (managed bars from the score's start; a voice read in order from
+/// its own). For relating an engraving's columns to time.
+public struct VoiceMoments {
+    private let trees: [SyntaxTree]
+    private var timelines: [Int: [CollectionTimeline]] = [:]
+
+    /// `trees[0]` is the root (its shared bars give the managed bars).
+    public init(trees: [SyntaxTree]) { self.trees = trees }
+
+    private mutating func timeline(file: Int, offset: Int) -> CollectionTimeline? {
+        if let known = timelines[file]?.first(where: { t in t.segments.contains { $0.body.contains(offset) } }) { return known }
+        guard trees.indices.contains(file),
+              let made = CollectionTimeline(tree: trees[file], root: trees.first, at: offset) else { return nil }
+        timelines[file, default: []].append(made)
+        return made
+    }
+
+    /// The onset and length of event `index` in `trees[file]`; nil inside a
+    /// collection or where the voice's moments are not one sequence.
+    public mutating func event(file: Int, index: Int) -> (onset: LensFraction, duration: LensFraction)? {
+        guard trees.indices.contains(file), trees[file].events.indices.contains(index),
+              let t = timeline(file: file, offset: trees[file].events[index].range.lowerBound) else { return nil }
+        for s in t.segments where !s.split {
+            if let e = s.events.first(where: { $0.index == index }) { return (s.start + e.onset, e.duration) }
+        }
+        return nil
+    }
+
+    /// The moment of a zero-length position (a collection) at `offset`.
+    public mutating func moment(file: Int, offset: Int) -> LensFraction? {
+        timeline(file: file, offset: offset)?.moment(at: offset)
     }
 }
 
@@ -302,8 +345,21 @@ extension ScoreEditor {
     public func deleteCollection(_ collection: ScoreCollection, parse: ((String) -> SyntaxTree)? = nil) -> ScoreEdit? {
         let gone = TextEdit(collectionDeletionRange(collection.command), "")
         let parse = parse ?? { SyntaxTree($0, language: tree.events.first?.language ?? .nederlands) }
-        return finishingCollectionEdit([gone], removed: [collection.command], carrier: nil, pitches: [],
-                                       name: "Delete Collection", parse: parse)
+        guard var edit = finishingCollectionEdit([gone], removed: [collection.command], carrier: nil, pitches: [],
+                                                 name: "Delete Collection", parse: parse) else { return nil }
+        // Select the music beside it (before, else after, in its voice), so
+        // the selection stays on an event and the lens follows the edit.
+        let voice = CollectionTimeline.topLevelValue(containing: collection.command.lowerBound, in: tree)
+        func inVoice(_ e: Int) -> Bool {
+            !collection.events.contains(e) && voice.map { $0.contains(tree.events[e].range.lowerBound) } ?? true
+                && tree.events[e].kind != .lyric
+        }
+        let neighbour = tree.events.indices.last { inVoice($0) && tree.events[$0].range.upperBound <= collection.command.lowerBound }
+            ?? tree.events.indices.first { inVoice($0) && tree.events[$0].range.lowerBound >= collection.command.upperBound }
+        if let neighbour {
+            edit.selectionAnchors = [edit.edits.mapOffset(tree.events[neighbour].range.lowerBound)]
+        }
+        return edit
     }
 
     /// An empty collection straight after `event`, at the moment it ends.
@@ -315,6 +371,23 @@ extension ScoreEditor {
         let parse = parse ?? { SyntaxTree($0, language: tree.events[eventIndex].language) }
         return finishingCollectionEdit([carrier], removed: [], carrier: (carrier, 1), pitches: [],
                                        name: "Insert Collection", parse: parse)
+    }
+
+    /// An empty collection `later` whole notes after `collection`, in its
+    /// voice (`k` at a collection: the next one starts where this one's
+    /// engraving ends). A moment inside a note moves to where it ends.
+    public func insertCollection(following collection: ScoreCollection, later: LensFraction, root: SyntaxTree?,
+                                 parse: ((String) -> SyntaxTree)? = nil) -> (edit: ScoreEdit, snapped: Bool)? {
+        guard LensFraction.zero < later,
+              let timeline = CollectionTimeline(tree: tree, root: root, at: collection.command.lowerBound),
+              let here = timeline.moment(at: collection.command.lowerBound),
+              let (spot, snapped) = timeline.spot(at: here + later) else { return nil }
+        let language = collection.events.first.map { tree.events[$0].language } ?? tree.events.first?.language ?? .nederlands
+        let (raw, carrier, prefix) = timeline.insertion(of: Self.collectionText([], language: language), at: spot)
+        guard let edit = finishingCollectionEdit(raw, removed: [], carrier: (carrier, prefix), pitches: [],
+                                                 name: "Insert Collection",
+                                                 parse: parse ?? { SyntaxTree($0, language: language) }) else { return nil }
+        return (edit, snapped != nil)
     }
 
     /// A note added at the end of an empty collection (the first note
@@ -351,9 +424,17 @@ extension ScoreEditor {
     /// `root` is the score's root tree, for the managed bars.
     public func shiftCollection(_ collection: ScoreCollection, by duration: DurationValue, forward: Bool,
                                 copy: Bool, root: SyntaxTree?, parse: ((String) -> SyntaxTree)? = nil) -> (edit: ScoreEdit, snapped: Bool)? {
-        guard let timeline = CollectionTimeline(tree: tree, root: root, at: collection.command.lowerBound),
+        shiftCollection(collection, by: LensFraction(duration.wholeNotes.0, duration.wholeNotes.1), forward: forward,
+                        copy: copy, root: root, parse: parse)
+    }
+
+    /// Moves or copies `collection` by exactly `d` whole notes (for `r`,
+    /// the span its engraving takes, `CollectionFollow`).
+    public func shiftCollection(_ collection: ScoreCollection, by d: LensFraction, forward: Bool,
+                                copy: Bool, root: SyntaxTree?, parse: ((String) -> SyntaxTree)? = nil) -> (edit: ScoreEdit, snapped: Bool)? {
+        guard LensFraction.zero < d,
+              let timeline = CollectionTimeline(tree: tree, root: root, at: collection.command.lowerBound),
               let here = timeline.moment(at: collection.command.lowerBound) else { return nil }
-        let d = LensFraction(duration.wholeNotes.0, duration.wholeNotes.1)
         let target = forward ? here + d : here - d
         guard let (spot, snapped) = timeline.spot(at: target) else { return nil }
         let pitches = collection.notes.map { tree.notes[$0].absolute }
@@ -418,6 +499,9 @@ public enum CollectionStaves {
         public var file: Int
         public var name: String
         public var value: Range<Int>
+        /// The staff's declaration (`\new Staff … { … }`) in `trees[staffFile]`.
+        public var staffFile: Int
+        public var declaration: Range<Int>
     }
 
     /// One voice per staff, in score order. `trees[0]` is the root.
@@ -444,11 +528,56 @@ public enum CollectionStaves {
             tree.root.forEachLeaf { leaf in
                 guard found == nil, leaf.kind == .command, leaf.range.lowerBound > staff.offset, leaf.range.lowerBound < end else { return }
                 let name = String(tree.string(leaf.range).dropFirst())
-                if let d = definitions[name] { found = Voice(staff: staff.index, file: d.file, name: name, value: d.value) }
+                if let d = definitions[name] {
+                    found = Voice(staff: staff.index, file: d.file, name: name, value: d.value,
+                                  staffFile: staff.file, declaration: staff.offset..<end)
+                }
             }
             if let found { out.append(found) }
         }
         return out
+    }
+
+    /// The staff the score keeps its collections on: the one whose music
+    /// holds the most; else one styled for them (`\collectionStyle` in its
+    /// declaration); else one named for electronics or tape. Nil: none.
+    public static func collectionStaff(trees: [SyntaxTree]) -> Voice? {
+        let voices = Self.voices(trees: trees)
+        let counts = voices.map { v in trees[v.file].collections.filter { v.value.contains($0.command.lowerBound) }.count }
+        if let best = counts.indices.max(by: { counts[$0] < counts[$1] }), counts[best] > 0 { return voices[best] }
+        func declaration(_ v: Voice) -> String {
+            let tree = trees[v.staffFile]
+            return tree.string(v.declaration.clamped(to: 0..<tree.bytes.count))
+        }
+        if let styled = voices.first(where: { declaration($0).contains("\\collectionStyle") }) { return styled }
+        return voices.first { v in
+            // Words, not substrings: "select" is not electronics.
+            let words = (v.name + " " + declaration(v)).lowercased().split { !$0.isLetter }
+            return words.contains { w in w.hasPrefix("elec") || w == "tape" || w.hasPrefix("live") }
+        }
+    }
+
+    /// An empty collection at the moment `offset` (the selection's start)
+    /// has in `trees[file]`, in `target`'s music (`k` with music selected:
+    /// the collections staff, `collectionStaff`). A moment inside a note
+    /// there moves to where the note ends (`snapped`).
+    public static func insertEmpty(at offset: Int, file: Int, into target: Voice, trees: [SyntaxTree],
+                                   parse: @escaping (Int, String) -> SyntaxTree) -> Move? {
+        guard trees.indices.contains(file), trees.indices.contains(target.file) else { return nil }
+        let root = trees.first
+        let source = trees[file]
+        guard let here = CollectionTimeline(tree: source, root: root, at: offset)?.moment(at: offset),
+              let timeline = CollectionTimeline(tree: trees[target.file], root: root, at: target.value.lowerBound + 1),
+              let (spot, snapped) = timeline.spot(at: here) else { return nil }
+        let destination = trees[target.file]
+        let language = destination.events.first { target.value.contains($0.range.lowerBound) }?.language
+            ?? source.events.first?.language ?? .nederlands
+        let (inserted, carrier, prefix) = timeline.insertion(of: ScoreEditor.collectionText([], language: language), at: spot)
+        guard let edit = ScoreEditor(destination).finishingCollectionEdit(inserted, removed: [], carrier: (carrier, prefix),
+                                                                         pitches: [], name: "Insert Collection",
+                                                                         parse: { parse(target.file, $0) }),
+              let first = edit.selectionAnchors.first else { return nil }
+        return Move(edits: [target.file: edit.edits], anchor: (target.file, first), snapped: snapped != nil, staffName: target.name)
     }
 
     public struct Move: Sendable {

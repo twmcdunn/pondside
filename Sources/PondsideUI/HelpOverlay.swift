@@ -12,7 +12,7 @@ final class HelpOverlay {
     private struct Target {
         weak var view: NSView?
         let id: CommandID
-        let tracker: HoverTracker
+        let tracker: HoverTracker?
     }
 
     private weak var window: NSWindow?
@@ -39,6 +39,12 @@ final class HelpOverlay {
         view.addTrackingArea(area)
         view.toolTip = nil
         targets.append(Target(view: view, id: id, tracker: tracker))
+    }
+
+    /// Shows `id`'s keys on `view` under ⌥ only; the view keeps its own
+    /// tooltip (for controls whose hover help says more than the command).
+    func registerReveal(_ view: NSView, _ id: CommandID) {
+        targets.append(Target(view: view, id: id, tracker: nil))
     }
 
     // MARK: Hover

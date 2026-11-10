@@ -202,6 +202,38 @@ final class ScoreCanvasView: NSView {
         }, completionHandler: { scrollView.reflectScrolledClipView(clip) })
     }
 
+    // MARK: Collection anchor
+
+    /// Where the selection starts in time (a collection: where it is
+    /// anchored): a dashed line in the accent over its system, drawn on the
+    /// latest engraving, so a move shows before the engraving that prints it
+    /// lands. Its time stamp is in the transport (`TransportView`).
+    private(set) var collectionAnchor: PlayheadPosition?
+    /// A click's moment, given as soon as the line is placed from it.
+    var onAnchorMoment: ((LensFraction) -> Void)?
+
+    /// Moments of the shown engraving's glyphs and its clock, for placing
+    /// the line at a click before the source is looked up.
+    var momentMap: MomentMap?
+
+    func setCollectionAnchor(_ position: PlayheadPosition?, reveal: Bool) {
+        if position != collectionAnchor {
+            collectionAnchor = position
+            for (n, v) in pageViews.enumerated() { v.collectionAnchor = position?.page == n ? position : nil }
+        }
+        if reveal, let r = collectionAnchorRect, !visibleRect.insetBy(dx: 24, dy: 0).intersects(r) {
+            scrollToVisible(r.insetBy(dx: -120, dy: -24))
+        }
+    }
+
+    /// The line's system, in canvas coordinates.
+    var collectionAnchorRect: NSRect? {
+        guard let p = collectionAnchor, pageViews.indices.contains(p.page) else { return nil }
+        let v = pageViews[p.page]
+        return convert(v.viewRect(for: Rect(x: p.x, y: p.top, width: 0, height: p.bottom - p.top)), from: v)
+            .insetBy(dx: -1, dy: 0)
+    }
+
     func revealPlayhead() {
         guard let p = playhead, pageViews.indices.contains(p.page) else { return }
         let v = pageViews[p.page]
@@ -597,8 +629,23 @@ final class ScoreCanvasView: NSView {
         }
         let link = v.rendered?.page.hitTest(p, tolerance: tolerance, excluding: v.removed, byOutline: byOutline)?.link
             ?? v.rendered?.page.regionHit(p, excluding: v.removed, byOutline: byOutline)?.link
-        delegate?.canvas(self, didClick: link, at: pageViews.firstIndex { $0 === v }, point: p,
-                          extending: event.modifierFlags.contains(.shift))
+        let extending = event.modifierFlags.contains(.shift)
+        if let link, let page = v.rendered?.page, delegate?.canvas(self, isGraphicLink: link) != true {
+            // Outline what was clicked now, from its own glyphs, and put it on
+            // screen before the source is looked up; the selection's own
+            // highlight replaces it a moment later.
+            let glyphs = page.linkedGraphics(at: link.position).filter { $0.link?.path == link.path && !v.removed.contains($0) }
+            if !glyphs.isEmpty {
+                if !extending { for other in pageViews where other !== v { other.highlights = [] } }
+                v.highlights = (extending ? v.highlights : []) + glyphs.map(\.bounds)
+                if !extending, let m = momentMap?.moment(of: link) {
+                    setCollectionAnchor(momentMap?.position(at: m), reveal: false)
+                    onAnchorMoment?(m)
+                }
+                CATransaction.flush()
+            }
+        }
+        delegate?.canvas(self, didClick: link, at: pageViews.firstIndex { $0 === v }, point: p, extending: extending)
     }
 
     /// Provisional rendering: ghost noteheads where the given notes are
@@ -762,6 +809,8 @@ private final class PageView: NSView {
     private(set) var staves: [Staff] = []
     /// The audio's place on this page, when it is the page playing.
     var playhead: PlayheadPosition? { didSet { if playhead != oldValue { updatePlayhead() } } }
+    var collectionAnchor: PlayheadPosition? { didSet { if collectionAnchor != oldValue { updateCollectionAnchor() } } }
+    private let anchorLine = CAShapeLayer()
     /// The ⌥-drag section's boxes on this page, in page coordinates.
     var sectionBoxes: [Rect] = [] { didSet { if sectionBoxes != oldValue { needsDisplay = true } } }
     /// Engraved note glyphs moved to provisional (not yet engraved) positions.
@@ -769,7 +818,9 @@ private final class PageView: NSView {
     /// Glyphs the provisional deletion has taken out of the page.
     var removed: Set<Graphic> = [] { didSet { if removed != oldValue { needsDisplay = true } } }
     var badges: [(Rect, String)] = [] { didSet { needsDisplay = true } }
-    var highlights: [Rect] = [] { didSet { if highlights != oldValue { needsDisplay = true } } }
+    /// The selection's outline, on its own layer: selecting never redraws the music.
+    var highlights: [Rect] = [] { didSet { if highlights != oldValue { updateHighlights() } } }
+    private let highlightLayer = CAShapeLayer()
     var overflows: [SystemOverflow] = [] { didSet { if overflows != oldValue { needsDisplay = true } } }
     var lightsOut = false { didSet { needsDisplay = true } }
     /// The region an agent is working on (page coordinates): outlined on a
@@ -832,10 +883,19 @@ private final class PageView: NSView {
         }
         playheadLine.fillColor = nil
         playheadLine.lineCap = .round
+        highlightLayer.zPosition = 1.2
+        highlightLayer.fillColor = Theme.accent.withAlphaComponent(0.16).cgColor
+        highlightLayer.strokeColor = Theme.accent.withAlphaComponent(0.9).cgColor
+        highlightLayer.lineWidth = 1
+        layer?.addSublayer(highlightLayer)
+        anchorLine.isHidden = true
+        anchorLine.zPosition = 1.5
+        anchorLine.fillColor = nil
+        layer?.addSublayer(anchorLine)
         playheadCap.fillColor = Theme.accent.cgColor
         displayOptionsObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.updateWork(); self?.updatePlayhead() }
+            MainActor.assumeIsolated { self?.updateWork(); self?.updatePlayhead(); self?.updateCollectionAnchor() }
         }
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.55)
@@ -856,7 +916,44 @@ private final class PageView: NSView {
             needsDisplay = true
             updateWork()
             updatePlayhead()
+            updateCollectionAnchor()
+            updateHighlights()
         }
+    }
+
+    private func updateHighlights() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        let path = CGMutablePath()
+        for r in highlights {
+            path.addRoundedRect(in: viewRect(for: r).insetBy(dx: -3, dy: -3), cornerWidth: 3, cornerHeight: 3)
+        }
+        highlightLayer.frame = bounds
+        highlightLayer.path = path
+    }
+
+    /// The anchor line on its own layer, like the playhead: moving it never
+    /// redraws the music. Dashed, so it never reads as a barline.
+    private func updateCollectionAnchor() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+        guard let p = collectionAnchor, rendered != nil else {
+            anchorLine.isHidden = true
+            return
+        }
+        let r = viewRect(for: Rect(x: p.x, y: p.top, width: 0, height: p.bottom - p.top))
+        let contrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        let line = CGMutablePath()
+        line.move(to: CGPoint(x: r.midX, y: r.minY))
+        line.addLine(to: CGPoint(x: r.midX, y: r.maxY))
+        anchorLine.frame = bounds
+        anchorLine.path = line
+        anchorLine.strokeColor = Theme.accent.withAlphaComponent(contrast ? 1 : 0.85).cgColor
+        anchorLine.lineWidth = contrast ? 2 : 1.25
+        anchorLine.lineDashPattern = [5, 3]
+        anchorLine.isHidden = false
     }
 
     /// Places the head on its own layers: following the audio never redraws
@@ -1042,17 +1139,6 @@ private final class PageView: NSView {
         drawOverflows(in: ctx)
 
         let accent = Theme.accent
-        for r in highlights {
-            let rect = viewRect(for: r).insetBy(dx: -3, dy: -3)
-            let path = CGPath(roundedRect: rect, cornerWidth: 3, cornerHeight: 3, transform: nil)
-            ctx.addPath(path)
-            ctx.setFillColor(accent.withAlphaComponent(0.16).cgColor)
-            ctx.fillPath()
-            ctx.addPath(path)
-            ctx.setStrokeColor(accent.withAlphaComponent(0.9).cgColor)
-            ctx.setLineWidth(1)
-            ctx.strokePath()
-        }
 
         // Provisional marks use ink, not the accent: the preview is meant to
         // look like the engraving that is about to land, not like a UI ghost.

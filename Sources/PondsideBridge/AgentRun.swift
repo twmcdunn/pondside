@@ -429,11 +429,13 @@ public struct AgentRun: Sendable {
     Numbers the user gives win. Too small to notice counts as not done.
     """
 
-    /// What a marked range is: an existing drawing, or only a range (a new
-    /// drawing or a notation/layout change).
+    /// What a request is about: a marked range on an existing drawing, a
+    /// marked range with no drawing (a new drawing or a notation/layout
+    /// change), the notes selected in the score, or the whole project.
     public enum RequestTarget: String, Sendable {
         case existingGraphic
         case emptySection
+        case notes
         case project
     }
 
@@ -469,12 +471,28 @@ public struct AgentRun: Sendable {
     picks the wider one, change only inside the marked range.
     """
 
+    static let notesRules = """
+    \(ScoreContract.notice)
+    The context's selection has kind "notes": the events the user selected in the score, with `from` and `to`
+    (file, line, character, bar, moment) and the selected source `text`. Change only those notes and what is
+    attached to them (articulations, dynamics, slurs, ties, beams, tweaks, fingerings, text, noteheads, \\once
+    overrides before them) unless the request clearly asks for more. Follow skill://lilypond: keep the selection's
+    durations and bar checks adding up, and prefer a local \\once or \\tweak over a change to a shared
+    \\layout or definition. Transpositions, inversions, retrogrades and rhythm changes rewrite only the selected
+    events. A drawing, texture or gesture over these notes is a graphic: read skill://graphic-notation and use
+    graphic_insert from the selection's first moment to its last. Do not create a Lexicon entry for a one-off change.
+    If the request sounds as if it reaches past the selection ("all of them", "every bar"), ask_user first whether to
+    change only the selection or every place it occurs (both as choices); until the user picks the wider one,
+    change only the selection.
+    """
+
     public static func graphicsPrompt(request: String, context: String, score: URL,
                                       followUp: Bool = false,
                                       target: RequestTarget = .existingGraphic) -> String {
         if target == .project {
             return ScoreContract.notice + "\n\nGeneral LilyPond project request: \(request)\n\(context)\nThe scope is the requested file/project, not a marked graphics range. Use atomic MCP edits; preserve shared definitions and wrappers. Read only missing lines needed for the request, check the returned engraving, and reply in one short line."
         }
+        if target == .notes { return notesPrompt(request: request, context: context, score: score, followUp: followUp) }
 
         let rules = target == .emptySection ? Self.emptySectionRules : Self.graphicRules
         let skill = MCPServer.skills.first { $0.folder == "graphic-notation" }.flatMap(MCPServer.skillText) ?? ""
@@ -539,6 +557,47 @@ public struct AgentRun: Sendable {
         \(context)
 
         \(skill)
+
+        \(lilypond)
+        """
+    }
+
+    /// A request about the notes selected in the score ("staccato", "up an
+    /// octave", "a slur over these"): LilyPond's skill, the selection's
+    /// context, and only the selection changes.
+    static func notesPrompt(request: String, context: String, score: URL, followUp: Bool) -> String {
+        let edits = """
+        Code in the context is numbered as in its file (`412| ` is not part of the line), fresh as of now. \
+        Use one atomic MCP edit per file (root: \(score.path) for an .ily), with from_line/to_line for every \
+        hunk, without reading the files again; all ranges refer to the same pre-edit snapshot, so inserted \
+        lines do not renumber other hunks. No native Edit/Write. The reply includes the engraving and \
+        new_diagnostics: fix any new diagnostic before responding. No renders, images or shell.
+        """
+        if followUp {
+            return """
+            Next request: "\(request)", about the notes now selected (score_context):
+            \(context)
+            \(edits)
+            \(notesRules)
+            \(atAGlance) Reply in one short line saying what changed.
+            """
+        }
+        let lilypond = MCPServer.skills.first { $0.folder == "lilypond" }.flatMap(MCPServer.skillText) ?? ""
+        return """
+        The user selected notes in Pondside's score of \(score.path) and asked: "\(request)".
+        Its context (what score_context returns) is below; call score_context again only for another point.
+        Follow the skill below. You run in the background: take the most plausible reading; only if \
+        two readings really differ, ask with ask_user (offer choices). If you can't carry it out, call \
+        warn_user.
+        \(atAGlance)
+        Be quick: the context has the selected events, their staff's music and the root `\\layout`. \(edits)
+        \(notesRules)
+        Final reply: one short line saying what changed, e.g. "Staccato on the 6 selected notes, bars 3–4."
+        More requests may follow in this conversation, each with the selection at that moment; \
+        "it", "that" and "again" refer to earlier ones.
+
+        Context:
+        \(context)
 
         \(lilypond)
         """

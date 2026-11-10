@@ -122,6 +122,70 @@ final class CollectionTests: XCTestCase {
         XCTAssertEqual(SyntaxTree(result).collections.count, 2)
     }
 
+    func testTheNextCollectionGoesLaterInItsVoice() {
+        let text = "music = { \\collection { c' e' g' } s1 c'2 d'2 }"
+        let tree = SyntaxTree(text)
+        let made = ScoreEditor(tree).insertCollection(following: tree.collections[0], later: LensFraction(3, 8), root: nil)
+        XCTAssertEqual(apply(made?.edit, to: text), "music = { \\collection { c' e' g' } s8*3 \\collection { } s8*5 c'2 d'2 }")
+        XCTAssertEqual(made?.snapped, false)
+        // Inside a note: where it ends.
+        let late = ScoreEditor(tree).insertCollection(following: tree.collections[0], later: LensFraction(5, 4), root: nil)
+        XCTAssertEqual(apply(late?.edit, to: text), "music = { \\collection { c' e' g' } s1 c'2 \\collection { } d'2 }")
+        XCTAssertEqual(late?.snapped, true)
+        XCTAssertNil(ScoreEditor(tree).insertCollection(following: tree.collections[0], later: .zero, root: nil))
+    }
+
+    /// `k` with music selected: the staff with collections wins, then one
+    /// styled for them, then one named for electronics; else none.
+    func testTheCollectionsStaffIsFound() {
+        func staff(_ text: String) -> String? { CollectionStaves.collectionStaff(trees: [SyntaxTree(text)])?.name }
+        XCTAssertEqual(staff("fl = { c'1 }\nvc = { \\collection { c' } s1 }\n\\score { << \\new Staff \\fl \\new Staff \\vc >> }"), "vc")
+        XCTAssertEqual(staff("fl = { c'1 }\nx = { s1 }\n\\score { << \\new Staff \\fl \\new Staff \\with { \\collectionStyle } \\x >> }"), "x")
+        XCTAssertEqual(staff("fl = { c'1 }\nx = { s1 }\n\\score { << \\new Staff \\fl \\new Staff = \"elec\" \\x >> }"), "x")
+        XCTAssertNil(staff("fl = { c'1 }\nvc = { c1 }\n\\score { << \\new Staff \\fl \\new Staff \\vc >> }"))
+    }
+
+    /// The collection goes at the selected note's moment, on the other staff.
+    func testACollectionGoesOnTheCollectionsStaffAtTheSelectionsStart() throws {
+        let text = "fl = { c'4 d' e' f' }\nel = { s1 }\n\\score { << \\new Staff \\fl \\new Staff = \"elec\" \\el >> }"
+        let tree = SyntaxTree(text)
+        let target = try XCTUnwrap(CollectionStaves.collectionStaff(trees: [tree]))
+        let made = try XCTUnwrap(CollectionStaves.insertEmpty(at: tree.events[2].range.lowerBound, file: 0, into: target,
+                                                              trees: [tree], parse: { SyntaxTree($1) }))
+        XCTAssertEqual(made.edits[0]?.apply(to: text).split(separator: "\n")[1], "el = { s2 \\collection { } s2 }")
+        XCTAssertFalse(made.snapped)
+    }
+
+    /// At the end of its voice, the next collection (and a repeat) goes after
+    /// it, not before it with the new skip pushing it later.
+    func testTheNextCollectionAtTheVoicesEndGoesAfterIt() {
+        let cases = [
+            ("music = { c'1 \\collection { c' e' } }", "music = { c'1 \\collection { c' e' } s8*3 \\collection { } }"),
+            ("music = { \\collection { c' e' } }", "music = { \\collection { c' e' } s8*3 \\collection { } }"),
+        ]
+        for (text, expected) in cases {
+            let tree = SyntaxTree(text)
+            let made = ScoreEditor(tree).insertCollection(following: tree.collections[0], later: LensFraction(3, 8), root: nil)
+            XCTAssertEqual(apply(made?.edit, to: text), expected)
+            let repeated = ScoreEditor(tree).shiftCollection(tree.collections[0], by: LensFraction(3, 8), forward: true,
+                                                            copy: true, root: nil)
+            XCTAssertEqual(apply(repeated?.edit, to: text), expected.replacingOccurrences(of: "\\collection { } }", with: "\\collection { c' e' } }"))
+        }
+    }
+
+    func testDeletingACollectionSelectsTheMusicBesideIt() {
+        let text = "music = { c'4 \\collection { e' g' } d'2. }"
+        let tree = SyntaxTree(text)
+        let edit = ScoreEditor(tree).deleteCollection(tree.collections[0])
+        XCTAssertEqual(apply(edit, to: text), "music = { c'4 d'2. }")
+        XCTAssertEqual(edit?.selectionAnchors, [10])
+        // At the start of its voice: the event after it.
+        let t2 = SyntaxTree("music = { \\collection { e' } s1 }")
+        let e2 = ScoreEditor(t2).deleteCollection(t2.collections[0])
+        XCTAssertEqual(apply(e2, to: t2.text), "music = { s1 }")
+        XCTAssertEqual(e2?.selectionAnchors, [10])
+    }
+
     func testMovingInRelativeMusicKeepsEveryPitch() {
         let text = "music = \\relative c'' { d4 \\collection { f, a } e'4 g4 }"
         let tree = SyntaxTree(text)

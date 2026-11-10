@@ -204,18 +204,37 @@ extension StructuralEditing {
         let replacement = "\n  \\pondsideLayout #'(\n    " + slots + "\n  ) \\pondsideTimeline {" + body + "\n  }\n"
         return Part(file: file.id, edits: [TextEdit((block.range.lowerBound + 1)..<(block.range.upperBound - 1), replacement)], bars: outputBars)
     }
-    public static func needsInterpreter(in tree: SyntaxTree, body: Range<Int>) -> Bool {
-        let context = LensContextScanner.scan(tree, block: body)
-        var generated = false
-        tree.root.forEachNode { node in
-            guard body.contains(node.range.lowerBound) else { return }
-            if node.kind == .simultaneous { generated = true }
-            if node.kind == .scheme {
-                let text = tree.string(node.range)
-                if text.hasPrefix("#(") || text.hasPrefix("$") { generated = true }
+    /// Whether the length of `body` needs LilyPond to evaluate it: generated
+    /// or simultaneous music, or a command that may take time. `timeless`
+    /// names the score's own commands that take none (`TimelessCommands`).
+    public static func needsInterpreter(in tree: SyntaxTree, body: Range<Int>, timeless: Set<String> = []) -> Bool {
+        if generatesMusic(tree, body: body) { return true }
+        let context = LensContextScanner.scan(tree, block: body, timeless: timeless)
+        return !context.custom.isEmpty || !context.unsupported.filter { $0 != "markup" }.isEmpty
+    }
+
+    /// Simultaneous music, or Scheme that may make music, starting in `body`.
+    /// Scheme that sets a value cannot: a tweak or override value
+    /// (`-\tweak stencil #(…)`, `\override X.y = #(…)`), or anything in a post-event.
+    static func generatesMusic(_ tree: SyntaxTree, body: Range<Int>) -> Bool {
+        func walk(_ node: SyntaxNode, inPostEvent: Bool) -> Bool {
+            var previous: SyntaxNode?
+            for child in node.children where !child.kind.isTrivia {
+                defer { previous = child }
+                guard child.range.upperBound > body.lowerBound, child.range.lowerBound < body.upperBound else { continue }
+                let starts = body.contains(child.range.lowerBound)
+                if starts, child.kind == .simultaneous { return true }
+                if child.kind == .scheme {
+                    let isValue = inPostEvent || previous.map { $0.kind == .equals || $0.kind == .propertyPath } == true
+                    if isValue { continue }
+                    let text = tree.string(child.range)
+                    if starts, text.hasPrefix("#(") || text.hasPrefix("$") { return true }
+                }
+                if walk(child, inPostEvent: inPostEvent || child.kind == .postEvent) { return true }
             }
+            return false
         }
-        return generated || !context.custom.isEmpty || !context.unsupported.filter { $0 != "markup" }.isEmpty
+        return walk(tree.root, inPostEvent: false)
     }
 
     static func timelineDefinition(names: [String]) -> String {

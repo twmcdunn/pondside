@@ -318,6 +318,69 @@ final class LexiconEngravingTests: XCTestCase {
         XCTAssertEqual(found.map(\.midi), [[60, 62, 63], [65, 66, 67, 70]])
     }
 
+    /// `k` at a collection: the next one starts at the moment the engraving
+    /// shows after the first's right edge, so the two never print on top of
+    /// each other, and the music around them keeps its spacing.
+    func testTheNextCollectionStartsWhereTheEngravingOfTheLastEnds() async throws {
+        let notes = "c' d' e' fis' g' a' b'"
+        let body = """
+        fl = \\relative c'' { c8 d e f g a b c | c8 b a g f e d c | c1 }
+        el = { \\collection { \(notes) } s1*3 }
+        \\score { << \\new Staff \\fl \\new Staff \\el >> \\layout { } }
+        """
+        let (first, file, _) = try await compile(body)
+        XCTAssertTrue(first.succeeded && first.errors.isEmpty, first.log)
+        let text = try String(contentsOf: file, encoding: .utf8)
+        let tree = SyntaxTree(text)
+        let collection = try XCTUnwrap(tree.collections.first)
+        let pages = try first.pages()
+        func span(engraved: Bool, notes count: Int) -> LensFraction? {
+            CollectionFollow.span(ofCollectionAt: engraved ? collection.command.lowerBound : nil, moment: .zero, file: 0,
+                                  trees: [tree], pages: pages, fileIndex: { $0.hasSuffix("score.ly") ? 0 : nil },
+                                  noteCount: count, accidentals: 1)
+        }
+        // Seven notes reach under the flute's seventh eighth: the next column is its eighth.
+        let measured = try XCTUnwrap(span(engraved: true, notes: collection.notes.count))
+        XCTAssertTrue(LensFraction(1, 8) < measured && measured < LensFraction(1), "\(measured)")
+        // Notes typed since the engraving reach further.
+        XCTAssertTrue(measured < (span(engraved: true, notes: collection.notes.count + 4) ?? .zero))
+        // Not engraved at all: estimated from its moment.
+        XCTAssertNotNil(span(engraved: false, notes: collection.notes.count))
+
+        let inserted = try XCTUnwrap(ScoreEditor(tree).shiftCollection(collection, by: measured, forward: true, copy: true, root: tree))
+        let second = inserted.edit.edits.apply(to: text)
+        try second.write(to: file, atomically: true, encoding: .utf8)
+        let lily = try XCTUnwrap(ToolchainDetector.select(from: await ToolchainDetector().detectLilyPond(), for: nil))
+        let again = try await LilyPondEngraver(installation: lily).engrave(file, purpose: .canvas,
+                                                                          outputDirectory: file.deletingLastPathComponent().appendingPathComponent("out2"))
+        XCTAssertTrue(again.succeeded && again.errors.isEmpty, again.log)
+        let page = try XCTUnwrap(again.pages().first)
+        let tree2 = SyntaxTree(second), source = SourceText(second)
+        XCTAssertEqual(tree2.collections.count, 2)
+        let boxes = tree2.collections.map { c in
+            EngravedPage.bounds(of: c.notes.flatMap { n in
+                page.linkedGraphics(at: source.position(of: second.utf8.index(second.startIndex, offsetBy: tree2.notes[n].name.lowerBound)))
+            })
+        }
+        let a = try XCTUnwrap(boxes[0]), b = try XCTUnwrap(boxes[1])
+        XCTAssertGreaterThan(b.minX, a.maxX, "the second collection starts before the first ends")
+
+        // The anchor line: at each collection's left edge, and never going back.
+        let map = MomentMap(trees: [tree2], pages: [page], fileIndex: { $0.hasSuffix("score.ly") ? 0 : nil })
+        var moments = VoiceMoments(trees: [tree2])
+        for (c, box) in zip(tree2.collections, [a, b]) {
+            let moment = try XCTUnwrap(moments.moment(file: 0, offset: c.command.lowerBound))
+            let line = try XCTUnwrap(map.position(at: moment))
+            XCTAssertEqual(line.x, box.minX, accuracy: 1)
+        }
+        var last = -Double.infinity
+        for k in 0...48 {
+            let x = try XCTUnwrap(map.position(at: LensFraction(k, 16))).x
+            XCTAssertGreaterThanOrEqual(x, last)
+            last = x
+        }
+    }
+
     /// A graphic going on past its system ends at the system's staff end;
     /// one stopped on the first note of a system leaves nothing on it; one
     /// crossing a break is clipped there instead of drawn into the margins.
